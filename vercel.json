@@ -1,7 +1,1 @@
-{
-  "functions": {
-    "api/bot.js": {
-      "runtime": "nodejs20.x"
-    }
-  }
-}
+{}
