@@ -1,1 +1,8 @@
-{}
+{
+  "version": 2,
+  "functions": {
+    "api/bot.js": {
+      "maxDuration": 60
+    }
+  }
+}
