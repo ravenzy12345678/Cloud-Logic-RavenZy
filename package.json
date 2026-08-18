@@ -4,10 +4,11 @@
   "private": true,
   "main": "api/bot.js",
   "engines": {
-    "node": ">=20"
+    "node": "20.x"
   },
   "dependencies": {
-    "axios": "^1.7.0",
+    "axios": "^1.7.9",
+    "cheerio": "^1.0.0",
     "jszip": "^3.10.1",
     "telegraf": "^4.16.3"
   }
