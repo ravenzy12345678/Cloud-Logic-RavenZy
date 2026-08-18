@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Raven Call Screen Studio Pro</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:opsz,wght@14..32,400;14..32,500;14..32,600;14..32,700;14..32,800&display=swap" rel="stylesheet" />
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js">
+  </script>
+  <link rel="stylesheet" href="style.css" />
+</head>
+
+<body class="is-locked">
+  <!-- LOCK OVERLAY -->
+  <div class="lock-overlay" id="lockOverlay">
+    <div class="lock-card">
+      <div class="lock-icon">🔒</div>
+      <h2>Join Saluran</h2>
+      <p>Join saluran admin untuk info update/project selanjutnya</p>
+      <div class="lock-steps">
+        <button class="lock-btn" id="followStepBtn" type="button">
+          <span class="check" id="followCheck">1</span>
+          <span id="followBtnLabel">Mengikuti</span>
+        </button>
+        <button class="lock-btn lock-btn-secondary" id="alreadyFollowBtn" type="button">
+          <span class="check">✓</span>
+          Sudah Mengikuti
+        </button>
+      </div>
+      <p class="lock-note">Sudah join sebelumnya? Klik "Sudah Mengikuti" untuk langsung masuk</p>
+    </div>
+  </div>
+
+  <div class="container">
+    <header class="app-header">
+      <div class="badge">{Raven Project}</div>
+      <h1>Fake Call</h1>
+      <p>Membuat rekayasa panggilan untuk bersenang senang✨️</p>
+    </header>
+
+    <div class="dashboard">
+      <!-- PANEL KONTROL -->
+      <div class="controls">
+        <div class="group">
+          <label>Foto Profil</label>
+          <div class="photo-upload" id="photoUploadBtn">
+            <img class="avatar-preview placeholder" id="photoPreview" src="" alt="Avatar" style="display:none;" />
+            <span class="avatar-preview placeholder" id="photoPlaceholder">+</span>
+            <span class="label-text"><b>Klik</b> untuk unggah foto</span>
+          </div>
+          <input type="file" id="photoInput" accept="image/*" />
+        </div>
+
+        <div class="group">
+          <label>Nama Kontak</label>
+          <input type="text" id="nameInput" value="Nama Kontak" maxlength="30" />
+        </div>
+
+        <div class="group">
+          <label>Durasi Panggilan</label>
+          <div class="trio">
+            <input type="number" id="jamInput" min="0" max="99" value="0" placeholder="Jam" />
+            <input type="number" id="minInput" min="0" max="59" value="1" placeholder="Menit" />
+            <input type="number" id="detikInput" min="0" max="59" value="45" placeholder="Detik" />
+          </div>
+        </div>
+
+        <button class="action-btn preview-btn" id="previewBtn">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="3" y="3" width="18" height="18" rx="3" />
+            <path d="M8 12h8" />
+            <path d="M12 8v8" />
+          </svg>
+          Ganerate
+        </button>
+      </div>
+
+      <!-- PREVIEW HASIL -->
+      <div class="preview-wrapper" id="previewWrapper">
+        <div class="preview" id="captureTarget">
+          <div class="screen">
+            <img class="bg-image" src="https://i.ibb.co.com/fYTqw2R1/20260723-155230.jpg" alt="Call Screen Background" crossorigin="anonymous" />
+
+            <div class="avatar-container" id="avatarContainer">
+              <div class="avatar-placeholder" id="avatarPlaceholder">👤</div>
+            </div>
+
+            <div class="overlay">
+              <div class="name" id="nameLabel">Nama Kontak</div>
+              <div class="duration" id="durLabel">00:01:45</div>
+            </div>
+          </div>
+        </div>
+
+        <button class="action-btn download-btn" id="downloadBtn">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+            <polyline points="7 10 12 15 17 10" />
+            <line x1="12" y1="15" x2="12" y2="3" />
+          </svg>
+          Unduh Gambar
+        </button>
+        <p class="note">Hasil unduhan akan sama persis dengan tampilan preview di atas</p>
+      </div>
+    </div>
+
+    <footer class="site-footer">
+      <div class="footer-line"></div>
+      <p>© 2026 <span>Raven Project</span> — All Rights Reserved.</p>
+      <small>Built with passion by Raven</small>
+    </footer>
+  </div>
+
+  <script src="script.js"></script>
+</body>
+</html>
