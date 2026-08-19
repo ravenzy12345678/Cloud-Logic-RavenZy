@@ -334,15 +334,20 @@ async function getVercelTeamIds() {
   return ids;
 }
 
-async function createVercelDeployment(repo, branch, commitSha) {
+async function createVercelDeployment(name, files) {
+  // Deploy langsung dari isi file (bukan gitSource) supaya TIDAK bergantung
+  // sama sekali pada GitHub App Integration Vercel <-> GitHub. Hanya butuh
+  // VERCEL_TOKEN yang valid untuk akun/scope yang dipakai.
   const payload = {
-    name: projectSafeName(repo.name),
+    name: projectSafeName(name),
     target: 'production',
-    gitSource: {
-      type: 'github',
-      repoId: repo.id,
-      ref: branch,
-      sha: commitSha,
+    files: files.map((file) => ({
+      file: file.path.replace(/^\/+/, ''),
+      data: file.buffer.toString('base64'),
+      encoding: 'base64',
+    })),
+    projectSettings: {
+      framework: null,
     },
   };
 
@@ -356,7 +361,7 @@ async function createVercelDeployment(repo, branch, commitSha) {
     try {
       const response = await axios.post(`${VERCEL_API}/v13/deployments`, payload, {
         headers: vercelHeaders,
-        params: teamId ? { teamId } : undefined,
+        params: { teamId: teamId || undefined, skipAutoDetectionConfirmation: 1 },
         timeout: 120000,
       });
       return { ...response.data, teamId: teamId || null };
@@ -370,11 +375,8 @@ async function createVercelDeployment(repo, branch, commitSha) {
   }
 
   const message = errorMessage(lastError);
-  if (/github integration|github repository|link.*github/i.test(message)) {
-    throw new Error('Vercel belum mempunyai akses GitHub ke repository baru. Pasang/beri akses GitHub Integration Vercel ke repository tersebut, lalu coba lagi.');
-  }
   if (/not authorized|unauthorized/i.test(message)) {
-    throw new Error(`Vercel menolak deployment (Not authorized). Token tidak mempunyai scope/team yang bisa membuat deployment untuk repository ${repo.full_name}.`);
+    throw new Error(`Vercel menolak deployment (Not authorized). Periksa VERCEL_TOKEN — pastikan token masih berlaku dan dibuat dari akun/scope yang benar (name: ${name}).`);
   }
   throw new Error(`Vercel deployment gagal: ${message}`);
 }
@@ -562,7 +564,9 @@ async function runDeployment(ctx, session, statusMessage) {
     await updateStatus(ctx, statusMessage.message_id, 'Deploying',
       `📦 Repository&#8202;: <code>${escapeHtml(repo.name)}</code>\n🔗 <a href="${escapeHtml(repo.html_url)}">Buka di GitHub</a>\n\n✅ GitHub&#8202;: <b>unggah selesai</b>\n⚡ Vercel&#8202;: <b>membuat deployment…</b>`);
 
-    const deployment = await createVercelDeployment(repo, commit.branch, commit.commitSha);
+    // Deploy langsung dari file yang sudah diunggah user (bukan menarik dari
+    // GitHub), jadi tidak butuh GitHub App Integration Vercel sama sekali.
+    const deployment = await createVercelDeployment(repo.name, session.files);
     const final = await waitForDeployment(deployment.id, deployment.teamId, 180000, async (state) => {
       await updateStatus(ctx, statusMessage.message_id, 'Deploying',
         `📦 Repository&#8202;: <code>${escapeHtml(repo.name)}</code>\n🔗 <a href="${escapeHtml(repo.html_url)}">Buka di GitHub</a>\n\n✅ GitHub&#8202;: <b>unggah selesai</b>\n⚡ Vercel&#8202;: <b>${escapeHtml(state || 'PROCESSING')}</b>`);
