@@ -86,40 +86,61 @@ async function safeDeleteMessage(ctx, chatId, messageId) {
   try { await ctx.telegram.deleteMessage(chatId, messageId); } catch (_) {}
 }
 
+// ─────────────────────────────────────────────
+// TAMPILAN / UI HELPERS
+// Catatan penting: bot ini SENGAJA tidak memakai Reply Keyboard (tombol
+// menu di sebelah kotak ketik) maupun daftar perintah "/" di menu chat.
+// Semua navigasi hanya lewat inline button yang menempel di pesan bot,
+// supaya tidak ada dua menu berbeda yang membingungkan pengguna.
+// ─────────────────────────────────────────────
+
+const DIVIDER = '┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈';
+
 function homeButton() {
-  return Markup.inlineKeyboard([[Markup.button.callback('🏠 Menu Utama', 'home')]]);
+  return Markup.inlineKeyboard([[Markup.button.callback('🏠  Menu Utama', 'home')]]);
+}
+
+function backCancelRow() {
+  return [Markup.button.callback('✖️  Batalkan', 'home')];
 }
 
 function mainMenuMarkup() {
   return Markup.inlineKeyboard([
-    [Markup.button.callback('🚀 Deploy HTML', 'deploy_html'), Markup.button.callback('📦 Deploy ZIP', 'deploy_zip')],
-    [Markup.button.callback('🌐 Get Source', 'get_source'), Markup.button.callback('🛡️ Encrypt HTML', 'encrypt_html')],
-    [Markup.button.callback('🗑️ Delete Web', 'delete_web'), Markup.button.callback('📡 System', 'system')],
-    [Markup.button.callback('👤 Add User', 'add_user'), Markup.button.callback('👥 Users', 'users')],
+    [Markup.button.callback('🚀  Deploy HTML', 'deploy_html'), Markup.button.callback('📦  Deploy ZIP', 'deploy_zip')],
+    [Markup.button.callback('🌐  Get Source', 'get_source'), Markup.button.callback('🛡️  Encrypt HTML', 'encrypt_html')],
+    [Markup.button.callback('🗑️  Delete Web', 'delete_web'), Markup.button.callback('📡  System Check', 'system')],
+    [Markup.button.callback('👤  Add User', 'add_user'), Markup.button.callback('👥  Users', 'users')],
   ]);
 }
 
-function menuText(text) {
-  return `☁️ <b>CLOUD LOGIC</b>\n━━━━━━━━━━━━━━━━━━\n${text}`;
+function menuText(title, body) {
+  if (body === undefined) {
+    // Dipanggil dengan 1 argumen (kompatibilitas lama) → anggap itu body, pakai judul default.
+    return `☁️ <b>CLOUD LOGIC</b>\n${DIVIDER}\n${title}`;
+  }
+  return `☁️ <b>CLOUD LOGIC</b>  ·  <i>${escapeHtml(title)}</i>\n${DIVIDER}\n${body}`;
 }
 
-async function sendMainMenu(ctx, text = '🟢 <b>ONLINE</b>\n\nPilih menu di bawah.') {
+async function sendMainMenu(ctx, body = '🟢 <b>Status:</b> Online & siap digunakan.\n\nSilakan pilih salah satu menu di bawah ini.') {
   await safeDeleteMessage(ctx, ctx.chat?.id, ctx.callbackQuery?.message?.message_id);
-  await ctx.reply(menuText(text), { parse_mode: 'HTML', ...mainMenuMarkup() });
+  await ctx.reply(menuText('Menu Utama', body), { parse_mode: 'HTML', ...mainMenuMarkup() });
 }
 
-async function sendPlainPrompt(ctx, text, session) {
+async function sendPlainPrompt(ctx, title, body, session) {
   const old = sessions.get(uid(ctx));
   if (old?.controlMessageId) await safeDeleteMessage(ctx, ctx.chat.id, old.controlMessageId);
-  const message = await ctx.reply(menuText(text), { parse_mode: 'HTML', ...Markup.forceReply() });
+  const message = await ctx.reply(menuText(title, body), {
+    parse_mode: 'HTML',
+    ...Markup.forceReply(),
+  });
   session.controlMessageId = message.message_id;
   sessions.set(uid(ctx), session);
   return message;
 }
 
-async function updateStatus(ctx, messageId, text, keyboard = null) {
+async function updateStatus(ctx, messageId, title, body, keyboard = null) {
   try {
-    return await ctx.telegram.editMessageText(ctx.chat.id, messageId, undefined, menuText(text), {
+    return await ctx.telegram.editMessageText(ctx.chat.id, messageId, undefined, menuText(title, body), {
       parse_mode: 'HTML',
       ...(keyboard || {}),
     });
@@ -403,10 +424,11 @@ async function extractZip(buffer) {
   const lowerIndex = raw.find((f) => f.path.toLowerCase() === 'index.html');
   if (lowerIndex) return raw;
 
-  const first = raw[0].path.split('/')[0];
-  const nested = raw.every((f) => f.path.startsWith(`${first}/`));
-  if (nested) {
-    const flattened = raw.map((f) => ({ ...f, path: f.path.slice(first.length + 1) })).filter((f) => f.path);
+  // Coba ratakan folder pembungkus tunggal (mis. "my-site/index.html" → "index.html")
+  const topFolders = new Set(raw.map((f) => f.path.split('/')[0]));
+  if (topFolders.size === 1) {
+    const [prefix] = topFolders;
+    const flattened = raw.map((f) => ({ path: f.path.slice(prefix.length + 1), buffer: f.buffer }));
     if (flattened.some((f) => f.path.toLowerCase() === 'index.html')) return flattened;
   }
   throw new Error('ZIP harus mempunyai index.html sebagai halaman utama.');
@@ -525,22 +547,25 @@ async function runDeployment(ctx, session, statusMessage) {
   let repo = null;
   let commit = null;
 
-  await updateStatus(ctx, statusMessage.message_id,
-    `🚀 <b>DEPLOYING</b>\n\n📦 Repository: <code>${escapeHtml(repoName)}</code>\n\n⬆️ GitHub: <b>mempersiapkan...</b>\n⚡ Vercel: <b>menunggu...</b>`);
+  const progress = (ghLine, vercelLine) =>
+    `📦 Repository&#8202;: <code>${escapeHtml(repoName)}</code>\n\n${ghLine}\n${vercelLine}`;
+
+  await updateStatus(ctx, statusMessage.message_id, 'Deploying',
+    progress('⬆️ GitHub&#8202;: <b>mempersiapkan…</b>', '⚡ Vercel&#8202;: <b>menunggu…</b>'));
 
   try {
     repo = await createGitHubRepo(repoName);
-    await updateStatus(ctx, statusMessage.message_id,
-      `🚀 <b>DEPLOYING</b>\n\n📦 Repository: <code>${escapeHtml(repo.name)}</code>\n🔗 <a href="${escapeHtml(repo.html_url)}">GitHub Repository</a>\n\n⬆️ GitHub: <b>mengunggah ${session.files.length} file...</b>\n⚡ Vercel: <b>menunggu...</b>`);
+    await updateStatus(ctx, statusMessage.message_id, 'Deploying',
+      `📦 Repository&#8202;: <code>${escapeHtml(repo.name)}</code>\n🔗 <a href="${escapeHtml(repo.html_url)}">Buka di GitHub</a>\n\n⬆️ GitHub&#8202;: <b>mengunggah ${session.files.length} berkas…</b>\n⚡ Vercel&#8202;: <b>menunggu…</b>`);
 
     commit = await uploadFilesToNewRepo(repo, session.files);
-    await updateStatus(ctx, statusMessage.message_id,
-      `🚀 <b>DEPLOYING</b>\n\n📦 Repository: <code>${escapeHtml(repo.name)}</code>\n🔗 <a href="${escapeHtml(repo.html_url)}">GitHub Repository</a>\n\n✅ GitHub: <b>upload selesai</b>\n⚡ Vercel: <b>membuat deployment...</b>`);
+    await updateStatus(ctx, statusMessage.message_id, 'Deploying',
+      `📦 Repository&#8202;: <code>${escapeHtml(repo.name)}</code>\n🔗 <a href="${escapeHtml(repo.html_url)}">Buka di GitHub</a>\n\n✅ GitHub&#8202;: <b>unggah selesai</b>\n⚡ Vercel&#8202;: <b>membuat deployment…</b>`);
 
     const deployment = await createVercelDeployment(repo, commit.branch, commit.commitSha);
     const final = await waitForDeployment(deployment.id, deployment.teamId, 180000, async (state) => {
-      await updateStatus(ctx, statusMessage.message_id,
-        `🚀 <b>DEPLOYING</b>\n\n📦 Repository: <code>${escapeHtml(repo.name)}</code>\n🔗 <a href="${escapeHtml(repo.html_url)}">GitHub Repository</a>\n\n✅ GitHub: <b>upload selesai</b>\n⚡ Vercel: <b>${escapeHtml(state || 'PROCESSING')}</b>`);
+      await updateStatus(ctx, statusMessage.message_id, 'Deploying',
+        `📦 Repository&#8202;: <code>${escapeHtml(repo.name)}</code>\n🔗 <a href="${escapeHtml(repo.html_url)}">Buka di GitHub</a>\n\n✅ GitHub&#8202;: <b>unggah selesai</b>\n⚡ Vercel&#8202;: <b>${escapeHtml(state || 'PROCESSING')}</b>`);
     });
 
     if ((final.readyState || final.state) !== 'READY') {
@@ -548,16 +573,22 @@ async function runDeployment(ctx, session, statusMessage) {
     }
 
     const url = final.url ? `https://${final.url}` : `https://${projectSafeName(repo.name)}.vercel.app`;
-    await updateStatus(ctx, statusMessage.message_id,
-      `✅ <b>DEPLOY BERHASIL</b>\n\n📦 Repository\n<a href="${escapeHtml(repo.html_url)}">${escapeHtml(repo.full_name)}</a>\n\n🌐 Website\n<a href="${escapeHtml(url)}">${escapeHtml(url)}</a>\n\n🟢 Vercel: <b>READY</b>`, homeButton());
+    await updateStatus(ctx, statusMessage.message_id, 'Deploy Berhasil ✅',
+      `📦 <b>Repository</b>\n<a href="${escapeHtml(repo.html_url)}">${escapeHtml(repo.full_name)}</a>\n\n🌐 <b>Website</b>\n<a href="${escapeHtml(url)}">${escapeHtml(url)}</a>\n\n🟢 Status Vercel&#8202;: <b>READY</b>`,
+      homeButton());
   } catch (error) {
     const detail = errorMessage(error);
-    await updateStatus(ctx, statusMessage.message_id,
-      `❌ <b>DEPLOY GAGAL</b>\n\n📦 Repository: <code>${escapeHtml(repoName)}</code>\n${repo ? `🔗 <a href="${escapeHtml(repo.html_url)}">Repository berhasil dibuat</a>\n\n` : ''}<b>Alasan:</b>\n<code>${escapeHtml(detail)}</code>`, homeButton());
+    await updateStatus(ctx, statusMessage.message_id, 'Deploy Gagal ❌',
+      `📦 Repository&#8202;: <code>${escapeHtml(repoName)}</code>\n${repo ? `🔗 <a href="${escapeHtml(repo.html_url)}">Repository sudah terlanjur dibuat</a>\n\n` : ''}<b>Penyebab&#8202;:</b>\n<code>${escapeHtml(detail)}</code>`,
+      homeButton());
   } finally {
     sessions.delete(uid(ctx));
   }
 }
+
+// ─────────────────────────────────────────────
+// COMMANDS & ACTIONS
+// ─────────────────────────────────────────────
 
 bot.start(async (ctx) => {
   await loadUsers();
@@ -573,43 +604,68 @@ bot.action('home', async (ctx) => {
 bot.action('deploy_html', async (ctx) => {
   await ctx.answerCbQuery();
   await safeDeleteMessage(ctx, ctx.chat.id, ctx.callbackQuery.message.message_id);
-  await sendPlainPrompt(ctx, '🚀 <b>DEPLOY HTML</b>\n\nKirim file <code>.html</code>.', { type: 'deploy_html', step: 'file' });
+  await sendPlainPrompt(
+    ctx,
+    'Deploy HTML',
+    '🚀 <b>Langkah 1 dari 2&#8202;: Kirim File</b>\n\nUnggah 1 file dengan ekstensi <code>.html</code> sebagai halaman utama website kamu.\n\n<i>Balas pesan ini dengan mengirim filenya sebagai dokumen (bukan foto).</i>',
+    { type: 'deploy_html', step: 'file' }
+  );
 });
 
 bot.action('deploy_zip', async (ctx) => {
   await ctx.answerCbQuery();
   await safeDeleteMessage(ctx, ctx.chat.id, ctx.callbackQuery.message.message_id);
-  await sendPlainPrompt(ctx, '📦 <b>DEPLOY ZIP</b>\n\nKirim file <code>.zip</code>.', { type: 'deploy_zip', step: 'file' });
+  await sendPlainPrompt(
+    ctx,
+    'Deploy ZIP',
+    '📦 <b>Langkah 1 dari 2&#8202;: Kirim File</b>\n\nUnggah 1 file <code>.zip</code> berisi seluruh project website kamu.\n\n⚠️ <b>Wajib</b> ada <code>index.html</code> di root ZIP (atau di dalam satu folder pembungkus tunggal).',
+    { type: 'deploy_zip', step: 'file' }
+  );
 });
 
 bot.action('get_source', async (ctx) => {
   await ctx.answerCbQuery();
   await safeDeleteMessage(ctx, ctx.chat.id, ctx.callbackQuery.message.message_id);
-  await sendPlainPrompt(ctx, '🌐 <b>GET SOURCE</b>\n\nKirim URL website publik yang ingin dibundel menjadi ZIP.', { type: 'source', step: 'url' });
+  await sendPlainPrompt(
+    ctx,
+    'Get Source',
+    '🌐 <b>Kirim URL Website</b>\n\nKirim alamat lengkap website publik (contoh&#8202;: <code>https://contoh.com</code>) yang ingin diambil HTML, CSS, JavaScript, dan asset-nya menjadi satu file ZIP.',
+    { type: 'source', step: 'url' }
+  );
 });
 
 bot.action('encrypt_html', async (ctx) => {
   await ctx.answerCbQuery();
   await safeDeleteMessage(ctx, ctx.chat.id, ctx.callbackQuery.message.message_id);
-  await sendPlainPrompt(ctx, '🛡️ <b>ENCRYPT HTML</b>\n\nKirim file <code>.html</code>.', { type: 'encrypt', step: 'file' });
+  await sendPlainPrompt(
+    ctx,
+    'Encrypt HTML',
+    '🛡️ <b>Langkah 1 dari 3&#8202;: Kirim File</b>\n\nUnggah 1 file <code>.html</code> yang ingin dikunci dengan password (AES-256).',
+    { type: 'encrypt', step: 'file' }
+  );
 });
 
 bot.action('system', async (ctx) => {
-  await ctx.answerCbQuery('Checking...');
+  await ctx.answerCbQuery('Memeriksa koneksi…');
   await safeDeleteMessage(ctx, ctx.chat.id, ctx.callbackQuery.message.message_id);
-  const status = await ctx.reply(menuText('📡 <b>SYSTEM CHECK</b>\n\n⏳ Memeriksa koneksi Telegram, GitHub, dan Vercel...'), { parse_mode: 'HTML' });
+  const status = await ctx.reply(menuText('System Check', '⏳ Memeriksa koneksi Telegram, GitHub, dan Vercel…'), { parse_mode: 'HTML' });
   const result = [];
-  try { await checkGitHub(); result.push('🟢 GitHub API'); } catch (e) { result.push(`🔴 GitHub API — ${escapeHtml(errorMessage(e))}`); }
-  try { await checkVercel(); result.push('🟢 Vercel API'); } catch (e) { result.push(`🔴 Vercel API — ${escapeHtml(errorMessage(e))}`); }
-  result.push(`🟢 Telegram Webhook — handler aktif`);
-  await updateStatus(ctx, status.message_id, `📡 <b>SYSTEM STATUS</b>\n\n${result.join('\n')}`, homeButton());
+  try { await checkGitHub(); result.push('🟢 GitHub API&#8202;: <b>terhubung</b>'); } catch (e) { result.push(`🔴 GitHub API&#8202;: <code>${escapeHtml(errorMessage(e))}</code>`); }
+  try { await checkVercel(); result.push('🟢 Vercel API&#8202;: <b>terhubung</b>'); } catch (e) { result.push(`🔴 Vercel API&#8202;: <code>${escapeHtml(errorMessage(e))}</code>`); }
+  result.push('🟢 Telegram Webhook&#8202;: <b>aktif</b>');
+  await updateStatus(ctx, status.message_id, 'System Status', result.join('\n'), homeButton());
 });
 
 bot.action('add_user', async (ctx) => {
   await ctx.answerCbQuery();
   if (uid(ctx) !== OWNER_ID) return;
   await safeDeleteMessage(ctx, ctx.chat.id, ctx.callbackQuery.message.message_id);
-  await sendPlainPrompt(ctx, '👤 <b>ADD USER</b>\n\nKirim Telegram ID user yang ingin diberi akses.', { type: 'add_user', step: 'id' });
+  await sendPlainPrompt(
+    ctx,
+    'Add User',
+    '👤 <b>Kirim Telegram ID</b>\n\nKirim angka Telegram ID user yang ingin diberi akses ke bot ini.\n\n<i>Tidak tahu ID Telegram seseorang? Minta mereka forward pesan apapun ke bot @userinfobot.</i>',
+    { type: 'add_user', step: 'id' }
+  );
 });
 
 bot.action('users', async (ctx) => {
@@ -617,14 +673,19 @@ bot.action('users', async (ctx) => {
   if (uid(ctx) !== OWNER_ID) return;
   await safeDeleteMessage(ctx, ctx.chat.id, ctx.callbackQuery.message.message_id);
   const ids = [...allowedUsers].filter((id) => id !== OWNER_ID);
-  const text = `👥 <b>AUTHORIZED USERS</b>\n\n👑 Owner: <code>${OWNER_ID}</code>\n👤 User tambahan: <b>${ids.length}</b>\n\n${ids.length ? ids.map((id, i) => `${i + 1}. <code>${id}</code>`).join('\n') : 'Belum ada user tambahan.'}`;
-  await ctx.reply(menuText(text), { parse_mode: 'HTML', ...homeButton() });
+  const body = `👑 Owner&#8202;: <code>${OWNER_ID}</code>\n👤 User tambahan&#8202;: <b>${ids.length}</b>\n\n${ids.length ? ids.map((id, i) => `${i + 1}. <code>${id}</code>`).join('\n') : '<i>Belum ada user tambahan.</i>'}`;
+  await ctx.reply(menuText('Authorized Users', body), { parse_mode: 'HTML', ...homeButton() });
 });
 
 bot.action('delete_web', async (ctx) => {
   await ctx.answerCbQuery();
   await safeDeleteMessage(ctx, ctx.chat.id, ctx.callbackQuery.message.message_id);
-  await sendPlainPrompt(ctx, '🗑️ <b>DELETE DEPLOYMENT</b>\n\nKirim <b>Deployment ID Vercel</b> yang ingin dihapus.', { type: 'delete', step: 'id' });
+  await sendPlainPrompt(
+    ctx,
+    'Delete Deployment',
+    '🗑️ <b>Kirim Deployment ID</b>\n\nKirim Deployment ID dari Vercel yang ingin dihapus (bisa dilihat di dashboard Vercel, contoh&#8202;: <code>dpl_xxx…</code>).',
+    { type: 'delete', step: 'id' }
+  );
 });
 
 bot.on('text', async (ctx) => {
@@ -639,43 +700,43 @@ bot.on('text', async (ctx) => {
     if (id !== OWNER_ID) return;
     const target = Number(text);
     if (!Number.isInteger(target) || target <= 0) {
-      await sendPlainPrompt(ctx, '❌ Telegram ID tidak valid. Kirim angka ID Telegram.', session);
+      await sendPlainPrompt(ctx, 'Add User', '❌ <b>ID tidak valid.</b>\n\nKirim ulang dalam bentuk angka saja, contoh&#8202;: <code>123456789</code>.', session);
       return;
     }
     allowedUsers.add(target);
     try {
       await saveUsers();
       sessions.delete(id);
-      await ctx.reply(menuText(`✅ User <code>${target}</code> berhasil ditambahkan.`), { parse_mode: 'HTML', ...homeButton() });
+      await ctx.reply(menuText('Add User', `✅ User <code>${target}</code> berhasil ditambahkan dan sekarang punya akses ke bot ini.`), { parse_mode: 'HTML', ...homeButton() });
     } catch (error) {
       allowedUsers.delete(target);
       sessions.delete(id);
-      await ctx.reply(menuText(`❌ Gagal menyimpan user.\n<code>${escapeHtml(errorMessage(error))}</code>`), { parse_mode: 'HTML', ...homeButton() });
+      await ctx.reply(menuText('Add User', `❌ <b>Gagal menyimpan user.</b>\n\n<code>${escapeHtml(errorMessage(error))}</code>`), { parse_mode: 'HTML', ...homeButton() });
     }
     return;
   }
 
   if (session.type === 'source' && session.step === 'url') {
     sessions.delete(id);
-    const status = await ctx.reply(menuText('🌐 <b>GET SOURCE</b>\n\n⏳ Mengambil HTML, CSS, JavaScript, dan asset publik...'), { parse_mode: 'HTML' });
+    const status = await ctx.reply(menuText('Get Source', '⏳ Mengambil HTML, CSS, JavaScript, dan asset publik…'), { parse_mode: 'HTML' });
     try {
       const zip = await getPublicSource(text);
       await ctx.replyWithDocument({ source: zip, filename: 'source-public.zip' }, { caption: '✅ Source publik berhasil dibundel menjadi ZIP.' });
-      await updateStatus(ctx, status.message_id, '✅ <b>GET SOURCE SELESAI</b>\n\nZIP sudah dikirim. Resource yang gagal diakses publik tidak dapat dimasukkan.', homeButton());
+      await updateStatus(ctx, status.message_id, 'Get Source Selesai ✅', 'ZIP sudah dikirim di atas.\n\n<i>Catatan&#8202;: resource yang tidak bisa diakses publik tidak dapat dimasukkan.</i>', homeButton());
     } catch (error) {
-      await updateStatus(ctx, status.message_id, `❌ <b>GET SOURCE GAGAL</b>\n\n<code>${escapeHtml(errorMessage(error))}</code>`, homeButton());
+      await updateStatus(ctx, status.message_id, 'Get Source Gagal ❌', `<code>${escapeHtml(errorMessage(error))}</code>`, homeButton());
     }
     return;
   }
 
   if (session.type === 'delete' && session.step === 'id') {
     sessions.delete(id);
-    const status = await ctx.reply(menuText(`🗑️ <b>DELETE DEPLOYMENT</b>\n\n⏳ Menghapus <code>${escapeHtml(text)}</code>...`), { parse_mode: 'HTML' });
+    const status = await ctx.reply(menuText('Delete Deployment', `⏳ Menghapus <code>${escapeHtml(text)}</code>…`), { parse_mode: 'HTML' });
     try {
       await deleteDeployment(text);
-      await updateStatus(ctx, status.message_id, `✅ <b>DEPLOYMENT DIHAPUS</b>\n\nID: <code>${escapeHtml(text)}</code>`, homeButton());
+      await updateStatus(ctx, status.message_id, 'Deployment Dihapus ✅', `ID&#8202;: <code>${escapeHtml(text)}</code>`, homeButton());
     } catch (error) {
-      await updateStatus(ctx, status.message_id, `❌ <b>DELETE GAGAL</b>\n\n<code>${escapeHtml(errorMessage(error))}</code>`, homeButton());
+      await updateStatus(ctx, status.message_id, 'Delete Gagal ❌', `<code>${escapeHtml(errorMessage(error))}</code>`, homeButton());
     }
     return;
   }
@@ -684,19 +745,19 @@ bot.on('text', async (ctx) => {
     session.password = text;
     session.step = 'confirm';
     sessions.set(id, session);
-    await sendPlainPrompt(ctx, '🔐 <b>KONFIRMASI PASSWORD</b>\n\nKirim password yang sama sekali lagi.', session);
+    await sendPlainPrompt(ctx, 'Encrypt HTML', '🔐 <b>Langkah 3 dari 3&#8202;: Konfirmasi</b>\n\nKetik ulang password yang sama persis untuk konfirmasi.', session);
     return;
   }
 
   if (session.type === 'encrypt' && session.step === 'confirm') {
     if (text !== session.password) {
-      await sendPlainPrompt(ctx, '❌ Password berbeda. Kirim ulang password yang benar.', session);
+      await sendPlainPrompt(ctx, 'Encrypt HTML', '❌ <b>Password tidak sama.</b>\n\nKirim ulang password yang benar (harus sama persis dengan langkah sebelumnya).', session);
       return;
     }
     sessions.delete(id);
     const encrypted = encryptedHtml(session.fileBuffer.toString('utf8'), session.password);
-    await ctx.replyWithDocument({ source: Buffer.from(encrypted, 'utf8'), filename: `${session.fileName.replace(/\.html$/i, '')}-encrypted.html` }, { caption: '✅ HTML berhasil dienkripsi.' });
-    await ctx.reply(menuText('🛡️ <b>ENCRYPT SELESAI</b>\n\nFile terenkripsi sudah dikirim.'), { parse_mode: 'HTML', ...homeButton() });
+    await ctx.replyWithDocument({ source: Buffer.from(encrypted, 'utf8'), filename: `${session.fileName.replace(/\.html$/i, '')}-encrypted.html` }, { caption: '✅ HTML berhasil dienkripsi dengan AES-256.' });
+    await ctx.reply(menuText('Encrypt Selesai ✅', 'File terenkripsi sudah dikirim di atas. Simpan passwordnya baik-baik — tanpa password, isi file tidak bisa dibuka lagi.'), { parse_mode: 'HTML', ...homeButton() });
     return;
   }
 
@@ -704,13 +765,13 @@ bot.on('text', async (ctx) => {
     session.name = repoSafeName(text);
     session.step = 'deploying';
     sessions.set(id, session);
-    const status = await ctx.reply(menuText('🚀 <b>DEPLOYING</b>\n\n⏳ Memulai proses...'), { parse_mode: 'HTML' });
+    const status = await ctx.reply(menuText('Deploying', '⏳ Memulai proses deploy…'), { parse_mode: 'HTML' });
     await runDeployment(ctx, session, status);
     return;
   }
 
   if (session.type === 'deploy_html' || session.type === 'deploy_zip') {
-    await sendPlainPrompt(ctx, '📛 Tahap ini belum meminta nama. Ikuti instruksi terakhir dari bot.', session);
+    await sendPlainPrompt(ctx, 'Deploy', '📛 Tahap ini belum meminta nama repository. Ikuti instruksi terakhir dari bot di atas, atau tekan tombol Batalkan.', session);
   }
 });
 
@@ -725,48 +786,48 @@ bot.on('document', async (ctx) => {
 
   if (session.type === 'deploy_html' && session.step === 'file') {
     if (!/\.html?$/i.test(fileName)) {
-      await sendPlainPrompt(ctx, '❌ Deploy HTML hanya menerima file <code>.html</code>.', session);
+      await sendPlainPrompt(ctx, 'Deploy HTML', '❌ <b>Format salah.</b>\n\nMenu ini hanya menerima file <code>.html</code>. Silakan kirim ulang file yang sesuai.', session);
       return;
     }
     try {
       const buffer = await downloadTelegramFile(ctx, document.file_id);
       session.files = [{ path: 'index.html', buffer }];
       session.step = 'name';
-      await sendPlainPrompt(ctx, '📄 <b>HTML DITERIMA</b>\n\n📛 Sekarang kirim nama repository/website <b>tanpa spasi</b>.', session);
+      await sendPlainPrompt(ctx, 'Deploy HTML', `📄 <b>File diterima&#8202;:</b> <code>${escapeHtml(fileName)}</code>\n\n🚀 <b>Langkah 2 dari 2&#8202;: Nama Website</b>\n\nKirim nama repository/website (huruf, angka, dan tanda "-" saja, <b>tanpa spasi</b>).\nContoh&#8202;: <code>toko-online-saya</code>`, session);
     } catch (error) {
-      await sendPlainPrompt(ctx, `❌ Gagal mengambil file Telegram.\n<code>${escapeHtml(errorMessage(error))}</code>`, session);
+      await sendPlainPrompt(ctx, 'Deploy HTML', `❌ <b>Gagal mengambil file dari Telegram.</b>\n\n<code>${escapeHtml(errorMessage(error))}</code>`, session);
     }
     return;
   }
 
   if (session.type === 'deploy_zip' && session.step === 'file') {
     if (!/\.zip$/i.test(fileName)) {
-      await sendPlainPrompt(ctx, '❌ Deploy ZIP hanya menerima file <code>.zip</code>.', session);
+      await sendPlainPrompt(ctx, 'Deploy ZIP', '❌ <b>Format salah.</b>\n\nMenu ini hanya menerima file <code>.zip</code>. Silakan kirim ulang file yang sesuai.', session);
       return;
     }
     try {
       const buffer = await downloadTelegramFile(ctx, document.file_id);
       session.files = await extractZip(buffer);
       session.step = 'name';
-      await sendPlainPrompt(ctx, `📦 <b>ZIP DITERIMA</b>\n\n📁 File: <b>${session.files.length}</b>\n📛 Sekarang kirim nama repository/website <b>tanpa spasi</b>.`, session);
+      await sendPlainPrompt(ctx, 'Deploy ZIP', `📦 <b>ZIP diterima&#8202;:</b> <b>${session.files.length}</b> file ditemukan.\n\n🚀 <b>Langkah 2 dari 2&#8202;: Nama Website</b>\n\nKirim nama repository/website (huruf, angka, dan tanda "-" saja, <b>tanpa spasi</b>).\nContoh&#8202;: <code>toko-online-saya</code>`, session);
     } catch (error) {
-      await sendPlainPrompt(ctx, `❌ ZIP tidak valid.\n<code>${escapeHtml(errorMessage(error))}</code>`, session);
+      await sendPlainPrompt(ctx, 'Deploy ZIP', `❌ <b>ZIP tidak valid.</b>\n\n<code>${escapeHtml(errorMessage(error))}</code>`, session);
     }
     return;
   }
 
   if (session.type === 'encrypt' && session.step === 'file') {
     if (!/\.html?$/i.test(fileName)) {
-      await sendPlainPrompt(ctx, '❌ Encrypt HTML hanya menerima file <code>.html</code>.', session);
+      await sendPlainPrompt(ctx, 'Encrypt HTML', '❌ <b>Format salah.</b>\n\nMenu ini hanya menerima file <code>.html</code>. Silakan kirim ulang file yang sesuai.', session);
       return;
     }
     try {
       session.fileBuffer = await downloadTelegramFile(ctx, document.file_id);
       session.fileName = fileName;
       session.step = 'password';
-      await sendPlainPrompt(ctx, '🔐 <b>FILE DITERIMA</b>\n\nKirim password enkripsi.', session);
+      await sendPlainPrompt(ctx, 'Encrypt HTML', `📄 <b>File diterima&#8202;:</b> <code>${escapeHtml(fileName)}</code>\n\n🔐 <b>Langkah 2 dari 3&#8202;: Password</b>\n\nKirim password yang akan dipakai untuk mengunci file ini.`, session);
     } catch (error) {
-      await sendPlainPrompt(ctx, `❌ Gagal mengambil file Telegram.\n<code>${escapeHtml(errorMessage(error))}</code>`, session);
+      await sendPlainPrompt(ctx, 'Encrypt HTML', `❌ <b>Gagal mengambil file dari Telegram.</b>\n\n<code>${escapeHtml(errorMessage(error))}</code>`, session);
     }
   }
 });
@@ -774,14 +835,14 @@ bot.on('document', async (ctx) => {
 bot.command('adduser', async (ctx) => {
   if (uid(ctx) !== OWNER_ID) return;
   const target = Number(ctx.message.text.split(/\s+/)[1]);
-  if (!Number.isInteger(target) || target <= 0) return ctx.reply('Format: /adduser 123456789');
+  if (!Number.isInteger(target) || target <= 0) return ctx.reply(menuText('Add User', '❌ Format salah. Gunakan&#8202;: <code>/adduser 123456789</code>'), { parse_mode: 'HTML' });
   allowedUsers.add(target);
   try {
     await saveUsers();
-    await ctx.reply(menuText(`✅ User <code>${target}</code> berhasil ditambahkan.`), { parse_mode: 'HTML', ...homeButton() });
+    await ctx.reply(menuText('Add User', `✅ User <code>${target}</code> berhasil ditambahkan.`), { parse_mode: 'HTML', ...homeButton() });
   } catch (error) {
     allowedUsers.delete(target);
-    await ctx.reply(menuText(`❌ Gagal menyimpan user.\n<code>${escapeHtml(errorMessage(error))}</code>`), { parse_mode: 'HTML', ...homeButton() });
+    await ctx.reply(menuText('Add User', `❌ <b>Gagal menyimpan user.</b>\n\n<code>${escapeHtml(errorMessage(error))}</code>`), { parse_mode: 'HTML', ...homeButton() });
   }
 });
 
@@ -789,7 +850,7 @@ bot.command('cancel', async (ctx) => {
   const session = sessions.get(uid(ctx));
   if (session?.controlMessageId) await safeDeleteMessage(ctx, ctx.chat.id, session.controlMessageId);
   sessions.delete(uid(ctx));
-  await ctx.reply(menuText('↩️ <b>PROSES DIBATALKAN</b>'), { parse_mode: 'HTML', ...homeButton() });
+  await ctx.reply(menuText('Dibatalkan ↩️', 'Proses yang sedang berjalan sudah dibatalkan.'), { parse_mode: 'HTML', ...homeButton() });
 });
 
 bot.catch((error) => {
@@ -798,6 +859,17 @@ bot.catch((error) => {
 
 (async () => {
   await loadUsers();
+  // Sengaja HANYA mendaftarkan /start dan /cancel di daftar perintah "/".
+  // Navigasi utama tetap lewat inline button pada pesan bot, bukan lewat
+  // Reply Keyboard, supaya tidak ada dua menu yang tampil berbarengan.
+  try {
+    await bot.telegram.setMyCommands([
+      { command: 'start', description: 'Buka menu utama' },
+      { command: 'cancel', description: 'Batalkan proses yang sedang berjalan' },
+    ]);
+  } catch (error) {
+    console.error('[SET COMMANDS]', errorMessage(error));
+  }
 })();
 
 module.exports = async (req, res) => {
