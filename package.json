@@ -3,6 +3,9 @@
   "version": "1.0.1",
   "private": true,
   "main": "api/bot.js",
+  "engines": {
+    "node": "20.x"
+  },
   "dependencies": {
     "axios": "^1.7.0",
     "telegraf": "^4.16.3",
