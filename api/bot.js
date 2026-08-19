@@ -390,6 +390,27 @@ async function getDeployment(deploymentId, teamId) {
   return response.data;
 }
 
+async function getCleanProductionUrl(deploymentId, teamId, projectName) {
+  // Deployment yang baru dibuat punya URL unik berisi hash acak
+  // (mis. nama-b9gt875u5-user.vercel.app). Alias "bersih" produksi
+  // (nama.vercel.app) baru muncul di endpoint alias terpisah, kadang
+  // butuh beberapa detik setelah status READY. Kita coba ambil,
+  // dengan fallback ke pola nama project kalau belum kebentuk.
+  try {
+    const response = await axios.get(`${VERCEL_API}/v2/deployments/${encodeURIComponent(deploymentId)}/aliases`, {
+      headers: vercelHeaders,
+      params: teamId ? { teamId } : undefined,
+      timeout: 30000,
+    });
+    const aliases = (response.data?.aliases || []).map((a) => a.alias).filter(Boolean);
+    const clean = aliases.find((alias) => alias === `${projectName}.vercel.app`) ||
+      aliases.find((alias) => !/-[a-z0-9]{9,}(-[a-z0-9-]+)?\.vercel\.app$/i.test(alias)) ||
+      aliases[0];
+    if (clean) return clean;
+  } catch (_) {}
+  return `${projectName}.vercel.app`;
+}
+
 async function waitForDeployment(deploymentId, teamId, timeoutMs = 180000, onStatus) {
   const start = Date.now();
   let lastState = '';
@@ -524,24 +545,79 @@ async function checkVercel() {
   return r.data;
 }
 
-async function deleteDeployment(deploymentId) {
+async function tryGetVercelProject(idOrName) {
   const scopes = [null, ...(await getVercelTeamIds())];
-  let lastError;
   for (const teamId of scopes) {
     try {
-      await axios.delete(`${VERCEL_API}/v13/deployments/${encodeURIComponent(deploymentId)}`, {
+      const response = await axios.get(`${VERCEL_API}/v9/projects/${encodeURIComponent(idOrName)}`, {
         headers: vercelHeaders,
         params: teamId ? { teamId } : undefined,
-        timeout: 30000,
+        timeout: 20000,
       });
-      return true;
-    } catch (error) {
-      lastError = error;
-      const status = error.response?.status;
-      if (![401, 403, 404].includes(status)) break;
+      return { ...response.data, teamId: teamId || null };
+    } catch (_) {
+      // coba scope berikutnya
     }
   }
-  throw new Error(errorMessage(lastError));
+  return null;
+}
+
+async function resolveVercelProjectFromUrl(urlInput) {
+  let value = String(urlInput).trim();
+  if (!/^https?:\/\//i.test(value)) value = `https://${value}`;
+  let host;
+  try {
+    host = new URL(value).hostname.toLowerCase();
+  } catch (_) {
+    throw new Error('Link tidak valid. Kirim URL lengkap, contoh: https://nama-web.vercel.app');
+  }
+  if (!host.endsWith('.vercel.app')) {
+    throw new Error('Link harus berupa domain *.vercel.app hasil deploy Cloud Logic.');
+  }
+
+  const baseSlug = host.slice(0, -'.vercel.app'.length);
+  const candidates = [baseSlug];
+  let working = baseSlug;
+  // Kalau link masih format lama (ada hash acak di belakang), coba lucuti
+  // segmen terakhirnya satu-satu sampai ketemu nama project aslinya.
+  for (let i = 0; i < 3; i++) {
+    const idx = working.lastIndexOf('-');
+    if (idx <= 0) break;
+    const segment = working.slice(idx + 1);
+    working = working.slice(0, idx);
+    if (/^[a-z0-9]{6,}$/i.test(segment)) candidates.push(working);
+    else break;
+  }
+
+  for (const candidate of candidates) {
+    const project = await tryGetVercelProject(candidate);
+    if (project) return project;
+  }
+  throw new Error(`Project Vercel untuk "${host}" tidak ditemukan. Pastikan link sesuai hasil deploy Cloud Logic.`);
+}
+
+async function deleteVercelProject(project) {
+  await axios.delete(`${VERCEL_API}/v9/projects/${encodeURIComponent(project.id)}`, {
+    headers: vercelHeaders,
+    params: project.teamId ? { teamId: project.teamId } : undefined,
+    timeout: 30000,
+  });
+}
+
+async function findGithubRepoByProjectName(projectName) {
+  for (let page = 1; page <= 10; page += 1) {
+    const response = await githubApi('GET', '/user/repos', undefined, {
+      params: { per_page: 100, page, affiliation: 'owner' },
+    });
+    const match = response.data.find((r) => r.name.toLowerCase().replace(/_/g, '-') === projectName);
+    if (match) return match;
+    if (response.data.length < 100) break;
+  }
+  return null;
+}
+
+async function deleteGithubRepo(owner, repoName) {
+  await githubApi('DELETE', `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repoName)}`);
 }
 
 async function runDeployment(ctx, session, statusMessage) {
@@ -576,7 +652,11 @@ async function runDeployment(ctx, session, statusMessage) {
       throw new Error(`Build Vercel berakhir dengan status ${final.readyState || final.state || 'ERROR'}.`);
     }
 
-    const url = final.url ? `https://${final.url}` : `https://${projectSafeName(repo.name)}.vercel.app`;
+    await updateStatus(ctx, statusMessage.message_id, 'Deploying',
+      `📦 Repository&#8202;: <code>${escapeHtml(repo.name)}</code>\n🔗 <a href="${escapeHtml(repo.html_url)}">Buka di GitHub</a>\n\n✅ GitHub&#8202;: <b>unggah selesai</b>\n⚡ Vercel&#8202;: <b>READY, mengambil link bersih…</b>`);
+
+    const cleanHost = await getCleanProductionUrl(deployment.id, deployment.teamId, projectSafeName(repoName));
+    const url = `https://${cleanHost}`;
     await updateStatus(ctx, statusMessage.message_id, 'Deploy Berhasil ✅',
       `📦 <b>Repository</b>\n<a href="${escapeHtml(repo.html_url)}">${escapeHtml(repo.full_name)}</a>\n\n🌐 <b>Website</b>\n<a href="${escapeHtml(url)}">${escapeHtml(url)}</a>\n\n🟢 Status Vercel&#8202;: <b>READY</b>`,
       homeButton());
@@ -686,9 +766,9 @@ bot.action('delete_web', async (ctx) => {
   await safeDeleteMessage(ctx, ctx.chat.id, ctx.callbackQuery.message.message_id);
   await sendPlainPrompt(
     ctx,
-    'Delete Deployment',
-    '🗑️ <b>Kirim Deployment ID</b>\n\nKirim Deployment ID dari Vercel yang ingin dihapus (bisa dilihat di dashboard Vercel, contoh&#8202;: <code>dpl_xxx…</code>).',
-    { type: 'delete', step: 'id' }
+    'Delete Web',
+    '🗑️ <b>Kirim Link Website</b>\n\nKirim link website hasil deploy Cloud Logic yang ingin dihapus.\nContoh&#8202;: <code>https://nama-web.vercel.app</code>\n\nWebsite (Vercel) dan repository (GitHub) yang cocok akan <b>otomatis ikut terhapus</b> — tidak perlu cari ID atau buka dashboard.',
+    { type: 'delete', step: 'link' }
   );
 });
 
@@ -733,12 +813,32 @@ bot.on('text', async (ctx) => {
     return;
   }
 
-  if (session.type === 'delete' && session.step === 'id') {
+  if (session.type === 'delete' && session.step === 'link') {
     sessions.delete(id);
-    const status = await ctx.reply(menuText('Delete Deployment', `⏳ Menghapus <code>${escapeHtml(text)}</code>…`), { parse_mode: 'HTML' });
+    const status = await ctx.reply(menuText('Delete Web', '⏳ Mencari project dari link…'), { parse_mode: 'HTML' });
     try {
-      await deleteDeployment(text);
-      await updateStatus(ctx, status.message_id, 'Deployment Dihapus ✅', `ID&#8202;: <code>${escapeHtml(text)}</code>`, homeButton());
+      const project = await resolveVercelProjectFromUrl(text);
+
+      await updateStatus(ctx, status.message_id, 'Delete Web',
+        `🌐 Project ditemukan&#8202;: <code>${escapeHtml(project.name)}</code>\n\n⏳ Menghapus website & deployment di Vercel…`);
+      await deleteVercelProject(project);
+
+      let repoLine = '⚠️ Repository GitHub dengan nama yang cocok tidak ditemukan — kalau masih ada, hapus manual di GitHub.';
+      try {
+        const repo = await findGithubRepoByProjectName(project.name);
+        if (repo) {
+          await updateStatus(ctx, status.message_id, 'Delete Web',
+            `🌐 Project&#8202;: <code>${escapeHtml(project.name)}</code>\n✅ Website & deployment Vercel dihapus.\n\n⏳ Menghapus repository <code>${escapeHtml(repo.full_name)}</code>…`);
+          await deleteGithubRepo(repo.owner.login, repo.name);
+          repoLine = `✅ Repository <code>${escapeHtml(repo.full_name)}</code> ikut dihapus.`;
+        }
+      } catch (repoError) {
+        repoLine = `⚠️ Website sudah terhapus, tapi gagal hapus repository&#8202;: <code>${escapeHtml(errorMessage(repoError))}</code>`;
+      }
+
+      await updateStatus(ctx, status.message_id, 'Web Dihapus ✅',
+        `🌐 Project&#8202;: <code>${escapeHtml(project.name)}</code>\n✅ Website & deployment Vercel dihapus.\n${repoLine}`,
+        homeButton());
     } catch (error) {
       await updateStatus(ctx, status.message_id, 'Delete Gagal ❌', `<code>${escapeHtml(errorMessage(error))}</code>`, homeButton());
     }
