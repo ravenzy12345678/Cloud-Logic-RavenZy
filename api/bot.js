@@ -562,6 +562,37 @@ async function tryGetVercelProject(idOrName) {
   return null;
 }
 
+async function findProjectByDeploymentHost(host) {
+  // Cocokkan persis ke deployment.url (bukan menebak pola nama), ini yang
+  // paling akurat untuk link lama berformat "nama-hashacak-teamslug.vercel.app"
+  // karena teamslug sendiri bisa berisi tanda "-" sehingga tebak-tebakan
+  // pemotongan teks jadi tidak bisa diandalkan.
+  const scopes = [null, ...(await getVercelTeamIds())];
+  for (const teamId of scopes) {
+    let cursor;
+    for (let page = 0; page < 5; page += 1) {
+      try {
+        const response = await axios.get(`${VERCEL_API}/v6/deployments`, {
+          headers: vercelHeaders,
+          params: { teamId: teamId || undefined, limit: 100, until: cursor },
+          timeout: 30000,
+        });
+        const deployments = response.data?.deployments || [];
+        const match = deployments.find((d) => d.url === host);
+        if (match?.projectId) {
+          const project = await tryGetVercelProject(match.projectId);
+          if (project) return project;
+        }
+        cursor = response.data?.pagination?.next;
+        if (!cursor) break;
+      } catch (_) {
+        break;
+      }
+    }
+  }
+  return null;
+}
+
 async function resolveVercelProjectFromUrl(urlInput) {
   let value = String(urlInput).trim();
   if (!/^https?:\/\//i.test(value)) value = `https://${value}`;
@@ -576,23 +607,16 @@ async function resolveVercelProjectFromUrl(urlInput) {
   }
 
   const baseSlug = host.slice(0, -'.vercel.app'.length);
-  const candidates = [baseSlug];
-  let working = baseSlug;
-  // Kalau link masih format lama (ada hash acak di belakang), coba lucuti
-  // segmen terakhirnya satu-satu sampai ketemu nama project aslinya.
-  for (let i = 0; i < 3; i++) {
-    const idx = working.lastIndexOf('-');
-    if (idx <= 0) break;
-    const segment = working.slice(idx + 1);
-    working = working.slice(0, idx);
-    if (/^[a-z0-9]{6,}$/i.test(segment)) candidates.push(working);
-    else break;
-  }
 
-  for (const candidate of candidates) {
-    const project = await tryGetVercelProject(candidate);
-    if (project) return project;
-  }
+  // 1) Coba langsung: cocok untuk link bersih (nama-project.vercel.app)
+  let project = await tryGetVercelProject(baseSlug);
+  if (project) return project;
+
+  // 2) Coba cocokkan persis ke deployment aslinya (akurat untuk link lama
+  //    yang masih ada hash acak di belakangnya)
+  project = await findProjectByDeploymentHost(host);
+  if (project) return project;
+
   throw new Error(`Project Vercel untuk "${host}" tidak ditemukan. Pastikan link sesuai hasil deploy Cloud Logic.`);
 }
 
