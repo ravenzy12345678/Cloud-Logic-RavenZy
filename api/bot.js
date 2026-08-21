@@ -88,20 +88,23 @@ async function safeDeleteMessage(ctx, chatId, messageId) {
 
 // ─────────────────────────────────────────────
 // TAMPILAN / UI HELPERS
-// Catatan penting: bot ini SENGAJA tidak memakai Reply Keyboard (tombol
-// menu di sebelah kotak ketik) maupun daftar perintah "/" di menu chat.
-// Semua navigasi hanya lewat inline button yang menempel di pesan bot,
-// supaya tidak ada dua menu berbeda yang membingungkan pengguna.
+//
+// Aturan tampilan bot ini:
+// 1. Navigasi HANYA lewat inline button pada pesan bot (tidak ada Reply
+//    Keyboard, tidak ada daftar perintah "/" selain /start dan /cancel),
+//    supaya tidak ada dua menu berbeda yang membingungkan.
+// 2. Semua pesan mematikan link preview (disable_web_page_preview) supaya
+//    tidak ada kartu/gambar preview GitHub atau Vercel yang muncul —
+//    tampilan tetap murni teks & status.
+// 3. Tombol "Menu Utama" TIDAK PERNAH menghapus pesan yang ditempelinya,
+//    jadi hasil (link deploy, hasil delete, dsb) tidak pernah hilang saat
+//    pengguna menekan tombol itu atau /start ulang.
 // ─────────────────────────────────────────────
 
-const DIVIDER = '┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈';
+const BAR = '━━━━━━━━━━━━━━━━━━━━━━━━━━━';
 
 function homeButton() {
   return Markup.inlineKeyboard([[Markup.button.callback('🏠  Menu Utama', 'home')]]);
-}
-
-function backCancelRow() {
-  return [Markup.button.callback('✖️  Batalkan', 'home')];
 }
 
 function mainMenuMarkup() {
@@ -113,40 +116,72 @@ function mainMenuMarkup() {
   ]);
 }
 
-function menuText(title, body) {
-  if (body === undefined) {
-    // Dipanggil dengan 1 argumen (kompatibilitas lama) → anggap itu body, pakai judul default.
-    return `☁️ <b>CLOUD LOGIC</b>\n${DIVIDER}\n${title}`;
-  }
-  return `☁️ <b>CLOUD LOGIC</b>  ·  <i>${escapeHtml(title)}</i>\n${DIVIDER}\n${body}`;
-}
-
-async function sendMainMenu(ctx, body = '🟢 <b>Status:</b> Online & siap digunakan.\n\nSilakan pilih salah satu menu di bawah ini.') {
-  await safeDeleteMessage(ctx, ctx.chat?.id, ctx.callbackQuery?.message?.message_id);
-  await ctx.reply(menuText('Menu Utama', body), { parse_mode: 'HTML', ...mainMenuMarkup() });
-}
-
-async function sendPlainPrompt(ctx, title, body, session) {
-  const old = sessions.get(uid(ctx));
-  if (old?.controlMessageId) await safeDeleteMessage(ctx, ctx.chat.id, old.controlMessageId);
-  const message = await ctx.reply(menuText(title, body), {
-    parse_mode: 'HTML',
-    ...Markup.forceReply(),
+// Kotak info bergaya "dashboard" — dipakai untuk semua tampilan status/hasil
+// supaya konsisten & terlihat premium di seluruh menu.
+function infoBox(rows) {
+  const lines = rows.map(([label, value], idx) => {
+    const prefix = idx === rows.length - 1 ? '└' : '├';
+    return `${prefix} ${label} : ${value}`;
   });
-  session.controlMessageId = message.message_id;
-  sessions.set(uid(ctx), session);
-  return message;
+  return `┌─────────────────────────\n${lines.join('\n')}`;
 }
 
-async function updateStatus(ctx, messageId, title, body, keyboard = null) {
+function panel({ heading, box, body, footer } = {}) {
+  let out = `⚡ <b>CLOUD LOGIC</b>\n${BAR}\n\n`;
+  if (heading) out += `${heading}\n`;
+  if (box) out += `${box}\n`;
+  if (body) out += `${body}\n`;
+  out += `\n${BAR}`;
+  if (footer) out += `\n${footer}`;
+  return out;
+}
+
+function progressBar(percent) {
+  const total = 10;
+  const filled = Math.min(total, Math.max(0, Math.round((percent / 100) * total)));
+  return '█'.repeat(filled) + '░'.repeat(total - filled);
+}
+
+function formatElapsed(ms) {
+  const totalSec = Math.max(0, Math.round(ms / 1000));
+  const m = Math.floor(totalSec / 60);
+  const s = totalSec % 60;
+  return `${m}m ${s}s`;
+}
+
+const REPLY_OPTS = { parse_mode: 'HTML', disable_web_page_preview: true };
+
+async function sendPanel(ctx, text, keyboard) {
+  return ctx.reply(text, { ...REPLY_OPTS, ...(keyboard || {}) });
+}
+
+async function editPanel(ctx, messageId, text, keyboard) {
   try {
-    return await ctx.telegram.editMessageText(ctx.chat.id, messageId, undefined, menuText(title, body), {
-      parse_mode: 'HTML',
+    return await ctx.telegram.editMessageText(ctx.chat.id, messageId, undefined, text, {
+      ...REPLY_OPTS,
       ...(keyboard || {}),
     });
   } catch (_) {
     return null;
   }
+}
+
+async function sendMainMenu(ctx, body = '🟢 Status: Online & siap digunakan.\n\nSilakan pilih salah satu menu di bawah ini.') {
+  // SENGAJA tidak menghapus pesan apapun di sini — supaya hasil/status
+  // sebelumnya (mis. link deploy) tidak pernah hilang saat kembali ke menu.
+  await sendPanel(ctx, panel({ heading: '<b>MENU UTAMA</b>', body }), mainMenuMarkup());
+}
+
+async function sendPrompt(ctx, heading, body, session) {
+  const old = sessions.get(uid(ctx));
+  if (old?.controlMessageId) await safeDeleteMessage(ctx, ctx.chat.id, old.controlMessageId);
+  const message = await ctx.reply(panel({ heading: `<b>${escapeHtml(heading)}</b>`, body }), {
+    ...REPLY_OPTS,
+    ...Markup.forceReply(),
+  });
+  session.controlMessageId = message.message_id;
+  sessions.set(uid(ctx), session);
+  return message;
 }
 
 async function getBotRepoFile(path) {
@@ -376,7 +411,7 @@ async function createVercelDeployment(name, files) {
 
   const message = errorMessage(lastError);
   if (/not authorized|unauthorized/i.test(message)) {
-    throw new Error(`Vercel menolak deployment (Not authorized). Periksa VERCEL_TOKEN — pastikan token masih berlaku dan dibuat dari akun/scope yang benar (name: ${name}).`);
+    throw new Error('Vercel menolak deployment (Not authorized). Periksa VERCEL_TOKEN — pastikan token masih berlaku dan dibuat dari akun/scope yang benar.');
   }
   throw new Error(`Vercel deployment gagal: ${message}`);
 }
@@ -424,7 +459,7 @@ async function waitForDeployment(deploymentId, teamId, timeoutMs = 180000, onSta
     if (['READY', 'ERROR', 'CANCELED'].includes(state)) return deployment;
     await sleep(5000);
   }
-  throw new Error('Deployment belum selesai dalam 3 menit. Periksa deployment di Vercel untuk build log lengkap.');
+  throw new Error('Deployment belum selesai dalam 3 menit. Periksa lagi beberapa saat lagi.');
 }
 
 function normalizeZipPath(path) {
@@ -465,84 +500,6 @@ async function downloadTelegramFile(ctx, fileId) {
     maxContentLength: 200 * 1024 * 1024,
   });
   return Buffer.from(response.data);
-}
-
-async function getPublicSource(url) {
-  const base = new URL(url);
-  if (!['http:', 'https:'].includes(base.protocol)) throw new Error('URL harus http atau https.');
-  const response = await axios.get(base.href, {
-    timeout: 30000,
-    responseType: 'text',
-    maxContentLength: 10 * 1024 * 1024,
-    headers: { 'User-Agent': 'Cloud-Logic-SourceFetcher/1.0' },
-  });
-  const html = String(response.data);
-  const zip = new JSZip();
-  zip.file('index.html', html);
-
-  const assets = new Set();
-  const add = (candidate) => {
-    try {
-      const absolute = new URL(candidate, base.href);
-      if (['http:', 'https:'].includes(absolute.protocol)) assets.add(absolute.href);
-    } catch (_) {}
-  };
-
-  for (const match of html.matchAll(/<(?:script|link|img|source|video|audio)[^>]+(?:src|href)=['"]([^'"]+)['"]/gi)) add(match[1]);
-  for (const match of html.matchAll(/url\(\s*['"]?([^'"\)]+)['"]?\s*\)/gi)) add(match[1]);
-
-  let index = 0;
-  for (const assetUrl of assets) {
-    if (index >= 100) break;
-    try {
-      const asset = await axios.get(assetUrl, {
-        responseType: 'arraybuffer',
-        timeout: 15000,
-        maxContentLength: 10 * 1024 * 1024,
-        headers: { 'User-Agent': 'Cloud-Logic-SourceFetcher/1.0' },
-      });
-      const parsed = new URL(assetUrl);
-      const fileName = parsed.pathname.split('/').filter(Boolean).pop() || `asset-${index}`;
-      zip.file(`assets/${index}-${fileName}`, Buffer.from(asset.data));
-      index += 1;
-    } catch (_) {}
-  }
-  return zip.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE' });
-}
-
-function encryptedHtml(html, password) {
-  const salt = crypto.randomBytes(16);
-  const iv = crypto.randomBytes(12);
-  const key = crypto.pbkdf2Sync(Buffer.from(password, 'utf8'), salt, 200000, 32, 'sha256');
-  const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
-  const ciphertext = Buffer.concat([cipher.update(Buffer.from(html, 'utf8')), cipher.final()]);
-  const tag = cipher.getAuthTag();
-  const b64 = (value) => value.toString('base64');
-
-  return `<!doctype html><meta charset="utf-8"><title>Encrypted HTML</title><div id="app">Password required.</div><script>
-(async()=>{
-const enc=${JSON.stringify(b64(ciphertext))},salt=${JSON.stringify(b64(salt))},iv=${JSON.stringify(b64(iv))},tag=${JSON.stringify(b64(tag))};
-const p=prompt('Password:'); if(!p) return;
-const bytes=s=>Uint8Array.from(atob(s),c=>c.charCodeAt(0));
-const material=await crypto.subtle.importKey('raw',new TextEncoder().encode(p),'PBKDF2',false,['deriveKey']);
-const key=await crypto.subtle.deriveKey({name:'PBKDF2',salt:bytes(salt),iterations:200000,hash:'SHA-256'},material,{name:'AES-GCM',length:256},false,['decrypt']);
-try{
-const packed=new Uint8Array([...bytes(enc),...bytes(tag)]);
-const plain=await crypto.subtle.decrypt({name:'AES-GCM',iv:bytes(iv)},key,packed);
-document.open();document.write(new TextDecoder().decode(plain));document.close();
-}catch(e){document.body.innerHTML='<h3>Wrong password or corrupted file.</h3>';}
-})();
-</script>`;
-}
-
-async function checkGitHub() {
-  const r = await axios.get(`${GH_API}/user`, { headers: ghHeaders, timeout: 30000 });
-  return r.data;
-}
-
-async function checkVercel() {
-  const r = await axios.get(`${VERCEL_API}/v2/user`, { headers: vercelHeaders, timeout: 30000 });
-  return r.data;
 }
 
 async function tryGetVercelProject(idOrName) {
@@ -644,51 +601,210 @@ async function deleteGithubRepo(owner, repoName) {
   await githubApi('DELETE', `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repoName)}`);
 }
 
+// ─────────────────────────────────────────────
+// GET SOURCE — pengambilan HTML + CSS + JS + asset publik
+//
+// Selain membaca HTML utama, fungsi ini SEKARANG juga membuka tiap file
+// CSS yang ditemukan untuk mencari referensi asset di dalamnya
+// (url(...) dan @import) — jadi background-image / font yang dipanggil
+// dari dalam CSS ikut terbawa, bukan cuma asset yang direferensikan
+// langsung dari tag HTML.
+// ─────────────────────────────────────────────
+
+function looksLikeSpaShell(html) {
+  const bodyMatch = html.match(/<body[^>]*>([\s\S]*?)<\/body>/i);
+  const bodyContent = bodyMatch ? bodyMatch[1] : html;
+  const textOnly = bodyContent.replace(/<script[\s\S]*?<\/script>/gi, '').replace(/<[^>]+>/g, '').trim();
+  const hasRootMount = /<div[^>]+id=["'](root|app|__next|__nuxt)["']/i.test(html);
+  return hasRootMount && textOnly.length < 40;
+}
+
+async function getPublicSource(url) {
+  const base = new URL(url);
+  if (!['http:', 'https:'].includes(base.protocol)) throw new Error('URL harus http atau https.');
+
+  const response = await axios.get(base.href, {
+    timeout: 30000,
+    responseType: 'text',
+    maxRedirects: 5,
+    maxContentLength: 10 * 1024 * 1024,
+    headers: { 'User-Agent': 'Mozilla/5.0 (compatible; CloudLogicSourceFetcher/1.0)' },
+  });
+
+  const html = String(response.data);
+  const zip = new JSZip();
+  zip.file('index.html', html);
+
+  const visited = new Set();
+  const queue = [];
+  const addAsset = (candidate, refBase) => {
+    try {
+      const absolute = new URL(candidate, refBase);
+      if (!['http:', 'https:'].includes(absolute.protocol)) return;
+      const clean = absolute.href.split('#')[0];
+      if (visited.has(clean)) return;
+      visited.add(clean);
+      queue.push(clean);
+    } catch (_) {}
+  };
+
+  const extractFromHtml = (text, refBase) => {
+    for (const match of text.matchAll(/<(?:script|link|img|source|video|audio)[^>]+(?:src|href)=['"]([^'"]+)['"]/gi)) addAsset(match[1], refBase);
+    for (const match of text.matchAll(/url\(\s*['"]?([^'"\)]+)['"]?\s*\)/gi)) addAsset(match[1], refBase);
+  };
+  extractFromHtml(html, base.href);
+
+  let downloaded = 0;
+  const MAX_ASSETS = 100;
+  const MAX_CSS_SCAN = 25;
+  let cssScanned = 0;
+
+  while (queue.length && downloaded < MAX_ASSETS) {
+    const assetUrl = queue.shift();
+    try {
+      const asset = await axios.get(assetUrl, {
+        responseType: 'arraybuffer',
+        timeout: 15000,
+        maxRedirects: 5,
+        maxContentLength: 10 * 1024 * 1024,
+        headers: { 'User-Agent': 'Mozilla/5.0 (compatible; CloudLogicSourceFetcher/1.0)' },
+      });
+      const parsedUrl = new URL(assetUrl);
+      const fileName = parsedUrl.pathname.split('/').filter(Boolean).pop() || `asset-${downloaded}`;
+      const buffer = Buffer.from(asset.data);
+      zip.file(`assets/${downloaded}-${fileName}`, buffer);
+      downloaded += 1;
+
+      const contentType = String(asset.headers?.['content-type'] || '');
+      const isCss = /\.css($|\?)/i.test(fileName) || contentType.includes('text/css');
+      if (isCss && cssScanned < MAX_CSS_SCAN) {
+        cssScanned += 1;
+        const cssText = buffer.toString('utf8');
+        for (const match of cssText.matchAll(/url\(\s*['"]?([^'"\)]+)['"]?\s*\)/gi)) addAsset(match[1], assetUrl);
+        for (const match of cssText.matchAll(/@import\s+['"]([^'"]+)['"]/gi)) addAsset(match[1], assetUrl);
+      }
+    } catch (_) {
+      // Asset gagal diambil (mis. diblokir CORS/hotlink protection) — lewati,
+      // jangan gagalkan keseluruhan proses.
+    }
+  }
+
+  const zipBuffer = await zip.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE' });
+  return { buffer: zipBuffer, assetCount: downloaded, isSpaLikely: looksLikeSpaShell(html) };
+}
+
+function encryptedHtml(html, password) {
+  const salt = crypto.randomBytes(16);
+  const iv = crypto.randomBytes(12);
+  const key = crypto.pbkdf2Sync(Buffer.from(password, 'utf8'), salt, 200000, 32, 'sha256');
+  const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
+  const ciphertext = Buffer.concat([cipher.update(Buffer.from(html, 'utf8')), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  const b64 = (value) => value.toString('base64');
+
+  return `<!doctype html><meta charset="utf-8"><title>Encrypted HTML</title><div id="app">Password required.</div><script>
+(async()=>{
+const enc=${JSON.stringify(b64(ciphertext))},salt=${JSON.stringify(b64(salt))},iv=${JSON.stringify(b64(iv))},tag=${JSON.stringify(b64(tag))};
+const p=prompt('Password:'); if(!p) return;
+const bytes=s=>Uint8Array.from(atob(s),c=>c.charCodeAt(0));
+const material=await crypto.subtle.importKey('raw',new TextEncoder().encode(p),'PBKDF2',false,['deriveKey']);
+const key=await crypto.subtle.deriveKey({name:'PBKDF2',salt:bytes(salt),iterations:200000,hash:'SHA-256'},material,{name:'AES-GCM',length:256},false,['decrypt']);
+try{
+const packed=new Uint8Array([...bytes(enc),...bytes(tag)]);
+const plain=await crypto.subtle.decrypt({name:'AES-GCM',iv:bytes(iv)},key,packed);
+document.open();document.write(new TextDecoder().decode(plain));document.close();
+}catch(e){document.body.innerHTML='<h3>Wrong password or corrupted file.</h3>';}
+})();
+</script>`;
+}
+
+async function checkGitHub() {
+  const r = await axios.get(`${GH_API}/user`, { headers: ghHeaders, timeout: 30000 });
+  return r.data;
+}
+
+async function checkVercel() {
+  const r = await axios.get(`${VERCEL_API}/v2/user`, { headers: vercelHeaders, timeout: 30000 });
+  return r.data;
+}
+
+// ─────────────────────────────────────────────
+// DEPLOY — dashboard log + hasil premium
+// ─────────────────────────────────────────────
+
 async function runDeployment(ctx, session, statusMessage) {
   const repoName = repoSafeName(session.name);
-  let repo = null;
-  let commit = null;
+  const modeLabel = session.type === 'deploy_zip' ? 'Deploy ZIP' : 'Deploy HTML';
+  const startedAt = Date.now();
 
-  const progress = (ghLine, vercelLine) =>
-    `📦 Repository&#8202;: <code>${escapeHtml(repoName)}</code>\n\n${ghLine}\n${vercelLine}`;
+  const render = async (percent, activity) => {
+    await editPanel(ctx, statusMessage.message_id, panel({
+      heading: '📊 <b>DASHBOARD LOG</b>',
+      box: infoBox([
+        ['📡 Server', '🔵 <b>PROCESSING</b>'],
+        ['🔧 Mode', escapeHtml(modeLabel)],
+        ['📦 Nama Web', `<code>${escapeHtml(repoName)}</code>`],
+        ['🔄 Progress', `<code>${progressBar(percent)}</code> ${percent}%`],
+        ['📝 Activity', escapeHtml(activity)],
+      ]),
+      footer: 'Proses membutuhkan waktu, jadi mohon\nuntuk sabar.....',
+    }));
+  };
 
-  await updateStatus(ctx, statusMessage.message_id, 'Deploying',
-    progress('⬆️ GitHub&#8202;: <b>mempersiapkan…</b>', '⚡ Vercel&#8202;: <b>menunggu…</b>'));
+  await render(5, 'Menyiapkan berkas…');
 
   try {
-    repo = await createGitHubRepo(repoName);
-    await updateStatus(ctx, statusMessage.message_id, 'Deploying',
-      `📦 Repository&#8202;: <code>${escapeHtml(repo.name)}</code>\n🔗 <a href="${escapeHtml(repo.html_url)}">Buka di GitHub</a>\n\n⬆️ GitHub&#8202;: <b>mengunggah ${session.files.length} berkas…</b>\n⚡ Vercel&#8202;: <b>menunggu…</b>`);
+    // Backup ke GitHub bersifat opsional (tidak ditampilkan ke pengguna) dan
+    // TIDAK BOLEH menggagalkan keseluruhan proses deploy kalau bermasalah,
+    // karena deploy ke Vercel sekarang sepenuhnya independen dari GitHub.
+    try {
+      const repo = await createGitHubRepo(repoName);
+      await uploadFilesToNewRepo(repo, session.files);
+    } catch (_) {
+      // backup gagal, tetap lanjut — bukan kegagalan fatal
+    }
 
-    commit = await uploadFilesToNewRepo(repo, session.files);
-    await updateStatus(ctx, statusMessage.message_id, 'Deploying',
-      `📦 Repository&#8202;: <code>${escapeHtml(repo.name)}</code>\n🔗 <a href="${escapeHtml(repo.html_url)}">Buka di GitHub</a>\n\n✅ GitHub&#8202;: <b>unggah selesai</b>\n⚡ Vercel&#8202;: <b>membuat deployment…</b>`);
+    await render(30, 'Mengunggah berkas ke server…');
 
-    // Deploy langsung dari file yang sudah diunggah user (bukan menarik dari
-    // GitHub), jadi tidak butuh GitHub App Integration Vercel sama sekali.
-    const deployment = await createVercelDeployment(repo.name, session.files);
+    const deployment = await createVercelDeployment(repoName, session.files);
+    await render(45, 'Menunggu antrian build…');
+
     const final = await waitForDeployment(deployment.id, deployment.teamId, 180000, async (state) => {
-      await updateStatus(ctx, statusMessage.message_id, 'Deploying',
-        `📦 Repository&#8202;: <code>${escapeHtml(repo.name)}</code>\n🔗 <a href="${escapeHtml(repo.html_url)}">Buka di GitHub</a>\n\n✅ GitHub&#8202;: <b>unggah selesai</b>\n⚡ Vercel&#8202;: <b>${escapeHtml(state || 'PROCESSING')}</b>`);
+      if (state === 'BUILDING') await render(70, 'Membangun & mengoptimasi website…');
+      else if (state === 'READY') await render(95, 'Menyelesaikan…');
+      else if (state === 'QUEUED' || state === 'INITIALIZING') await render(50, 'Dalam antrian build…');
+      else await render(60, `Status: ${state || 'memproses'}…`);
     });
 
     if ((final.readyState || final.state) !== 'READY') {
-      throw new Error(`Build Vercel berakhir dengan status ${final.readyState || final.state || 'ERROR'}.`);
+      throw new Error(`Build berakhir dengan status ${final.readyState || final.state || 'ERROR'}.`);
     }
 
-    await updateStatus(ctx, statusMessage.message_id, 'Deploying',
-      `📦 Repository&#8202;: <code>${escapeHtml(repo.name)}</code>\n🔗 <a href="${escapeHtml(repo.html_url)}">Buka di GitHub</a>\n\n✅ GitHub&#8202;: <b>unggah selesai</b>\n⚡ Vercel&#8202;: <b>READY, mengambil link bersih…</b>`);
-
+    await render(98, 'Mengambil link publik…');
     const cleanHost = await getCleanProductionUrl(deployment.id, deployment.teamId, projectSafeName(repoName));
     const url = `https://${cleanHost}`;
-    await updateStatus(ctx, statusMessage.message_id, 'Deploy Berhasil ✅',
-      `📦 <b>Repository</b>\n<a href="${escapeHtml(repo.html_url)}">${escapeHtml(repo.full_name)}</a>\n\n🌐 <b>Website</b>\n<a href="${escapeHtml(url)}">${escapeHtml(url)}</a>\n\n🟢 Status Vercel&#8202;: <b>READY</b>`,
-      homeButton());
+    const elapsed = formatElapsed(Date.now() - startedAt);
+
+    await editPanel(ctx, statusMessage.message_id, panel({
+      heading: '<b>DEPLOY BERHASIL ✅️</b>',
+      box: infoBox([
+        ['📦 Project', escapeHtml(repoName)],
+        ['🔄 Link web', `<a href="${escapeHtml(url)}">${escapeHtml(url)}</a>`],
+        ['⏰ Waktu', escapeHtml(elapsed)],
+      ]),
+      footer: '🚀  Selamat menggunakan web',
+    }), homeButton());
   } catch (error) {
-    const detail = errorMessage(error);
-    await updateStatus(ctx, statusMessage.message_id, 'Deploy Gagal ❌',
-      `📦 Repository&#8202;: <code>${escapeHtml(repoName)}</code>\n${repo ? `🔗 <a href="${escapeHtml(repo.html_url)}">Repository sudah terlanjur dibuat</a>\n\n` : ''}<b>Penyebab&#8202;:</b>\n<code>${escapeHtml(detail)}</code>`,
-      homeButton());
+    const elapsed = formatElapsed(Date.now() - startedAt);
+    await editPanel(ctx, statusMessage.message_id, panel({
+      heading: '<b>DEPLOY GAGAL ❌</b>',
+      box: infoBox([
+        ['📦 Project', escapeHtml(repoName)],
+        ['⚠️ Penyebab', escapeHtml(errorMessage(error))],
+        ['⏰ Waktu', escapeHtml(elapsed)],
+      ]),
+      footer: '🔁 Silakan coba lagi dari menu utama',
+    }), homeButton());
   } finally {
     sessions.delete(uid(ctx));
   }
@@ -706,69 +822,64 @@ bot.start(async (ctx) => {
 bot.action('home', async (ctx) => {
   await ctx.answerCbQuery();
   sessions.delete(uid(ctx));
+  // TIDAK menghapus pesan apapun — lihat catatan di bagian UI HELPERS.
   return sendMainMenu(ctx);
 });
 
 bot.action('deploy_html', async (ctx) => {
   await ctx.answerCbQuery();
-  await safeDeleteMessage(ctx, ctx.chat.id, ctx.callbackQuery.message.message_id);
-  await sendPlainPrompt(
+  await sendPrompt(
     ctx,
     'Deploy HTML',
-    '🚀 <b>Langkah 1 dari 2&#8202;: Kirim File</b>\n\nUnggah 1 file dengan ekstensi <code>.html</code> sebagai halaman utama website kamu.\n\n<i>Balas pesan ini dengan mengirim filenya sebagai dokumen (bukan foto).</i>',
+    '🚀 <b>Langkah 1 dari 2 — Kirim File</b>\n\nUnggah 1 file dengan ekstensi <code>.html</code> sebagai halaman utama website kamu.\n\n<i>Balas pesan ini dengan mengirim filenya sebagai dokumen (bukan foto).</i>',
     { type: 'deploy_html', step: 'file' }
   );
 });
 
 bot.action('deploy_zip', async (ctx) => {
   await ctx.answerCbQuery();
-  await safeDeleteMessage(ctx, ctx.chat.id, ctx.callbackQuery.message.message_id);
-  await sendPlainPrompt(
+  await sendPrompt(
     ctx,
     'Deploy ZIP',
-    '📦 <b>Langkah 1 dari 2&#8202;: Kirim File</b>\n\nUnggah 1 file <code>.zip</code> berisi seluruh project website kamu.\n\n⚠️ <b>Wajib</b> ada <code>index.html</code> di root ZIP (atau di dalam satu folder pembungkus tunggal).',
+    '📦 <b>Langkah 1 dari 2 — Kirim File</b>\n\nUnggah 1 file <code>.zip</code> berisi seluruh project website kamu.\n\n⚠️ Wajib ada <code>index.html</code> di root ZIP (atau di dalam satu folder pembungkus tunggal).',
     { type: 'deploy_zip', step: 'file' }
   );
 });
 
 bot.action('get_source', async (ctx) => {
   await ctx.answerCbQuery();
-  await safeDeleteMessage(ctx, ctx.chat.id, ctx.callbackQuery.message.message_id);
-  await sendPlainPrompt(
+  await sendPrompt(
     ctx,
     'Get Source',
-    '🌐 <b>Kirim URL Website</b>\n\nKirim alamat lengkap website publik (contoh&#8202;: <code>https://contoh.com</code>) yang ingin diambil HTML, CSS, JavaScript, dan asset-nya menjadi satu file ZIP.',
+    '🌐 <b>Kirim URL Website</b>\n\nKirim alamat lengkap website publik (contoh: <code>https://contoh.com</code>) yang ingin diambil HTML, CSS, JavaScript, dan asset-nya menjadi satu file ZIP.\n\n<i>Catatan: website berbasis React/Vue/Next.js (SPA) kontennya dirender oleh JavaScript di browser, jadi HTML mentahnya bisa saja terlihat kosong — bot akan memberi tahu kalau situsnya terdeteksi seperti itu.</i>',
     { type: 'source', step: 'url' }
   );
 });
 
 bot.action('encrypt_html', async (ctx) => {
   await ctx.answerCbQuery();
-  await safeDeleteMessage(ctx, ctx.chat.id, ctx.callbackQuery.message.message_id);
-  await sendPlainPrompt(
+  await sendPrompt(
     ctx,
     'Encrypt HTML',
-    '🛡️ <b>Langkah 1 dari 3&#8202;: Kirim File</b>\n\nUnggah 1 file <code>.html</code> yang ingin dikunci dengan password (AES-256).',
+    '🛡️ <b>Langkah 1 dari 3 — Kirim File</b>\n\nUnggah 1 file <code>.html</code> yang ingin dikunci dengan password (AES-256-GCM).',
     { type: 'encrypt', step: 'file' }
   );
 });
 
 bot.action('system', async (ctx) => {
   await ctx.answerCbQuery('Memeriksa koneksi…');
-  await safeDeleteMessage(ctx, ctx.chat.id, ctx.callbackQuery.message.message_id);
-  const status = await ctx.reply(menuText('System Check', '⏳ Memeriksa koneksi Telegram, GitHub, dan Vercel…'), { parse_mode: 'HTML' });
-  const result = [];
-  try { await checkGitHub(); result.push('🟢 GitHub API&#8202;: <b>terhubung</b>'); } catch (e) { result.push(`🔴 GitHub API&#8202;: <code>${escapeHtml(errorMessage(e))}</code>`); }
-  try { await checkVercel(); result.push('🟢 Vercel API&#8202;: <b>terhubung</b>'); } catch (e) { result.push(`🔴 Vercel API&#8202;: <code>${escapeHtml(errorMessage(e))}</code>`); }
-  result.push('🟢 Telegram Webhook&#8202;: <b>aktif</b>');
-  await updateStatus(ctx, status.message_id, 'System Status', result.join('\n'), homeButton());
+  const status = await sendPanel(ctx, panel({ heading: '<b>SYSTEM CHECK</b>', body: '⏳ Memeriksa koneksi Telegram, GitHub, dan Vercel…' }));
+  const rows = [];
+  try { await checkGitHub(); rows.push(['🐙 GitHub API', '🟢 <b>Terhubung</b>']); } catch (e) { rows.push(['🐙 GitHub API', `🔴 <code>${escapeHtml(errorMessage(e))}</code>`]); }
+  try { await checkVercel(); rows.push(['▲ Vercel API', '🟢 <b>Terhubung</b>']); } catch (e) { rows.push(['▲ Vercel API', `🔴 <code>${escapeHtml(errorMessage(e))}</code>`]); }
+  rows.push(['✈️ Telegram', '🟢 <b>Aktif</b>']);
+  await editPanel(ctx, status.message_id, panel({ heading: '<b>SYSTEM STATUS</b>', box: infoBox(rows) }), homeButton());
 });
 
 bot.action('add_user', async (ctx) => {
   await ctx.answerCbQuery();
   if (uid(ctx) !== OWNER_ID) return;
-  await safeDeleteMessage(ctx, ctx.chat.id, ctx.callbackQuery.message.message_id);
-  await sendPlainPrompt(
+  await sendPrompt(
     ctx,
     'Add User',
     '👤 <b>Kirim Telegram ID</b>\n\nKirim angka Telegram ID user yang ingin diberi akses ke bot ini.\n\n<i>Tidak tahu ID Telegram seseorang? Minta mereka forward pesan apapun ke bot @userinfobot.</i>',
@@ -779,19 +890,24 @@ bot.action('add_user', async (ctx) => {
 bot.action('users', async (ctx) => {
   await ctx.answerCbQuery();
   if (uid(ctx) !== OWNER_ID) return;
-  await safeDeleteMessage(ctx, ctx.chat.id, ctx.callbackQuery.message.message_id);
-  const ids = [...allowedUsers].filter((id) => id !== OWNER_ID);
-  const body = `👑 Owner&#8202;: <code>${OWNER_ID}</code>\n👤 User tambahan&#8202;: <b>${ids.length}</b>\n\n${ids.length ? ids.map((id, i) => `${i + 1}. <code>${id}</code>`).join('\n') : '<i>Belum ada user tambahan.</i>'}`;
-  await ctx.reply(menuText('Authorized Users', body), { parse_mode: 'HTML', ...homeButton() });
+  const ids = [...allowedUsers].filter((x) => x !== OWNER_ID);
+  const list = ids.length ? ids.map((x, i) => `${i + 1}. <code>${x}</code>`).join('\n') : '<i>Belum ada user tambahan.</i>';
+  await sendPanel(ctx, panel({
+    heading: '<b>AUTHORIZED USERS</b>',
+    box: infoBox([
+      ['👑 Owner', `<code>${OWNER_ID}</code>`],
+      ['👤 User tambahan', `<b>${ids.length}</b>`],
+    ]),
+    body: list,
+  }), homeButton());
 });
 
 bot.action('delete_web', async (ctx) => {
   await ctx.answerCbQuery();
-  await safeDeleteMessage(ctx, ctx.chat.id, ctx.callbackQuery.message.message_id);
-  await sendPlainPrompt(
+  await sendPrompt(
     ctx,
     'Delete Web',
-    '🗑️ <b>Kirim Link Website</b>\n\nKirim link website hasil deploy Cloud Logic yang ingin dihapus.\nContoh&#8202;: <code>https://nama-web.vercel.app</code>\n\nWebsite (Vercel) dan repository (GitHub) yang cocok akan <b>otomatis ikut terhapus</b> — tidak perlu cari ID atau buka dashboard.',
+    '🗑️ <b>Kirim Link Website</b>\n\nKirim link website hasil deploy Cloud Logic yang ingin dihapus.\nContoh: <code>https://nama-web.vercel.app</code>\n\nWebsite (Vercel) dan repository (GitHub) yang cocok akan otomatis ikut terhapus — tidak perlu cari ID atau buka dashboard.',
     { type: 'delete', step: 'link' }
   );
 });
@@ -808,63 +924,82 @@ bot.on('text', async (ctx) => {
     if (id !== OWNER_ID) return;
     const target = Number(text);
     if (!Number.isInteger(target) || target <= 0) {
-      await sendPlainPrompt(ctx, 'Add User', '❌ <b>ID tidak valid.</b>\n\nKirim ulang dalam bentuk angka saja, contoh&#8202;: <code>123456789</code>.', session);
+      await sendPrompt(ctx, 'Add User', '❌ <b>ID tidak valid.</b>\n\nKirim ulang dalam bentuk angka saja, contoh: <code>123456789</code>.', session);
       return;
     }
     allowedUsers.add(target);
     try {
       await saveUsers();
       sessions.delete(id);
-      await ctx.reply(menuText('Add User', `✅ User <code>${target}</code> berhasil ditambahkan dan sekarang punya akses ke bot ini.`), { parse_mode: 'HTML', ...homeButton() });
+      await sendPanel(ctx, panel({ heading: '<b>ADD USER</b>', body: `✅ User <code>${target}</code> berhasil ditambahkan dan sekarang punya akses ke bot ini.` }), homeButton());
     } catch (error) {
       allowedUsers.delete(target);
       sessions.delete(id);
-      await ctx.reply(menuText('Add User', `❌ <b>Gagal menyimpan user.</b>\n\n<code>${escapeHtml(errorMessage(error))}</code>`), { parse_mode: 'HTML', ...homeButton() });
+      await sendPanel(ctx, panel({ heading: '<b>ADD USER GAGAL ❌</b>', body: `<code>${escapeHtml(errorMessage(error))}</code>` }), homeButton());
     }
     return;
   }
 
   if (session.type === 'source' && session.step === 'url') {
     sessions.delete(id);
-    const status = await ctx.reply(menuText('Get Source', '⏳ Mengambil HTML, CSS, JavaScript, dan asset publik…'), { parse_mode: 'HTML' });
+    const status = await sendPanel(ctx, panel({ heading: '<b>GET SOURCE</b>', body: '⏳ Mengambil HTML, CSS, JavaScript, dan asset publik…' }));
     try {
-      const zip = await getPublicSource(text);
-      await ctx.replyWithDocument({ source: zip, filename: 'source-public.zip' }, { caption: '✅ Source publik berhasil dibundel menjadi ZIP.' });
-      await updateStatus(ctx, status.message_id, 'Get Source Selesai ✅', 'ZIP sudah dikirim di atas.\n\n<i>Catatan&#8202;: resource yang tidak bisa diakses publik tidak dapat dimasukkan.</i>', homeButton());
+      const result = await getPublicSource(text);
+      await ctx.replyWithDocument({ source: result.buffer, filename: 'source-public.zip' }, { caption: '✅ Source publik berhasil dibundel menjadi ZIP.' });
+      const note = result.isSpaLikely
+        ? '⚠️ Website ini kemungkinan React/Vue/Next.js (SPA) — tampilan aslinya dirender JavaScript di browser, jadi HTML mentah di dalam ZIP bisa terlihat seperti kerangka kosong.'
+        : 'Semua asset (CSS, JS, gambar, font) yang bisa diakses publik — termasuk yang dirujuk dari dalam file CSS — sudah dibundel.';
+      await editPanel(ctx, status.message_id, panel({
+        heading: '<b>GET SOURCE SELESAI ✅</b>',
+        box: infoBox([
+          ['🌐 Sumber', `<code>${escapeHtml(text)}</code>`],
+          ['📦 Asset', `<b>${result.assetCount}</b> file`],
+        ]),
+        body: note,
+      }), homeButton());
     } catch (error) {
-      await updateStatus(ctx, status.message_id, 'Get Source Gagal ❌', `<code>${escapeHtml(errorMessage(error))}</code>`, homeButton());
+      await editPanel(ctx, status.message_id, panel({ heading: '<b>GET SOURCE GAGAL ❌</b>', body: `<code>${escapeHtml(errorMessage(error))}</code>` }), homeButton());
     }
     return;
   }
 
   if (session.type === 'delete' && session.step === 'link') {
     sessions.delete(id);
-    const status = await ctx.reply(menuText('Delete Web', '⏳ Mencari project dari link…'), { parse_mode: 'HTML' });
+    const status = await sendPanel(ctx, panel({ heading: '<b>DELETE WEB</b>', body: '⏳ Mencari project dari link…' }));
     try {
       const project = await resolveVercelProjectFromUrl(text);
 
-      await updateStatus(ctx, status.message_id, 'Delete Web',
-        `🌐 Project ditemukan&#8202;: <code>${escapeHtml(project.name)}</code>\n\n⏳ Menghapus website & deployment di Vercel…`);
+      await editPanel(ctx, status.message_id, panel({
+        heading: '<b>DELETE WEB</b>',
+        body: `🌐 Project ditemukan: <code>${escapeHtml(project.name)}</code>\n\n⏳ Menghapus website & deployment di Vercel…`,
+      }));
       await deleteVercelProject(project);
 
-      let repoLine = '⚠️ Repository GitHub dengan nama yang cocok tidak ditemukan — kalau masih ada, hapus manual di GitHub.';
+      let repoStatus = '⚠️ Repository tidak ditemukan otomatis';
       try {
         const repo = await findGithubRepoByProjectName(project.name);
         if (repo) {
-          await updateStatus(ctx, status.message_id, 'Delete Web',
-            `🌐 Project&#8202;: <code>${escapeHtml(project.name)}</code>\n✅ Website & deployment Vercel dihapus.\n\n⏳ Menghapus repository <code>${escapeHtml(repo.full_name)}</code>…`);
+          await editPanel(ctx, status.message_id, panel({
+            heading: '<b>DELETE WEB</b>',
+            body: `🌐 Project: <code>${escapeHtml(project.name)}</code>\n✅ Website Vercel dihapus.\n\n⏳ Menghapus repository…`,
+          }));
           await deleteGithubRepo(repo.owner.login, repo.name);
-          repoLine = `✅ Repository <code>${escapeHtml(repo.full_name)}</code> ikut dihapus.`;
+          repoStatus = '✅ Ikut dihapus';
         }
       } catch (repoError) {
-        repoLine = `⚠️ Website sudah terhapus, tapi gagal hapus repository&#8202;: <code>${escapeHtml(errorMessage(repoError))}</code>`;
+        repoStatus = `⚠️ Gagal dihapus: ${errorMessage(repoError)}`;
       }
 
-      await updateStatus(ctx, status.message_id, 'Web Dihapus ✅',
-        `🌐 Project&#8202;: <code>${escapeHtml(project.name)}</code>\n✅ Website & deployment Vercel dihapus.\n${repoLine}`,
-        homeButton());
+      await editPanel(ctx, status.message_id, panel({
+        heading: '<b>WEB DIHAPUS ✅</b>',
+        box: infoBox([
+          ['📦 Project', escapeHtml(project.name)],
+          ['🌐 Website', '✅ Dihapus'],
+          ['📁 Repository', escapeHtml(repoStatus)],
+        ]),
+      }), homeButton());
     } catch (error) {
-      await updateStatus(ctx, status.message_id, 'Delete Gagal ❌', `<code>${escapeHtml(errorMessage(error))}</code>`, homeButton());
+      await editPanel(ctx, status.message_id, panel({ heading: '<b>DELETE GAGAL ❌</b>', body: `<code>${escapeHtml(errorMessage(error))}</code>` }), homeButton());
     }
     return;
   }
@@ -873,19 +1008,22 @@ bot.on('text', async (ctx) => {
     session.password = text;
     session.step = 'confirm';
     sessions.set(id, session);
-    await sendPlainPrompt(ctx, 'Encrypt HTML', '🔐 <b>Langkah 3 dari 3&#8202;: Konfirmasi</b>\n\nKetik ulang password yang sama persis untuk konfirmasi.', session);
+    await sendPrompt(ctx, 'Encrypt HTML', '🔐 <b>Langkah 3 dari 3 — Konfirmasi</b>\n\nKetik ulang password yang sama persis untuk konfirmasi.', session);
     return;
   }
 
   if (session.type === 'encrypt' && session.step === 'confirm') {
     if (text !== session.password) {
-      await sendPlainPrompt(ctx, 'Encrypt HTML', '❌ <b>Password tidak sama.</b>\n\nKirim ulang password yang benar (harus sama persis dengan langkah sebelumnya).', session);
+      await sendPrompt(ctx, 'Encrypt HTML', '❌ <b>Password tidak sama.</b>\n\nKirim ulang password yang benar (harus sama persis dengan langkah sebelumnya).', session);
       return;
     }
     sessions.delete(id);
     const encrypted = encryptedHtml(session.fileBuffer.toString('utf8'), session.password);
-    await ctx.replyWithDocument({ source: Buffer.from(encrypted, 'utf8'), filename: `${session.fileName.replace(/\.html$/i, '')}-encrypted.html` }, { caption: '✅ HTML berhasil dienkripsi dengan AES-256.' });
-    await ctx.reply(menuText('Encrypt Selesai ✅', 'File terenkripsi sudah dikirim di atas. Simpan passwordnya baik-baik — tanpa password, isi file tidak bisa dibuka lagi.'), { parse_mode: 'HTML', ...homeButton() });
+    await ctx.replyWithDocument({ source: Buffer.from(encrypted, 'utf8'), filename: `${session.fileName.replace(/\.html?$/i, '')}-encrypted.html` }, { caption: '✅ HTML berhasil dienkripsi dengan AES-256.' });
+    await sendPanel(ctx, panel({
+      heading: '<b>ENCRYPT SELESAI ✅</b>',
+      body: 'File terenkripsi sudah dikirim di atas. Simpan passwordnya baik-baik — tanpa password, isi file tidak bisa dibuka lagi.',
+    }), homeButton());
     return;
   }
 
@@ -893,13 +1031,23 @@ bot.on('text', async (ctx) => {
     session.name = repoSafeName(text);
     session.step = 'deploying';
     sessions.set(id, session);
-    const status = await ctx.reply(menuText('Deploying', '⏳ Memulai proses deploy…'), { parse_mode: 'HTML' });
+    const status = await sendPanel(ctx, panel({
+      heading: '📊 <b>DASHBOARD LOG</b>',
+      box: infoBox([
+        ['📡 Server', '🔵 <b>PROCESSING</b>'],
+        ['🔧 Mode', escapeHtml(session.type === 'deploy_zip' ? 'Deploy ZIP' : 'Deploy HTML')],
+        ['📦 Nama Web', `<code>${escapeHtml(session.name)}</code>`],
+        ['🔄 Progress', `<code>${progressBar(0)}</code> 0%`],
+        ['📝 Activity', 'Memulai proses…'],
+      ]),
+      footer: 'Proses membutuhkan waktu, jadi mohon\nuntuk sabar.....',
+    }));
     await runDeployment(ctx, session, status);
     return;
   }
 
   if (session.type === 'deploy_html' || session.type === 'deploy_zip') {
-    await sendPlainPrompt(ctx, 'Deploy', '📛 Tahap ini belum meminta nama repository. Ikuti instruksi terakhir dari bot di atas, atau tekan tombol Batalkan.', session);
+    await sendPrompt(ctx, 'Deploy', 'Tahap ini belum meminta nama website. Ikuti instruksi terakhir dari bot di atas, atau tekan tombol Menu Utama untuk mengulang.', session);
   }
 });
 
@@ -914,48 +1062,48 @@ bot.on('document', async (ctx) => {
 
   if (session.type === 'deploy_html' && session.step === 'file') {
     if (!/\.html?$/i.test(fileName)) {
-      await sendPlainPrompt(ctx, 'Deploy HTML', '❌ <b>Format salah.</b>\n\nMenu ini hanya menerima file <code>.html</code>. Silakan kirim ulang file yang sesuai.', session);
+      await sendPrompt(ctx, 'Deploy HTML', '❌ <b>Format salah.</b>\n\nMenu ini hanya menerima file <code>.html</code>. Silakan kirim ulang file yang sesuai.', session);
       return;
     }
     try {
       const buffer = await downloadTelegramFile(ctx, document.file_id);
       session.files = [{ path: 'index.html', buffer }];
       session.step = 'name';
-      await sendPlainPrompt(ctx, 'Deploy HTML', `📄 <b>File diterima&#8202;:</b> <code>${escapeHtml(fileName)}</code>\n\n🚀 <b>Langkah 2 dari 2&#8202;: Nama Website</b>\n\nKirim nama repository/website (huruf, angka, dan tanda "-" saja, <b>tanpa spasi</b>).\nContoh&#8202;: <code>toko-online-saya</code>`, session);
+      await sendPrompt(ctx, 'Deploy HTML', `📄 File diterima: <code>${escapeHtml(fileName)}</code>\n\n🚀 <b>Langkah 2 dari 2 — Nama Website</b>\n\nKirim nama repository/website (huruf, angka, dan tanda "-" saja, tanpa spasi).\nContoh: <code>toko-online-saya</code>`, session);
     } catch (error) {
-      await sendPlainPrompt(ctx, 'Deploy HTML', `❌ <b>Gagal mengambil file dari Telegram.</b>\n\n<code>${escapeHtml(errorMessage(error))}</code>`, session);
+      await sendPrompt(ctx, 'Deploy HTML', `❌ <b>Gagal mengambil file dari Telegram.</b>\n\n<code>${escapeHtml(errorMessage(error))}</code>`, session);
     }
     return;
   }
 
   if (session.type === 'deploy_zip' && session.step === 'file') {
     if (!/\.zip$/i.test(fileName)) {
-      await sendPlainPrompt(ctx, 'Deploy ZIP', '❌ <b>Format salah.</b>\n\nMenu ini hanya menerima file <code>.zip</code>. Silakan kirim ulang file yang sesuai.', session);
+      await sendPrompt(ctx, 'Deploy ZIP', '❌ <b>Format salah.</b>\n\nMenu ini hanya menerima file <code>.zip</code>. Silakan kirim ulang file yang sesuai.', session);
       return;
     }
     try {
       const buffer = await downloadTelegramFile(ctx, document.file_id);
       session.files = await extractZip(buffer);
       session.step = 'name';
-      await sendPlainPrompt(ctx, 'Deploy ZIP', `📦 <b>ZIP diterima&#8202;:</b> <b>${session.files.length}</b> file ditemukan.\n\n🚀 <b>Langkah 2 dari 2&#8202;: Nama Website</b>\n\nKirim nama repository/website (huruf, angka, dan tanda "-" saja, <b>tanpa spasi</b>).\nContoh&#8202;: <code>toko-online-saya</code>`, session);
+      await sendPrompt(ctx, 'Deploy ZIP', `📦 ZIP diterima: <b>${session.files.length}</b> file ditemukan.\n\n🚀 <b>Langkah 2 dari 2 — Nama Website</b>\n\nKirim nama repository/website (huruf, angka, dan tanda "-" saja, tanpa spasi).\nContoh: <code>toko-online-saya</code>`, session);
     } catch (error) {
-      await sendPlainPrompt(ctx, 'Deploy ZIP', `❌ <b>ZIP tidak valid.</b>\n\n<code>${escapeHtml(errorMessage(error))}</code>`, session);
+      await sendPrompt(ctx, 'Deploy ZIP', `❌ <b>ZIP tidak valid.</b>\n\n<code>${escapeHtml(errorMessage(error))}</code>`, session);
     }
     return;
   }
 
   if (session.type === 'encrypt' && session.step === 'file') {
     if (!/\.html?$/i.test(fileName)) {
-      await sendPlainPrompt(ctx, 'Encrypt HTML', '❌ <b>Format salah.</b>\n\nMenu ini hanya menerima file <code>.html</code>. Silakan kirim ulang file yang sesuai.', session);
+      await sendPrompt(ctx, 'Encrypt HTML', '❌ <b>Format salah.</b>\n\nMenu ini hanya menerima file <code>.html</code>. Silakan kirim ulang file yang sesuai.', session);
       return;
     }
     try {
       session.fileBuffer = await downloadTelegramFile(ctx, document.file_id);
       session.fileName = fileName;
       session.step = 'password';
-      await sendPlainPrompt(ctx, 'Encrypt HTML', `📄 <b>File diterima&#8202;:</b> <code>${escapeHtml(fileName)}</code>\n\n🔐 <b>Langkah 2 dari 3&#8202;: Password</b>\n\nKirim password yang akan dipakai untuk mengunci file ini.`, session);
+      await sendPrompt(ctx, 'Encrypt HTML', `📄 File diterima: <code>${escapeHtml(fileName)}</code>\n\n🔐 <b>Langkah 2 dari 3 — Password</b>\n\nKirim password yang akan dipakai untuk mengunci file ini.`, session);
     } catch (error) {
-      await sendPlainPrompt(ctx, 'Encrypt HTML', `❌ <b>Gagal mengambil file dari Telegram.</b>\n\n<code>${escapeHtml(errorMessage(error))}</code>`, session);
+      await sendPrompt(ctx, 'Encrypt HTML', `❌ <b>Gagal mengambil file dari Telegram.</b>\n\n<code>${escapeHtml(errorMessage(error))}</code>`, session);
     }
   }
 });
@@ -963,14 +1111,17 @@ bot.on('document', async (ctx) => {
 bot.command('adduser', async (ctx) => {
   if (uid(ctx) !== OWNER_ID) return;
   const target = Number(ctx.message.text.split(/\s+/)[1]);
-  if (!Number.isInteger(target) || target <= 0) return ctx.reply(menuText('Add User', '❌ Format salah. Gunakan&#8202;: <code>/adduser 123456789</code>'), { parse_mode: 'HTML' });
+  if (!Number.isInteger(target) || target <= 0) {
+    await sendPanel(ctx, panel({ heading: '<b>ADD USER</b>', body: '❌ Format salah. Gunakan: <code>/adduser 123456789</code>' }));
+    return;
+  }
   allowedUsers.add(target);
   try {
     await saveUsers();
-    await ctx.reply(menuText('Add User', `✅ User <code>${target}</code> berhasil ditambahkan.`), { parse_mode: 'HTML', ...homeButton() });
+    await sendPanel(ctx, panel({ heading: '<b>ADD USER</b>', body: `✅ User <code>${target}</code> berhasil ditambahkan.` }), homeButton());
   } catch (error) {
     allowedUsers.delete(target);
-    await ctx.reply(menuText('Add User', `❌ <b>Gagal menyimpan user.</b>\n\n<code>${escapeHtml(errorMessage(error))}</code>`), { parse_mode: 'HTML', ...homeButton() });
+    await sendPanel(ctx, panel({ heading: '<b>ADD USER GAGAL ❌</b>', body: `<code>${escapeHtml(errorMessage(error))}</code>` }), homeButton());
   }
 });
 
@@ -978,7 +1129,7 @@ bot.command('cancel', async (ctx) => {
   const session = sessions.get(uid(ctx));
   if (session?.controlMessageId) await safeDeleteMessage(ctx, ctx.chat.id, session.controlMessageId);
   sessions.delete(uid(ctx));
-  await ctx.reply(menuText('Dibatalkan ↩️', 'Proses yang sedang berjalan sudah dibatalkan.'), { parse_mode: 'HTML', ...homeButton() });
+  await sendPanel(ctx, panel({ heading: '<b>DIBATALKAN ↩️</b>', body: 'Proses yang sedang berjalan sudah dibatalkan.' }), homeButton());
 });
 
 bot.catch((error) => {
@@ -1010,5 +1161,5 @@ module.exports = async (req, res) => {
       return res.status(500).send('Webhook error');
     }
   }
-  return res.status(200).send('☁️ Cloud Logic Bot Online');
+  return res.status(200).send('⚡ Cloud Logic Bot Online');
 };
