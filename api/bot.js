@@ -13,6 +13,7 @@ const ENV = {
   VERCEL_TOKEN: process.env.VERCEL_TOKEN,
   VERCEL_HOOK: process.env.VERCEL_HOOK,
   VERCEL_TEAM_ID: process.env.VERCEL_TEAM_ID || '',
+  NETLIFY_TOKEN: process.env.NETLIFY_TOKEN,
 };
 
 function requireConfig() {
@@ -29,6 +30,7 @@ let allowedUsers = new Set([OWNER_ID]);
 
 const GH_API = 'https://api.github.com';
 const VERCEL_API = 'https://api.vercel.com';
+const NETLIFY_API = 'https://api.netlify.com/api/v1';
 const ghHeaders = {
   Accept: 'application/vnd.github+json',
   Authorization: `Bearer ${ENV.GH_TOKEN}`,
@@ -37,6 +39,9 @@ const ghHeaders = {
 const vercelHeaders = {
   Authorization: `Bearer ${ENV.VERCEL_TOKEN}`,
   'Content-Type': 'application/json',
+};
+const netlifyHeaders = {
+  Authorization: `Bearer ${ENV.NETLIFY_TOKEN}`,
 };
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -109,10 +114,17 @@ function homeButton() {
 
 function mainMenuMarkup() {
   return Markup.inlineKeyboard([
-    [Markup.button.callback('🚀  Deploy HTML', 'deploy_html'), Markup.button.callback('📦  Deploy ZIP', 'deploy_zip')],
+    [Markup.button.callback('🚀  Deploy Vercel', 'deploy_vercel'), Markup.button.callback('☁️  Deploy Netlify', 'deploy_netlify')],
     [Markup.button.callback('🌐  Get Source', 'get_source'), Markup.button.callback('🛡️  Encrypt HTML', 'encrypt_html')],
     [Markup.button.callback('🗑️  Delete Web', 'delete_web'), Markup.button.callback('📡  System Check', 'system')],
     [Markup.button.callback('👤  Add User', 'add_user'), Markup.button.callback('👥  Users', 'users')],
+  ]);
+}
+
+function fileTypeMarkup(platform) {
+  return Markup.inlineKeyboard([
+    [Markup.button.callback('📄  Deploy HTML', `${platform}_html`), Markup.button.callback('📦  Deploy ZIP', `${platform}_zip`)],
+    [Markup.button.callback('🏠  Menu Utama', 'home')],
   ]);
 }
 
@@ -462,6 +474,67 @@ async function waitForDeployment(deploymentId, teamId, timeoutMs = 180000, onSta
   throw new Error('Deployment belum selesai dalam 3 menit. Periksa lagi beberapa saat lagi.');
 }
 
+// ─────────────────────────────────────────────
+// NETLIFY — deploy langsung via upload ZIP, tanpa GitHub sama sekali
+// (pola yang sama seperti deploy file langsung ke Vercel)
+// ─────────────────────────────────────────────
+
+async function zipFiles(files) {
+  const zip = new JSZip();
+  for (const file of files) {
+    zip.file(file.path.replace(/^\/+/, ''), file.buffer);
+  }
+  return zip.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE' });
+}
+
+async function createNetlifySite(name) {
+  if (!ENV.NETLIFY_TOKEN) throw new Error('NETLIFY_TOKEN belum diatur di environment variable bot.');
+  const response = await axios.post(`${NETLIFY_API}/sites`, { name: projectSafeName(name) }, {
+    headers: { ...netlifyHeaders, 'Content-Type': 'application/json' },
+    timeout: 30000,
+  });
+  return response.data;
+}
+
+async function deployZipToNetlifySite(siteId, zipBuffer) {
+  const response = await axios.post(`${NETLIFY_API}/sites/${encodeURIComponent(siteId)}/deploys`, zipBuffer, {
+    headers: { ...netlifyHeaders, 'Content-Type': 'application/zip' },
+    timeout: 120000,
+    maxBodyLength: 60 * 1024 * 1024,
+    maxContentLength: 60 * 1024 * 1024,
+  });
+  return response.data;
+}
+
+async function getNetlifyDeploy(deployId) {
+  const response = await axios.get(`${NETLIFY_API}/deploys/${encodeURIComponent(deployId)}`, {
+    headers: netlifyHeaders,
+    timeout: 20000,
+  });
+  return response.data;
+}
+
+async function waitForNetlifyDeploy(deployId, timeoutMs = 180000, onStatus) {
+  const start = Date.now();
+  let lastState = '';
+  while (Date.now() - start < timeoutMs) {
+    const deploy = await getNetlifyDeploy(deployId);
+    const state = deploy.state || '';
+    if (state !== lastState) {
+      lastState = state;
+      if (onStatus) await onStatus(state, deploy);
+    }
+    if (['ready', 'error'].includes(state)) return deploy;
+    await sleep(4000);
+  }
+  throw new Error('Deploy Netlify belum selesai dalam 3 menit. Periksa lagi beberapa saat lagi.');
+}
+
+async function checkNetlify() {
+  const r = await axios.get(`${NETLIFY_API}/user`, { headers: netlifyHeaders, timeout: 30000 });
+  return r.data;
+}
+
 function normalizeZipPath(path) {
   const clean = String(path).replace(/\\/g, '/').replace(/^\/+/, '');
   if (!clean || clean.includes('../') || clean === '..') return null;
@@ -583,6 +656,104 @@ async function deleteVercelProject(project) {
     params: project.teamId ? { teamId: project.teamId } : undefined,
     timeout: 30000,
   });
+}
+
+async function tryGetNetlifySite(idOrName) {
+  if (!ENV.NETLIFY_TOKEN) return null;
+  try {
+    const response = await axios.get(`${NETLIFY_API}/sites/${encodeURIComponent(idOrName)}`, {
+      headers: netlifyHeaders,
+      timeout: 20000,
+    });
+    return response.data;
+  } catch (_) {
+    return null;
+  }
+}
+
+async function findNetlifySiteByHost(host) {
+  // Fallback kalau site_id/name langsung tidak cocok (mis. site sudah pakai
+  // custom domain tapi kita masih terima link *.netlify.app lama, atau
+  // sebaliknya) — telusuri daftar site milik akun dan cocokkan.
+  if (!ENV.NETLIFY_TOKEN) return null;
+  for (let page = 1; page <= 10; page += 1) {
+    try {
+      const response = await axios.get(`${NETLIFY_API}/sites`, {
+        headers: netlifyHeaders,
+        params: { per_page: 100, page },
+        timeout: 30000,
+      });
+      const sites = response.data || [];
+      const match = sites.find((s) =>
+        (s.name && `${s.name}.netlify.app` === host) ||
+        s.custom_domain === host ||
+        s.ssl_url === `https://${host}` ||
+        s.url === `http://${host}`
+      );
+      if (match) return match;
+      if (sites.length < 100) break;
+    } catch (_) {
+      break;
+    }
+  }
+  return null;
+}
+
+async function resolveNetlifySiteFromUrl(urlInput) {
+  if (!ENV.NETLIFY_TOKEN) throw new Error('NETLIFY_TOKEN belum diatur di environment variable bot.');
+  let value = String(urlInput).trim();
+  if (!/^https?:\/\//i.test(value)) value = `https://${value}`;
+  let host;
+  try {
+    host = new URL(value).hostname.toLowerCase();
+  } catch (_) {
+    throw new Error('Link tidak valid. Kirim URL lengkap, contoh: https://nama-web.netlify.app');
+  }
+  if (!host.endsWith('.netlify.app')) {
+    throw new Error('Link harus berupa domain *.netlify.app hasil deploy Cloud Logic.');
+  }
+
+  const baseSlug = host.slice(0, -'.netlify.app'.length);
+  let site = await tryGetNetlifySite(baseSlug);
+  if (site) return site;
+
+  site = await findNetlifySiteByHost(host);
+  if (site) return site;
+
+  throw new Error(`Site Netlify untuk "${host}" tidak ditemukan. Pastikan link sesuai hasil deploy Cloud Logic.`);
+}
+
+async function deleteNetlifySite(site) {
+  await axios.delete(`${NETLIFY_API}/sites/${encodeURIComponent(site.id)}`, {
+    headers: netlifyHeaders,
+    timeout: 30000,
+  });
+}
+
+async function resolveDeployTargetFromUrl(urlInput) {
+  let value = String(urlInput).trim();
+  if (!/^https?:\/\//i.test(value)) value = `https://${value}`;
+  let host;
+  try {
+    host = new URL(value).hostname.toLowerCase();
+  } catch (_) {
+    throw new Error('Link tidak valid. Kirim URL lengkap, contoh: https://nama-web.vercel.app');
+  }
+
+  if (host.endsWith('.vercel.app')) {
+    const project = await resolveVercelProjectFromUrl(urlInput);
+    return { platform: 'vercel', name: project.name, data: project };
+  }
+  if (host.endsWith('.netlify.app')) {
+    const site = await resolveNetlifySiteFromUrl(urlInput);
+    return { platform: 'netlify', name: site.name, data: site };
+  }
+  throw new Error('Link harus berupa domain *.vercel.app atau *.netlify.app hasil deploy Cloud Logic.');
+}
+
+async function deleteDeployTarget(target) {
+  if (target.platform === 'netlify') return deleteNetlifySite(target.data);
+  return deleteVercelProject(target.data);
 }
 
 async function findGithubRepoByProjectName(projectName) {
@@ -730,11 +901,61 @@ async function checkVercel() {
 
 // ─────────────────────────────────────────────
 // DEPLOY — dashboard log + hasil premium
+// Ada 2 "publisher": Vercel & Netlify. Keduanya deploy langsung dari file
+// (bukan lewat GitHub), jadi sama-sama tidak bergantung pada integrasi
+// GitHub App apapun. Tampilan dashboard-nya sama persis untuk keduanya.
 // ─────────────────────────────────────────────
+
+async function publishToVercel(name, files, render) {
+  await render(30, 'Mengunggah berkas ke Vercel…');
+  const deployment = await createVercelDeployment(name, files);
+  await render(45, 'Menunggu antrian build…');
+
+  const final = await waitForDeployment(deployment.id, deployment.teamId, 180000, async (state) => {
+    if (state === 'BUILDING') await render(70, 'Membangun & mengoptimasi website…');
+    else if (state === 'READY') await render(95, 'Menyelesaikan…');
+    else if (state === 'QUEUED' || state === 'INITIALIZING') await render(50, 'Dalam antrian build…');
+    else await render(60, `Status: ${state || 'memproses'}…`);
+  });
+
+  if ((final.readyState || final.state) !== 'READY') {
+    throw new Error(`Build berakhir dengan status ${final.readyState || final.state || 'ERROR'}.`);
+  }
+
+  await render(98, 'Mengambil link publik…');
+  const cleanHost = await getCleanProductionUrl(deployment.id, deployment.teamId, projectSafeName(name));
+  return `https://${cleanHost}`;
+}
+
+async function publishToNetlify(name, files, render) {
+  await render(20, 'Membuat site Netlify…');
+  const site = await createNetlifySite(name);
+
+  await render(40, 'Mengemas berkas menjadi ZIP…');
+  const zipBuffer = await zipFiles(files);
+
+  await render(55, 'Mengunggah ke Netlify…');
+  const deploy = await deployZipToNetlifySite(site.id, zipBuffer);
+
+  await render(70, 'Menunggu proses publish…');
+  const final = await waitForNetlifyDeploy(deploy.id, 180000, async (state) => {
+    if (state === 'processing' || state === 'uploaded') await render(85, 'Memproses build Netlify…');
+    else if (state === 'ready') await render(97, 'Menyelesaikan…');
+    else await render(75, `Status: ${state || 'memproses'}…`);
+  });
+
+  if (final.state !== 'ready') {
+    throw new Error(`Deploy Netlify berakhir dengan status ${final.state || 'error'}.`);
+  }
+
+  return final.ssl_url || final.url || site.ssl_url || site.url;
+}
 
 async function runDeployment(ctx, session, statusMessage) {
   const repoName = repoSafeName(session.name);
   const modeLabel = session.type === 'deploy_zip' ? 'Deploy ZIP' : 'Deploy HTML';
+  const platform = session.platform === 'netlify' ? 'netlify' : 'vercel';
+  const platformLabel = platform === 'netlify' ? 'Netlify' : 'Vercel';
   const startedAt = Date.now();
 
   const render = async (percent, activity) => {
@@ -742,6 +963,7 @@ async function runDeployment(ctx, session, statusMessage) {
       heading: '📊 <b>DASHBOARD LOG</b>',
       box: infoBox([
         ['📡 Server', '🔵 <b>PROCESSING</b>'],
+        ['🛰️ Platform', escapeHtml(platformLabel)],
         ['🔧 Mode', escapeHtml(modeLabel)],
         ['📦 Nama Web', `<code>${escapeHtml(repoName)}</code>`],
         ['🔄 Progress', `<code>${progressBar(percent)}</code> ${percent}%`],
@@ -756,7 +978,7 @@ async function runDeployment(ctx, session, statusMessage) {
   try {
     // Backup ke GitHub bersifat opsional (tidak ditampilkan ke pengguna) dan
     // TIDAK BOLEH menggagalkan keseluruhan proses deploy kalau bermasalah,
-    // karena deploy ke Vercel sekarang sepenuhnya independen dari GitHub.
+    // karena deploy ke Vercel/Netlify sekarang sepenuhnya independen dari GitHub.
     try {
       const repo = await createGitHubRepo(repoName);
       await uploadFilesToNewRepo(repo, session.files);
@@ -764,31 +986,15 @@ async function runDeployment(ctx, session, statusMessage) {
       // backup gagal, tetap lanjut — bukan kegagalan fatal
     }
 
-    await render(30, 'Mengunggah berkas ke server…');
-
-    const deployment = await createVercelDeployment(repoName, session.files);
-    await render(45, 'Menunggu antrian build…');
-
-    const final = await waitForDeployment(deployment.id, deployment.teamId, 180000, async (state) => {
-      if (state === 'BUILDING') await render(70, 'Membangun & mengoptimasi website…');
-      else if (state === 'READY') await render(95, 'Menyelesaikan…');
-      else if (state === 'QUEUED' || state === 'INITIALIZING') await render(50, 'Dalam antrian build…');
-      else await render(60, `Status: ${state || 'memproses'}…`);
-    });
-
-    if ((final.readyState || final.state) !== 'READY') {
-      throw new Error(`Build berakhir dengan status ${final.readyState || final.state || 'ERROR'}.`);
-    }
-
-    await render(98, 'Mengambil link publik…');
-    const cleanHost = await getCleanProductionUrl(deployment.id, deployment.teamId, projectSafeName(repoName));
-    const url = `https://${cleanHost}`;
+    const publisher = platform === 'netlify' ? publishToNetlify : publishToVercel;
+    const url = await publisher(repoName, session.files, render);
     const elapsed = formatElapsed(Date.now() - startedAt);
 
     await editPanel(ctx, statusMessage.message_id, panel({
       heading: '<b>DEPLOY BERHASIL ✅️</b>',
       box: infoBox([
         ['📦 Project', escapeHtml(repoName)],
+        ['🛰️ Platform', escapeHtml(platformLabel)],
         ['🔄 Link web', `<a href="${escapeHtml(url)}">${escapeHtml(url)}</a>`],
         ['⏰ Waktu', escapeHtml(elapsed)],
       ]),
@@ -800,6 +1006,7 @@ async function runDeployment(ctx, session, statusMessage) {
       heading: '<b>DEPLOY GAGAL ❌</b>',
       box: infoBox([
         ['📦 Project', escapeHtml(repoName)],
+        ['🛰️ Platform', escapeHtml(platformLabel)],
         ['⚠️ Penyebab', escapeHtml(errorMessage(error))],
         ['⏰ Waktu', escapeHtml(elapsed)],
       ]),
@@ -826,23 +1033,59 @@ bot.action('home', async (ctx) => {
   return sendMainMenu(ctx);
 });
 
-bot.action('deploy_html', async (ctx) => {
+bot.action('deploy_vercel', async (ctx) => {
+  await ctx.answerCbQuery();
+  await sendPanel(ctx, panel({
+    heading: '<b>DEPLOY VERCEL</b>',
+    body: 'Pilih tipe file yang mau di-deploy:',
+  }), fileTypeMarkup('vercel'));
+});
+
+bot.action('deploy_netlify', async (ctx) => {
+  await ctx.answerCbQuery();
+  await sendPanel(ctx, panel({
+    heading: '<b>DEPLOY NETLIFY</b>',
+    body: 'Pilih tipe file yang mau di-deploy:',
+  }), fileTypeMarkup('netlify'));
+});
+
+bot.action('vercel_html', async (ctx) => {
   await ctx.answerCbQuery();
   await sendPrompt(
     ctx,
-    'Deploy HTML',
+    'Deploy HTML — Vercel',
     '🚀 <b>Langkah 1 dari 2 — Kirim File</b>\n\nUnggah 1 file dengan ekstensi <code>.html</code> sebagai halaman utama website kamu.\n\n<i>Balas pesan ini dengan mengirim filenya sebagai dokumen (bukan foto).</i>',
-    { type: 'deploy_html', step: 'file' }
+    { type: 'deploy_html', platform: 'vercel', step: 'file' }
   );
 });
 
-bot.action('deploy_zip', async (ctx) => {
+bot.action('vercel_zip', async (ctx) => {
   await ctx.answerCbQuery();
   await sendPrompt(
     ctx,
-    'Deploy ZIP',
+    'Deploy ZIP — Vercel',
     '📦 <b>Langkah 1 dari 2 — Kirim File</b>\n\nUnggah 1 file <code>.zip</code> berisi seluruh project website kamu.\n\n⚠️ Wajib ada <code>index.html</code> di root ZIP (atau di dalam satu folder pembungkus tunggal).',
-    { type: 'deploy_zip', step: 'file' }
+    { type: 'deploy_zip', platform: 'vercel', step: 'file' }
+  );
+});
+
+bot.action('netlify_html', async (ctx) => {
+  await ctx.answerCbQuery();
+  await sendPrompt(
+    ctx,
+    'Deploy HTML — Netlify',
+    '🚀 <b>Langkah 1 dari 2 — Kirim File</b>\n\nUnggah 1 file dengan ekstensi <code>.html</code> sebagai halaman utama website kamu.\n\n<i>Balas pesan ini dengan mengirim filenya sebagai dokumen (bukan foto).</i>',
+    { type: 'deploy_html', platform: 'netlify', step: 'file' }
+  );
+});
+
+bot.action('netlify_zip', async (ctx) => {
+  await ctx.answerCbQuery();
+  await sendPrompt(
+    ctx,
+    'Deploy ZIP — Netlify',
+    '📦 <b>Langkah 1 dari 2 — Kirim File</b>\n\nUnggah 1 file <code>.zip</code> berisi seluruh project website kamu.\n\n⚠️ Wajib ada <code>index.html</code> di root ZIP (atau di dalam satu folder pembungkus tunggal).',
+    { type: 'deploy_zip', platform: 'netlify', step: 'file' }
   );
 });
 
@@ -872,6 +1115,7 @@ bot.action('system', async (ctx) => {
   const rows = [];
   try { await checkGitHub(); rows.push(['🐙 GitHub API', '🟢 <b>Terhubung</b>']); } catch (e) { rows.push(['🐙 GitHub API', `🔴 <code>${escapeHtml(errorMessage(e))}</code>`]); }
   try { await checkVercel(); rows.push(['▲ Vercel API', '🟢 <b>Terhubung</b>']); } catch (e) { rows.push(['▲ Vercel API', `🔴 <code>${escapeHtml(errorMessage(e))}</code>`]); }
+  try { await checkNetlify(); rows.push(['☁️ Netlify API', '🟢 <b>Terhubung</b>']); } catch (e) { rows.push(['☁️ Netlify API', `🔴 <code>${escapeHtml(errorMessage(e))}</code>`]); }
   rows.push(['✈️ Telegram', '🟢 <b>Aktif</b>']);
   await editPanel(ctx, status.message_id, panel({ heading: '<b>SYSTEM STATUS</b>', box: infoBox(rows) }), homeButton());
 });
@@ -907,7 +1151,7 @@ bot.action('delete_web', async (ctx) => {
   await sendPrompt(
     ctx,
     'Delete Web',
-    '🗑️ <b>Kirim Link Website</b>\n\nKirim link website hasil deploy Cloud Logic yang ingin dihapus.\nContoh: <code>https://nama-web.vercel.app</code>\n\nWebsite (Vercel) dan repository (GitHub) yang cocok akan otomatis ikut terhapus — tidak perlu cari ID atau buka dashboard.',
+    '🗑️ <b>Kirim Link Website</b>\n\nKirim link website hasil deploy Cloud Logic yang ingin dihapus.\nContoh: <code>https://nama-web.vercel.app</code> atau <code>https://nama-web.netlify.app</code>\n\nBot otomatis kenali platform-nya dari link. Website (Vercel/Netlify) dan repository (GitHub) yang cocok akan otomatis ikut terhapus — tidak perlu cari ID atau buka dashboard.',
     { type: 'delete', step: 'link' }
   );
 });
@@ -967,21 +1211,22 @@ bot.on('text', async (ctx) => {
     sessions.delete(id);
     const status = await sendPanel(ctx, panel({ heading: '<b>DELETE WEB</b>', body: '⏳ Mencari project dari link…' }));
     try {
-      const project = await resolveVercelProjectFromUrl(text);
+      const target = await resolveDeployTargetFromUrl(text);
+      const platformLabel = target.platform === 'netlify' ? 'Netlify' : 'Vercel';
 
       await editPanel(ctx, status.message_id, panel({
         heading: '<b>DELETE WEB</b>',
-        body: `🌐 Project ditemukan: <code>${escapeHtml(project.name)}</code>\n\n⏳ Menghapus website & deployment di Vercel…`,
+        body: `🛰️ Platform: <b>${escapeHtml(platformLabel)}</b>\n🌐 Project ditemukan: <code>${escapeHtml(target.name)}</code>\n\n⏳ Menghapus website & deployment di ${escapeHtml(platformLabel)}…`,
       }));
-      await deleteVercelProject(project);
+      await deleteDeployTarget(target);
 
       let repoStatus = '⚠️ Repository tidak ditemukan otomatis';
       try {
-        const repo = await findGithubRepoByProjectName(project.name);
+        const repo = await findGithubRepoByProjectName(target.name);
         if (repo) {
           await editPanel(ctx, status.message_id, panel({
             heading: '<b>DELETE WEB</b>',
-            body: `🌐 Project: <code>${escapeHtml(project.name)}</code>\n✅ Website Vercel dihapus.\n\n⏳ Menghapus repository…`,
+            body: `🛰️ Platform: <b>${escapeHtml(platformLabel)}</b>\n🌐 Project: <code>${escapeHtml(target.name)}</code>\n✅ Website ${escapeHtml(platformLabel)} dihapus.\n\n⏳ Menghapus repository…`,
           }));
           await deleteGithubRepo(repo.owner.login, repo.name);
           repoStatus = '✅ Ikut dihapus';
@@ -993,7 +1238,8 @@ bot.on('text', async (ctx) => {
       await editPanel(ctx, status.message_id, panel({
         heading: '<b>WEB DIHAPUS ✅</b>',
         box: infoBox([
-          ['📦 Project', escapeHtml(project.name)],
+          ['📦 Project', escapeHtml(target.name)],
+          ['🛰️ Platform', escapeHtml(platformLabel)],
           ['🌐 Website', '✅ Dihapus'],
           ['📁 Repository', escapeHtml(repoStatus)],
         ]),
@@ -1035,6 +1281,7 @@ bot.on('text', async (ctx) => {
       heading: '📊 <b>DASHBOARD LOG</b>',
       box: infoBox([
         ['📡 Server', '🔵 <b>PROCESSING</b>'],
+        ['🛰️ Platform', escapeHtml(session.platform === 'netlify' ? 'Netlify' : 'Vercel')],
         ['🔧 Mode', escapeHtml(session.type === 'deploy_zip' ? 'Deploy ZIP' : 'Deploy HTML')],
         ['📦 Nama Web', `<code>${escapeHtml(session.name)}</code>`],
         ['🔄 Progress', `<code>${progressBar(0)}</code> 0%`],
@@ -1061,33 +1308,35 @@ bot.on('document', async (ctx) => {
   if (session.controlMessageId) await safeDeleteMessage(ctx, ctx.chat.id, session.controlMessageId);
 
   if (session.type === 'deploy_html' && session.step === 'file') {
+    const platformLabel = session.platform === 'netlify' ? 'Netlify' : 'Vercel';
     if (!/\.html?$/i.test(fileName)) {
-      await sendPrompt(ctx, 'Deploy HTML', '❌ <b>Format salah.</b>\n\nMenu ini hanya menerima file <code>.html</code>. Silakan kirim ulang file yang sesuai.', session);
+      await sendPrompt(ctx, `Deploy HTML — ${platformLabel}`, '❌ <b>Format salah.</b>\n\nMenu ini hanya menerima file <code>.html</code>. Silakan kirim ulang file yang sesuai.', session);
       return;
     }
     try {
       const buffer = await downloadTelegramFile(ctx, document.file_id);
       session.files = [{ path: 'index.html', buffer }];
       session.step = 'name';
-      await sendPrompt(ctx, 'Deploy HTML', `📄 File diterima: <code>${escapeHtml(fileName)}</code>\n\n🚀 <b>Langkah 2 dari 2 — Nama Website</b>\n\nKirim nama repository/website (huruf, angka, dan tanda "-" saja, tanpa spasi).\nContoh: <code>toko-online-saya</code>`, session);
+      await sendPrompt(ctx, `Deploy HTML — ${platformLabel}`, `📄 File diterima: <code>${escapeHtml(fileName)}</code>\n\n🚀 <b>Langkah 2 dari 2 — Nama Website</b>\n\nKirim nama repository/website (huruf, angka, dan tanda "-" saja, tanpa spasi).\nContoh: <code>toko-online-saya</code>`, session);
     } catch (error) {
-      await sendPrompt(ctx, 'Deploy HTML', `❌ <b>Gagal mengambil file dari Telegram.</b>\n\n<code>${escapeHtml(errorMessage(error))}</code>`, session);
+      await sendPrompt(ctx, `Deploy HTML — ${platformLabel}`, `❌ <b>Gagal mengambil file dari Telegram.</b>\n\n<code>${escapeHtml(errorMessage(error))}</code>`, session);
     }
     return;
   }
 
   if (session.type === 'deploy_zip' && session.step === 'file') {
+    const platformLabel = session.platform === 'netlify' ? 'Netlify' : 'Vercel';
     if (!/\.zip$/i.test(fileName)) {
-      await sendPrompt(ctx, 'Deploy ZIP', '❌ <b>Format salah.</b>\n\nMenu ini hanya menerima file <code>.zip</code>. Silakan kirim ulang file yang sesuai.', session);
+      await sendPrompt(ctx, `Deploy ZIP — ${platformLabel}`, '❌ <b>Format salah.</b>\n\nMenu ini hanya menerima file <code>.zip</code>. Silakan kirim ulang file yang sesuai.', session);
       return;
     }
     try {
       const buffer = await downloadTelegramFile(ctx, document.file_id);
       session.files = await extractZip(buffer);
       session.step = 'name';
-      await sendPrompt(ctx, 'Deploy ZIP', `📦 ZIP diterima: <b>${session.files.length}</b> file ditemukan.\n\n🚀 <b>Langkah 2 dari 2 — Nama Website</b>\n\nKirim nama repository/website (huruf, angka, dan tanda "-" saja, tanpa spasi).\nContoh: <code>toko-online-saya</code>`, session);
+      await sendPrompt(ctx, `Deploy ZIP — ${platformLabel}`, `📦 ZIP diterima: <b>${session.files.length}</b> file ditemukan.\n\n🚀 <b>Langkah 2 dari 2 — Nama Website</b>\n\nKirim nama repository/website (huruf, angka, dan tanda "-" saja, tanpa spasi).\nContoh: <code>toko-online-saya</code>`, session);
     } catch (error) {
-      await sendPrompt(ctx, 'Deploy ZIP', `❌ <b>ZIP tidak valid.</b>\n\n<code>${escapeHtml(errorMessage(error))}</code>`, session);
+      await sendPrompt(ctx, `Deploy ZIP — ${platformLabel}`, `❌ <b>ZIP tidak valid.</b>\n\n<code>${escapeHtml(errorMessage(error))}</code>`, session);
     }
     return;
   }
