@@ -116,8 +116,10 @@ function mainMenuMarkup() {
   return Markup.inlineKeyboard([
     [Markup.button.callback('🚀  Deploy Vercel', 'deploy_vercel'), Markup.button.callback('☁️  Deploy Netlify', 'deploy_netlify')],
     [Markup.button.callback('🌐  Get Source', 'get_source'), Markup.button.callback('🛡️  Encrypt HTML', 'encrypt_html')],
+    [Markup.button.callback('🖼️  Foto ke URL', 'photo_url'), Markup.button.callback('📋  List Web', 'list_web')],
     [Markup.button.callback('🗑️  Delete Web', 'delete_web'), Markup.button.callback('📡  System Check', 'system')],
     [Markup.button.callback('👤  Add User', 'add_user'), Markup.button.callback('👥  Users', 'users')],
+    [Markup.button.callback('📢  Broadcast', 'broadcast')],
   ]);
 }
 
@@ -250,6 +252,83 @@ async function saveUsers() {
     'chore: update Cloud Logic authorized users',
     old?.sha
   );
+}
+
+// ─────────────────────────────────────────────
+// RIWAYAT DEPLOY — dipakai fitur "List Web". Disimpan di file JSON yang
+// sama polanya dengan daftar user (di repo backup GitHub), supaya List Web
+// benar-benar berisi data deploy asli, bukan data karangan/simulasi.
+// ─────────────────────────────────────────────
+
+async function loadDeployments() {
+  try {
+    const file = await getBotRepoFile('cloud-logic-deployments.json');
+    if (!file?.content) return [];
+    const parsed = JSON.parse(Buffer.from(file.content, 'base64').toString('utf8'));
+    return Array.isArray(parsed) ? parsed : [];
+  } catch (_) {
+    return [];
+  }
+}
+
+async function recordDeployment(entry) {
+  // Best-effort: kalau gagal simpan catatan, JANGAN gagalkan proses deploy
+  // itu sendiri. Ada 1x retry kalau kena konflik versi (409) karena ada
+  // proses lain yang menulis file yang sama nyaris bersamaan.
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      const file = await getBotRepoFile('cloud-logic-deployments.json');
+      let list = [];
+      if (file?.content) {
+        try {
+          list = JSON.parse(Buffer.from(file.content, 'base64').toString('utf8'));
+        } catch (_) {
+          list = [];
+        }
+        if (!Array.isArray(list)) list = [];
+      }
+      list.push(entry);
+      if (list.length > 200) list = list.slice(list.length - 200);
+      await writeBotRepoFile(
+        'cloud-logic-deployments.json',
+        JSON.stringify(list, null, 2),
+        'chore: record Cloud Logic deployment',
+        file?.sha
+      );
+      return;
+    } catch (error) {
+      if (attempt === 0 && error.response?.status === 409) continue;
+      return;
+    }
+  }
+}
+
+async function removeDeploymentRecord(name, platform) {
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      const file = await getBotRepoFile('cloud-logic-deployments.json');
+      if (!file?.content) return;
+      let list = [];
+      try {
+        list = JSON.parse(Buffer.from(file.content, 'base64').toString('utf8'));
+      } catch (_) {
+        return;
+      }
+      if (!Array.isArray(list)) return;
+      const filtered = list.filter((d) => !(d.name === name && d.platform === platform));
+      if (filtered.length === list.length) return;
+      await writeBotRepoFile(
+        'cloud-logic-deployments.json',
+        JSON.stringify(filtered, null, 2),
+        'chore: remove Cloud Logic deployment record',
+        file.sha
+      );
+      return;
+    } catch (error) {
+      if (attempt === 0 && error.response?.status === 409) continue;
+      return;
+    }
+  }
 }
 
 async function githubApi(method, path, data, config = {}) {
@@ -906,6 +985,26 @@ async function checkVercel() {
 // GitHub App apapun. Tampilan dashboard-nya sama persis untuk keduanya.
 // ─────────────────────────────────────────────
 
+async function getVercelBuildLogTail(deploymentId, teamId, maxLines = 15) {
+  try {
+    const response = await axios.get(`${VERCEL_API}/v2/deployments/${encodeURIComponent(deploymentId)}/events`, {
+      headers: vercelHeaders,
+      params: { teamId: teamId || undefined, builds: 1 },
+      timeout: 20000,
+    });
+    const events = Array.isArray(response.data) ? response.data : (response.data?.events || []);
+    const lines = events
+      .map((e) => e?.payload?.text || e?.text)
+      .filter(Boolean)
+      .map((t) => String(t).trim())
+      .filter(Boolean);
+    if (!lines.length) return null;
+    return lines.slice(-maxLines).join('\n');
+  } catch (_) {
+    return null;
+  }
+}
+
 async function publishToVercel(name, files, render) {
   await render(30, 'Mengunggah berkas ke Vercel…');
   const deployment = await createVercelDeployment(name, files);
@@ -919,7 +1018,10 @@ async function publishToVercel(name, files, render) {
   });
 
   if ((final.readyState || final.state) !== 'READY') {
-    throw new Error(`Build berakhir dengan status ${final.readyState || final.state || 'ERROR'}.`);
+    const err = new Error(`Build berakhir dengan status ${final.readyState || final.state || 'ERROR'}.`);
+    const logTail = await getVercelBuildLogTail(deployment.id, deployment.teamId);
+    if (logTail) err.detail = logTail;
+    throw err;
   }
 
   await render(98, 'Mengambil link publik…');
@@ -945,10 +1047,106 @@ async function publishToNetlify(name, files, render) {
   });
 
   if (final.state !== 'ready') {
-    throw new Error(`Deploy Netlify berakhir dengan status ${final.state || 'error'}.`);
+    const err = new Error(`Deploy Netlify berakhir dengan status ${final.state || 'error'}.`);
+    const detailParts = [];
+    if (final.error_message) detailParts.push(String(final.error_message));
+    if (Array.isArray(final.summary?.messages)) {
+      for (const m of final.summary.messages.slice(0, 6)) {
+        if (m?.title) detailParts.push(m.description ? `${m.title}: ${m.description}` : String(m.title));
+      }
+    }
+    if (detailParts.length) err.detail = detailParts.join('\n');
+    throw err;
   }
 
   return final.ssl_url || final.url || site.ssl_url || site.url;
+}
+
+// ─────────────────────────────────────────────
+// FOTO KE URL — upload 1 gambar, dapat link langsung ke file-nya
+// (numpang infrastruktur deploy Vercel yang sudah ada, tanpa backup
+// GitHub — supaya prosesnya ringan & cepat)
+// ─────────────────────────────────────────────
+
+function sanitizeImageFileName(name, fallbackExt) {
+  let base = String(name || '').trim();
+  base = base.replace(/[^a-zA-Z0-9._-]+/g, '-').replace(/^-+|-+$/g, '');
+  if (!base) base = `image.${fallbackExt || 'png'}`;
+  if (!/\.[a-z0-9]{2,5}$/i.test(base)) base += `.${fallbackExt || 'png'}`;
+  return base.toLowerCase();
+}
+
+const IMAGE_MIME_EXT = {
+  'image/png': 'png',
+  'image/jpeg': 'jpg',
+  'image/gif': 'gif',
+  'image/webp': 'webp',
+  'image/svg+xml': 'svg',
+  'image/x-icon': 'ico',
+  'image/vnd.microsoft.icon': 'ico',
+};
+
+async function runPhotoUpload(ctx, files, statusMessage) {
+  const fileName = files[0].path;
+  const startedAt = Date.now();
+  const projectName = `img-${crypto.randomBytes(4).toString('hex')}`;
+
+  const render = async (percent, activity) => {
+    await editPanel(ctx, statusMessage.message_id, panel({
+      heading: '📊 <b>DASHBOARD LOG</b>',
+      box: infoBox([
+        ['📡 Server', '🔵 <b>PROCESSING</b>'],
+        ['🔧 Mode', 'Foto ke URL'],
+        ['🖼️ File', `<code>${escapeHtml(fileName)}</code>`],
+        ['🔄 Progress', `<code>${progressBar(percent)}</code> ${percent}%`],
+        ['📝 Activity', escapeHtml(activity)],
+      ]),
+      footer: 'Proses membutuhkan waktu, jadi mohon\nuntuk sabar.....',
+    }));
+  };
+
+  await render(10, 'Mengunggah foto…');
+
+  try {
+    const deployment = await createVercelDeployment(projectName, files);
+    await render(50, 'Memproses…');
+
+    const final = await waitForDeployment(deployment.id, deployment.teamId, 120000, async (state) => {
+      if (state === 'READY') await render(90, 'Menyelesaikan…');
+      else await render(60, `Status: ${state || 'memproses'}…`);
+    });
+
+    if ((final.readyState || final.state) !== 'READY') {
+      throw new Error(`Upload berakhir dengan status ${final.readyState || final.state || 'ERROR'}.`);
+    }
+
+    const cleanHost = await getCleanProductionUrl(deployment.id, deployment.teamId, projectSafeName(projectName));
+    const url = `https://${cleanHost}/${fileName}`;
+    const elapsed = formatElapsed(Date.now() - startedAt);
+
+    await editPanel(ctx, statusMessage.message_id, panel({
+      heading: '<b>FOTO SIAP DIPAKAI ✅️</b>',
+      box: infoBox([
+        ['🖼️ File', escapeHtml(fileName)],
+        ['🔗 URL', `<a href="${escapeHtml(url)}">${escapeHtml(url)}</a>`],
+        ['⏰ Waktu', escapeHtml(elapsed)],
+      ]),
+      footer: '💡 Tinggal pasang di HTML:\n<code>&lt;img src="LINK_DI_ATAS"&gt;</code>',
+    }), homeButton());
+  } catch (error) {
+    const elapsed = formatElapsed(Date.now() - startedAt);
+    await editPanel(ctx, statusMessage.message_id, panel({
+      heading: '<b>UPLOAD GAGAL ❌</b>',
+      box: infoBox([
+        ['🖼️ File', escapeHtml(fileName)],
+        ['⚠️ Penyebab', escapeHtml(errorMessage(error))],
+        ['⏰ Waktu', escapeHtml(elapsed)],
+      ]),
+      footer: '🔁 Silakan coba lagi dari menu utama',
+    }), homeButton());
+  } finally {
+    sessions.delete(uid(ctx));
+  }
 }
 
 async function runDeployment(ctx, session, statusMessage) {
@@ -990,6 +1188,15 @@ async function runDeployment(ctx, session, statusMessage) {
     const url = await publisher(repoName, session.files, render);
     const elapsed = formatElapsed(Date.now() - startedAt);
 
+    await recordDeployment({
+      name: repoName,
+      platform,
+      url,
+      ownerId: uid(ctx),
+      ownerUsername: ctx.from?.username || null,
+      ts: Date.now(),
+    });
+
     await editPanel(ctx, statusMessage.message_id, panel({
       heading: '<b>DEPLOY BERHASIL ✅️</b>',
       box: infoBox([
@@ -1002,6 +1209,9 @@ async function runDeployment(ctx, session, statusMessage) {
     }), homeButton());
   } catch (error) {
     const elapsed = formatElapsed(Date.now() - startedAt);
+    const logBody = error.detail
+      ? `📄 <b>Log Error:</b>\n<pre>${escapeHtml(String(error.detail).slice(0, 700))}</pre>`
+      : undefined;
     await editPanel(ctx, statusMessage.message_id, panel({
       heading: '<b>DEPLOY GAGAL ❌</b>',
       box: infoBox([
@@ -1010,6 +1220,7 @@ async function runDeployment(ctx, session, statusMessage) {
         ['⚠️ Penyebab', escapeHtml(errorMessage(error))],
         ['⏰ Waktu', escapeHtml(elapsed)],
       ]),
+      body: logBody,
       footer: '🔁 Silakan coba lagi dari menu utama',
     }), homeButton());
   } finally {
@@ -1136,6 +1347,9 @@ bot.action('users', async (ctx) => {
   if (uid(ctx) !== OWNER_ID) return;
   const ids = [...allowedUsers].filter((x) => x !== OWNER_ID);
   const list = ids.length ? ids.map((x, i) => `${i + 1}. <code>${x}</code>`).join('\n') : '<i>Belum ada user tambahan.</i>';
+  const buttons = ids.length
+    ? Markup.inlineKeyboard([[Markup.button.callback('🗑️  Kelola / Hapus User', 'manage_users')], [Markup.button.callback('🏠  Menu Utama', 'home')]])
+    : homeButton();
   await sendPanel(ctx, panel({
     heading: '<b>AUTHORIZED USERS</b>',
     box: infoBox([
@@ -1143,7 +1357,91 @@ bot.action('users', async (ctx) => {
       ['👤 User tambahan', `<b>${ids.length}</b>`],
     ]),
     body: list,
+  }), buttons);
+});
+
+bot.action('manage_users', async (ctx) => {
+  await ctx.answerCbQuery();
+  if (uid(ctx) !== OWNER_ID) return;
+  const ids = [...allowedUsers].filter((x) => x !== OWNER_ID);
+  if (!ids.length) {
+    await sendPanel(ctx, panel({ heading: '<b>KELOLA USER</b>', body: '<i>Belum ada user tambahan untuk dihapus.</i>' }), homeButton());
+    return;
+  }
+  const buttons = ids.map((x) => [Markup.button.callback(`❌  Hapus ${x}`, `rmuser_${x}`)]);
+  buttons.push([Markup.button.callback('🏠  Menu Utama', 'home')]);
+  await sendPanel(ctx, panel({
+    heading: '<b>KELOLA USER</b>',
+    body: 'Tap salah satu user di bawah untuk mencabut aksesnya dari bot ini.',
+  }), Markup.inlineKeyboard(buttons));
+});
+
+bot.action(/^rmuser_(\d+)$/, async (ctx) => {
+  await ctx.answerCbQuery();
+  if (uid(ctx) !== OWNER_ID) return;
+  const target = Number(ctx.match[1]);
+  if (target === OWNER_ID) {
+    await sendPanel(ctx, panel({ heading: '<b>TIDAK BISA ❌</b>', body: 'Owner tidak bisa menghapus dirinya sendiri.' }), homeButton());
+    return;
+  }
+  const existed = allowedUsers.has(target);
+  allowedUsers.delete(target);
+  try {
+    await saveUsers();
+    await sendPanel(ctx, panel({ heading: '<b>USER DIHAPUS ✅</b>', body: `User <code>${target}</code> sudah dicabut aksesnya dari bot ini.` }), homeButton());
+  } catch (error) {
+    if (existed) allowedUsers.add(target);
+    await sendPanel(ctx, panel({ heading: '<b>HAPUS USER GAGAL ❌</b>', body: `<code>${escapeHtml(errorMessage(error))}</code>` }), homeButton());
+  }
+});
+
+bot.action('list_web', async (ctx) => {
+  await ctx.answerCbQuery('Memuat daftar…');
+  const all = await loadDeployments();
+  const isOwnerView = uid(ctx) === OWNER_ID;
+  const relevant = isOwnerView ? all : all.filter((d) => d.ownerId === uid(ctx));
+  const recent = relevant.slice(-20).reverse();
+
+  if (!recent.length) {
+    await sendPanel(ctx, panel({
+      heading: `<b>LIST WEB${isOwnerView ? ' (SEMUA USER)' : ''}</b>`,
+      body: isOwnerView ? '<i>Belum ada web yang tercatat.</i>' : '<i>Kamu belum pernah deploy web lewat bot ini.</i>',
+    }), homeButton());
+    return;
+  }
+
+  const lines = recent.map((d, i) => {
+    const platformLabel = d.platform === 'netlify' ? 'Netlify' : 'Vercel';
+    const who = isOwnerView ? ` — <code>${d.ownerId}</code>` : '';
+    return `${i + 1}. <a href="${escapeHtml(d.url)}">${escapeHtml(d.name)}</a> (${escapeHtml(platformLabel)})${who}`;
+  });
+
+  await sendPanel(ctx, panel({
+    heading: `<b>LIST WEB${isOwnerView ? ' (SEMUA USER)' : ''}</b>`,
+    body: lines.join('\n'),
+    footer: `Menampilkan ${recent.length} terbaru dari ${relevant.length} total.`,
   }), homeButton());
+});
+
+bot.action('broadcast', async (ctx) => {
+  await ctx.answerCbQuery();
+  if (uid(ctx) !== OWNER_ID) return;
+  await sendPrompt(
+    ctx,
+    'Broadcast',
+    '📢 <b>Kirim Pesan Broadcast</b>\n\nKetik pesan yang mau dikirim ke SEMUA user terdaftar di bot ini.',
+    { type: 'broadcast', step: 'text' }
+  );
+});
+
+bot.action('photo_url', async (ctx) => {
+  await ctx.answerCbQuery();
+  await sendPrompt(
+    ctx,
+    'Foto ke URL',
+    '🖼️ <b>Kirim Foto/Icon</b>\n\nKirim gambar yang mau dijadikan link (untuk dipakai di <code>&lt;img src&gt;</code> project HTML kamu).\n\nFormat didukung: PNG, JPG, GIF, WEBP, SVG, ICO.\n\n<i>Tips: kirim sebagai File/Dokumen (bukan Foto biasa) kalau mau kualitas asli tanpa dikompres Telegram — cocok buat icon/logo yang butuh tajam.</i>',
+    { type: 'photo_url', step: 'file' }
+  );
 });
 
 bot.action('delete_web', async (ctx) => {
@@ -1184,6 +1482,38 @@ bot.on('text', async (ctx) => {
     return;
   }
 
+  if (session.type === 'broadcast' && session.step === 'text') {
+    if (id !== OWNER_ID) return;
+    sessions.delete(id);
+    const status = await sendPanel(ctx, panel({ heading: '<b>BROADCAST</b>', body: '⏳ Mengirim pesan ke semua user…' }));
+
+    const targets = [...allowedUsers].filter((x) => x !== id);
+    let success = 0;
+    let failed = 0;
+    for (const targetId of targets) {
+      try {
+        await bot.telegram.sendMessage(
+          targetId,
+          panel({ heading: '<b>📢 BROADCAST</b>', body: escapeHtml(text) }),
+          REPLY_OPTS
+        );
+        success += 1;
+      } catch (_) {
+        failed += 1;
+      }
+    }
+
+    await editPanel(ctx, status.message_id, panel({
+      heading: '<b>BROADCAST SELESAI ✅</b>',
+      box: infoBox([
+        ['📤 Terkirim', `<b>${success}</b>`],
+        ['❌ Gagal', `<b>${failed}</b>`],
+        ['👥 Total Target', `<b>${targets.length}</b>`],
+      ]),
+    }), homeButton());
+    return;
+  }
+
   if (session.type === 'source' && session.step === 'url') {
     sessions.delete(id);
     const status = await sendPanel(ctx, panel({ heading: '<b>GET SOURCE</b>', body: '⏳ Mengambil HTML, CSS, JavaScript, dan asset publik…' }));
@@ -1219,6 +1549,7 @@ bot.on('text', async (ctx) => {
         body: `🛰️ Platform: <b>${escapeHtml(platformLabel)}</b>\n🌐 Project ditemukan: <code>${escapeHtml(target.name)}</code>\n\n⏳ Menghapus website & deployment di ${escapeHtml(platformLabel)}…`,
       }));
       await deleteDeployTarget(target);
+      await removeDeploymentRecord(target.name, target.platform);
 
       let repoStatus = '⚠️ Repository tidak ditemukan otomatis';
       try {
@@ -1298,6 +1629,41 @@ bot.on('text', async (ctx) => {
   }
 });
 
+bot.on('photo', async (ctx) => {
+  const id = uid(ctx);
+  const session = sessions.get(id);
+  if (!session || session.type !== 'photo_url' || session.step !== 'file') return;
+
+  if (session.controlMessageId) await safeDeleteMessage(ctx, ctx.chat.id, session.controlMessageId);
+
+  try {
+    // Ambil resolusi terbesar yang dikirim Telegram (foto biasa otomatis
+    // dikompres Telegram jadi JPEG — untuk kualitas asli, sarankan user
+    // kirim sebagai File/Dokumen, sudah dijelaskan di prompt sebelumnya).
+    const sizes = ctx.message.photo;
+    const largest = sizes[sizes.length - 1];
+    const buffer = await downloadTelegramFile(ctx, largest.file_id);
+    const fileName = `foto-${Date.now()}.jpg`;
+    sessions.delete(id);
+
+    const status = await sendPanel(ctx, panel({
+      heading: '📊 <b>DASHBOARD LOG</b>',
+      box: infoBox([
+        ['📡 Server', '🔵 <b>PROCESSING</b>'],
+        ['🔧 Mode', 'Foto ke URL'],
+        ['🖼️ File', `<code>${escapeHtml(fileName)}</code>`],
+        ['🔄 Progress', `<code>${progressBar(0)}</code> 0%`],
+        ['📝 Activity', 'Memulai proses…'],
+      ]),
+      footer: 'Proses membutuhkan waktu, jadi mohon\nuntuk sabar.....',
+    }));
+    await runPhotoUpload(ctx, [{ path: fileName, buffer }], status);
+  } catch (error) {
+    sessions.delete(id);
+    await sendPrompt(ctx, 'Foto ke URL', `❌ <b>Gagal mengambil foto dari Telegram.</b>\n\n<code>${escapeHtml(errorMessage(error))}</code>`, { type: 'photo_url', step: 'file' });
+  }
+});
+
 bot.on('document', async (ctx) => {
   const id = uid(ctx);
   const session = sessions.get(id);
@@ -1306,6 +1672,37 @@ bot.on('document', async (ctx) => {
   const fileName = document.file_name || 'file';
 
   if (session.controlMessageId) await safeDeleteMessage(ctx, ctx.chat.id, session.controlMessageId);
+
+  if (session.type === 'photo_url' && session.step === 'file') {
+    const mimeType = document.mime_type || '';
+    const extFromMime = IMAGE_MIME_EXT[mimeType.toLowerCase()];
+    const looksLikeImageName = /\.(png|jpe?g|gif|webp|svg|ico)$/i.test(fileName);
+    if (!mimeType.startsWith('image/') && !looksLikeImageName) {
+      await sendPrompt(ctx, 'Foto ke URL', '❌ <b>Format tidak didukung.</b>\n\nKirim gambar dengan format PNG, JPG, GIF, WEBP, SVG, atau ICO.', session);
+      return;
+    }
+    try {
+      const buffer = await downloadTelegramFile(ctx, document.file_id);
+      const safeName = sanitizeImageFileName(fileName, extFromMime);
+      sessions.delete(id);
+
+      const status = await sendPanel(ctx, panel({
+        heading: '📊 <b>DASHBOARD LOG</b>',
+        box: infoBox([
+          ['📡 Server', '🔵 <b>PROCESSING</b>'],
+          ['🔧 Mode', 'Foto ke URL'],
+          ['🖼️ File', `<code>${escapeHtml(safeName)}</code>`],
+          ['🔄 Progress', `<code>${progressBar(0)}</code> 0%`],
+          ['📝 Activity', 'Memulai proses…'],
+        ]),
+        footer: 'Proses membutuhkan waktu, jadi mohon\nuntuk sabar.....',
+      }));
+      await runPhotoUpload(ctx, [{ path: safeName, buffer }], status);
+    } catch (error) {
+      await sendPrompt(ctx, 'Foto ke URL', `❌ <b>Gagal mengambil file dari Telegram.</b>\n\n<code>${escapeHtml(errorMessage(error))}</code>`, session);
+    }
+    return;
+  }
 
   if (session.type === 'deploy_html' && session.step === 'file') {
     const platformLabel = session.platform === 'netlify' ? 'Netlify' : 'Vercel';
