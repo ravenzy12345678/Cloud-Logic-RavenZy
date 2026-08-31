@@ -116,10 +116,10 @@ function mainMenuMarkup() {
   return Markup.inlineKeyboard([
     [Markup.button.callback('🚀  Deploy Vercel', 'deploy_vercel'), Markup.button.callback('☁️  Deploy Netlify', 'deploy_netlify')],
     [Markup.button.callback('🌐  Get Source', 'get_source'), Markup.button.callback('🛡️  Encrypt HTML', 'encrypt_html')],
-    [Markup.button.callback('🖼️  Foto ke URL', 'photo_url'), Markup.button.callback('📋  List Web', 'list_web')],
-    [Markup.button.callback('🗑️  Delete Web', 'delete_web'), Markup.button.callback('📡  System Check', 'system')],
+    [Markup.button.callback('🔏  Obfuscate HTML', 'obfuscate_html'), Markup.button.callback('🖼️  Foto ke URL', 'photo_url')],
+    [Markup.button.callback('📋  List Web', 'list_web'), Markup.button.callback('🗑️  Delete Web', 'delete_web')],
+    [Markup.button.callback('📡  System Check', 'system'), Markup.button.callback('📢  Broadcast', 'broadcast')],
     [Markup.button.callback('👤  Add User', 'add_user'), Markup.button.callback('👥  Users', 'users')],
-    [Markup.button.callback('📢  Broadcast', 'broadcast')],
   ]);
 }
 
@@ -968,6 +968,71 @@ document.open();document.write(new TextDecoder().decode(plain));document.close()
 </script>`;
 }
 
+function autoObfuscateHtml(html) {
+  // 1. Buat Kamus Karakter (36 Arab + 220 Mandarin = 256 unik)
+  let dict = [];
+  for (let i = 0x0627; i <= 0x064A; i++) dict.push(String.fromCharCode(i));
+  for (let i = 0x4E00; i < 0x4E00 + 220; i++) dict.push(String.fromCharCode(i));
+  
+  // 2. Acak / Shuffle Kamus untuk Obfuscation Unik setiap saat
+  for (let i = dict.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [dict[i], dict[j]] = [dict[j], dict[i]];
+  }
+  const dictStr = dict.join('');
+
+  // 3. Konversi HTML Asli ke Base64 UTF-8 Aman
+  const b64 = Buffer.from(html, 'utf8').toString('base64');
+  
+  // 4. Buat Kunci XOR Random (1-255)
+  const key = Math.floor(Math.random() * 255) + 1;
+  
+  // 5. Enkripsi (XOR) dan Mapping ke Karakter Arab/Mandarin
+  let obfString = '';
+  for (let i = 0; i < b64.length; i++) {
+    const charCode = b64.charCodeAt(i) ^ key;
+    obfString += dictStr[charCode];
+  }
+
+  // 6. Buat Skrip Decoder Otomatis (Senyap)
+  const decoder = `
+    var d = "${dictStr}";
+    var o = "${obfString}";
+    var k = ${key};
+    var b = "";
+    for (var i = 0; i < o.length; i++) {
+      b += String.fromCharCode(d.indexOf(o[i]) ^ k);
+    }
+    var bin = atob(b);
+    var bytes = new Uint8Array(bin.length);
+    for (var i = 0; i < bin.length; i++) {
+      bytes[i] = bin.charCodeAt(i);
+    }
+    var html = new TextDecoder().decode(bytes);
+    document.open();
+    document.write(html);
+    document.close();
+  `;
+
+  // 7. Obfuscate decoder ke bentuk Base64 agar script aslinya tersembunyi
+  const b64Decoder = Buffer.from(decoder).toString('base64');
+  
+  // 8. Output Final 1 File Index
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Loading...</title>
+</head>
+<body>
+<script>
+  new Function(atob("${b64Decoder}"))();
+</script>
+</body>
+</html>`;
+}
+
 async function checkGitHub() {
   const r = await axios.get(`${GH_API}/user`, { headers: ghHeaders, timeout: 30000 });
   return r.data;
@@ -1317,6 +1382,16 @@ bot.action('encrypt_html', async (ctx) => {
     'Encrypt HTML',
     '🛡️ <b>Langkah 1 dari 3 — Kirim File</b>\n\nUnggah 1 file <code>.html</code> yang ingin dikunci dengan password (AES-256-GCM).',
     { type: 'encrypt', step: 'file' }
+  );
+});
+
+bot.action('obfuscate_html', async (ctx) => {
+  await ctx.answerCbQuery();
+  await sendPrompt(
+    ctx,
+    'Obfuscate HTML',
+    '🔏 <b>Kirim File HTML</b>\n\nUnggah 1 file <code>.html</code> yang ingin diobfuscate (Base64 + XOR + Karakter Arab/Mandarin + Shuffle).\n\n<i>File ini akan didecode otomatis secara senyap di browser pengunjung tanpa meminta password!</i>',
+    { type: 'obfuscate', step: 'file' }
   );
 });
 
@@ -1751,6 +1826,36 @@ bot.on('document', async (ctx) => {
     } catch (error) {
       await sendPrompt(ctx, 'Encrypt HTML', `❌ <b>Gagal mengambil file dari Telegram.</b>\n\n<code>${escapeHtml(errorMessage(error))}</code>`, session);
     }
+    return;
+  }
+
+  // ───────────────────────────
+  // HANDLER OBFUSCATION BARU
+  // ───────────────────────────
+  if (session.type === 'obfuscate' && session.step === 'file') {
+    if (!/\.html?$/i.test(fileName)) {
+      await sendPrompt(ctx, 'Obfuscate HTML', '❌ <b>Format salah.</b>\n\nMenu ini hanya menerima file <code>.html</code>. Silakan kirim ulang file yang sesuai.', session);
+      return;
+    }
+    try {
+      const fileBuffer = await downloadTelegramFile(ctx, document.file_id);
+      sessions.delete(id);
+      
+      const obfuscatedHtml = autoObfuscateHtml(fileBuffer.toString('utf8'));
+      
+      await ctx.replyWithDocument(
+        { source: Buffer.from(obfuscatedHtml, 'utf8'), filename: `${fileName.replace(/\.html?$/i, '')}-obfuscated.html` },
+        { caption: '✅ HTML berhasil enkripsi.' }
+      );
+      
+      await sendPanel(ctx, panel({
+        heading: '<b>ENKRIPSI SELESAI ✅</b>',
+        body: 'File enkripsi sudah dikirim di atas.',
+      }), homeButton());
+    } catch (error) {
+      await sendPrompt(ctx, 'Obfuscate HTML', `❌ <b>Gagal memproses file.</b>\n\n<code>${escapeHtml(errorMessage(error))}</code>`, session);
+    }
+    return;
   }
 });
 
