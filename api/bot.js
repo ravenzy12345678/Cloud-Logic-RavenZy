@@ -2,6 +2,7 @@ const { Telegraf, Markup } = require('telegraf');
 const axios = require('axios');
 const JSZip = require('jszip');
 const crypto = require('crypto');
+const FormData = require('form-data');
 
 const ENV = {
   BOT_TOKEN: process.env.TOKEN_BOT || process.env.BOT_TOKEN,
@@ -116,8 +117,11 @@ function mainMenuMarkup() {
   return Markup.inlineKeyboard([
     [Markup.button.callback('🚀  Deploy Vercel', 'deploy_vercel'), Markup.button.callback('☁️  Deploy Netlify', 'deploy_netlify')],
     [Markup.button.callback('🌐  Get Source', 'get_source'), Markup.button.callback('🛡️  Encrypt HTML', 'encrypt_html')],
-    [Markup.button.callback('🖼️  Foto ke URL', 'photo_url'), Markup.button.callback('📋  List Web', 'list_web')],
-    [Markup.button.callback('🗑️  Delete Web', 'delete_web'), Markup.button.callback('📡  System Check', 'system')],
+    [Markup.button.callback('🖼️  Foto ke URL', 'photo_url'), Markup.button.callback('🎵  Audio ke URL', 'audio_url')],
+    [Markup.button.callback('📸  Screenshot URL', 'screenshot_url'), Markup.button.callback('📦  Get Repo ZIP', 'repo_zip')],
+    [Markup.button.callback('🔎  Cari Repo GitHub', 'search_repo'), Markup.button.callback('🤖  Generate Bot', 'generate_bot')],
+    [Markup.button.callback('📋  List Web', 'list_web'), Markup.button.callback('🗑️  Delete Web', 'delete_web')],
+    [Markup.button.callback('📡  System Check', 'system'), Markup.button.callback('ℹ️  Bantuan', 'help_info')],
     [Markup.button.callback('👤  Add User', 'add_user'), Markup.button.callback('👥  Users', 'users')],
     [Markup.button.callback('📢  Broadcast', 'broadcast')],
   ]);
@@ -128,6 +132,45 @@ function fileTypeMarkup(platform) {
     [Markup.button.callback('📄  Deploy HTML', `${platform}_html`), Markup.button.callback('📦  Deploy ZIP', `${platform}_zip`)],
     [Markup.button.callback('🏠  Menu Utama', 'home')],
   ]);
+}
+
+// Alur "Tambah .env" cuma untuk Vercel (env var Vercel cuma kepakai kalau
+// project punya backend/serverless function di folder api/, tidak berlaku
+// untuk website statis biasa — sudah dijelaskan ke user di teks prompt-nya).
+async function askForWebsiteName(ctx, session, prefixText = '') {
+  session.step = 'name';
+  const platformLabel = session.platform === 'netlify' ? 'Netlify' : 'Vercel';
+  const title = `${session.type === 'deploy_zip' ? 'Deploy ZIP' : 'Deploy HTML'} — ${platformLabel}`;
+  const body = `${prefixText ? `${prefixText}\n\n` : ''}🚀 <b>Langkah Terakhir — Nama Website</b>\n\nKirim nama repository/website (huruf, angka, dan tanda "-" saja, tanpa spasi).\nContoh: <code>toko-online-saya</code>`;
+  await sendPrompt(ctx, title, body, session);
+}
+
+async function askEnvChoiceOrName(ctx, session, prefixText) {
+  if (session.platform !== 'vercel') {
+    await askForWebsiteName(ctx, session, prefixText);
+    return;
+  }
+  session.step = 'env_choice';
+  const old = sessions.get(uid(ctx));
+  if (old?.controlMessageId) await safeDeleteMessage(ctx, ctx.chat.id, old.controlMessageId);
+  const message = await sendPanel(ctx, panel({
+    heading: `<b>${escapeHtml(session.type === 'deploy_zip' ? 'Deploy ZIP' : 'Deploy HTML')} — Vercel</b>`,
+    body: `${prefixText}\n\n⚙️ <b>Tambahkan Environment Variable (.env)?</b>\n\nKalau project ini punya backend/serverless function (folder <code>api/</code>) yang butuh secret/token, bisa ditambahkan dulu sebelum deploy. Kalau cuma website statis biasa, aman untuk Lewati.`,
+  }), Markup.inlineKeyboard([
+    [Markup.button.callback('➕  Tambah .env', 'env_add'), Markup.button.callback('⏭️  Lewati', 'env_skip')],
+  ]));
+  session.controlMessageId = message.message_id;
+  sessions.set(uid(ctx), session);
+}
+
+// Beda dari alur .env di Deploy Vercel: Generate Bot LANGSUNG masuk ke
+// pengisian .env (tidak ada opsi "Lewati"), karena bot Telegram nyaris
+// selalu butuh minimal TOKEN_BOT supaya bisa berfungsi sama sekali.
+async function startGenerateBotEnvCollection(ctx, session, prefixText) {
+  session.envVars = session.envVars || [];
+  session.step = 'gb_env_key';
+  const body = `${prefixText ? `${prefixText}\n\n` : ''}🔑 <b>Kirim KEY</b> environment variable pertama.\nContoh: <code>TOKEN_BOT</code> (wajib ada supaya bot bisa login ke Telegram)`;
+  await sendPrompt(ctx, 'Generate Bot — .env', body, session);
 }
 
 // Kotak info bergaya "dashboard" — dipakai untuk semua tampilan status/hasil
@@ -460,6 +503,53 @@ async function getVercelTeamIds() {
   return ids;
 }
 
+// ─────────────────────────────────────────────
+// VERCEL PROJECT + ENV VAR — dipakai untuk fitur "Tambah .env" (Deploy) dan
+// "Generate Bot". Project harus dibuat/ada duluan sebelum env var bisa
+// ditempel, dan env var harus sudah ada sebelum deployment dibuat supaya
+// langsung terpakai deployment pertamanya.
+// ─────────────────────────────────────────────
+
+async function ensureVercelProject(name) {
+  const projectName = projectSafeName(name);
+  const existing = await tryGetVercelProject(projectName);
+  if (existing) return existing;
+
+  const scopes = [null, ...(await getVercelTeamIds())];
+  let lastError;
+  for (const teamId of scopes) {
+    try {
+      const response = await axios.post(`${VERCEL_API}/v10/projects`, { name: projectName }, {
+        headers: vercelHeaders,
+        params: teamId ? { teamId } : undefined,
+        timeout: 30000,
+      });
+      return { ...response.data, teamId: teamId || null };
+    } catch (error) {
+      lastError = error;
+      const status = error.response?.status;
+      if (![401, 403].includes(status)) break;
+    }
+  }
+  throw new Error(`Gagal membuat project Vercel: ${errorMessage(lastError)}`);
+}
+
+async function pushVercelEnvVars(project, envVars) {
+  if (!envVars || !envVars.length) return;
+  for (const { key, value } of envVars) {
+    await axios.post(`${VERCEL_API}/v10/projects/${encodeURIComponent(project.id)}/env`, {
+      key,
+      value,
+      type: 'encrypted',
+      target: ['production', 'preview', 'development'],
+    }, {
+      headers: vercelHeaders,
+      params: project.teamId ? { teamId: project.teamId } : undefined,
+      timeout: 20000,
+    });
+  }
+}
+
 async function createVercelDeployment(name, files) {
   // Deploy langsung dari isi file (bukan gitSource) supaya TIDAK bergantung
   // sama sekali pada GitHub App Integration Vercel <-> GitHub. Hanya butuh
@@ -575,14 +665,28 @@ async function createNetlifySite(name) {
   return response.data;
 }
 
-async function deployZipToNetlifySite(siteId, zipBuffer) {
-  const response = await axios.post(`${NETLIFY_API}/sites/${encodeURIComponent(siteId)}/deploys`, zipBuffer, {
-    headers: { ...netlifyHeaders, 'Content-Type': 'application/zip' },
+async function deployZipToNetlifyBuilds(siteId, zipBuffer) {
+  // PAKAI Build API (multipart/form-data ke /builds), BUKAN kirim ZIP mentah
+  // langsung ke /deploys. Metode raw-zip (Content-Type: application/zip)
+  // punya bug lama di Netlify: HTML kadang ke-serve sebagai teks mentah
+  // (Content-Type salah), bukan di-render sebagai halaman web. Build API
+  // ini yang resmi direkomendasikan Netlify untuk deploy otomatis via tools.
+  const form = new FormData();
+  form.append('title', 'Cloud Logic deployment');
+  form.append('zip', zipBuffer, { filename: 'site.zip', contentType: 'application/zip' });
+
+  const response = await axios.post(`${NETLIFY_API}/sites/${encodeURIComponent(siteId)}/builds`, form, {
+    headers: { ...netlifyHeaders, ...form.getHeaders() },
     timeout: 120000,
     maxBodyLength: 60 * 1024 * 1024,
     maxContentLength: 60 * 1024 * 1024,
   });
-  return response.data;
+
+  const deployId = response.data?.deploy_id || response.data?.deploy?.id || response.data?.id;
+  if (!deployId) {
+    throw new Error('Netlify tidak mengembalikan deploy_id dari proses build.');
+  }
+  return { ...response.data, deployId };
 }
 
 async function getNetlifyDeploy(deployId) {
@@ -614,6 +718,32 @@ async function checkNetlify() {
   return r.data;
 }
 
+// ─────────────────────────────────────────────
+// SCREENSHOT URL — pakai layanan publik thum.io, tidak butuh API key.
+// ─────────────────────────────────────────────
+
+async function screenshotUrl(targetUrl) {
+  let value = String(targetUrl).trim();
+  if (!/^https?:\/\//i.test(value)) value = `https://${value}`;
+  try {
+    new URL(value); // validasi format
+  } catch (_) {
+    throw new Error('URL tidak valid.');
+  }
+  const shotUrl = `https://image.thum.io/get/width/1200/noanimate/${value}`;
+  const response = await axios.get(shotUrl, {
+    responseType: 'arraybuffer',
+    timeout: 45000,
+    maxContentLength: 15 * 1024 * 1024,
+    headers: { 'User-Agent': 'Mozilla/5.0 (compatible; CloudLogicScreenshot/1.0)' },
+  });
+  const contentType = String(response.headers?.['content-type'] || '');
+  if (!contentType.startsWith('image/')) {
+    throw new Error('Gagal mengambil screenshot — situs mungkin tidak dapat diakses publik.');
+  }
+  return Buffer.from(response.data);
+}
+
 function normalizeZipPath(path) {
   const clean = String(path).replace(/\\/g, '/').replace(/^\/+/, '');
   if (!clean || clean.includes('../') || clean === '..') return null;
@@ -643,6 +773,75 @@ async function extractZip(buffer) {
   }
   throw new Error('ZIP harus mempunyai index.html sebagai halaman utama.');
 }
+
+// Versi lebih longgar buat fitur Generate Bot — TIDAK mewajibkan index.html
+// (project bot backend nggak butuh itu), cukup ratakan folder pembungkus
+// tunggal kalau ada, sisanya diserahkan apa adanya.
+async function extractZipGeneric(buffer) {
+  const zip = await JSZip.loadAsync(buffer);
+  const raw = [];
+  for (const [path, entry] of Object.entries(zip.files)) {
+    if (entry.dir) continue;
+    const clean = normalizeZipPath(path);
+    if (!clean) continue;
+    raw.push({ path: clean, buffer: await entry.async('nodebuffer') });
+  }
+  if (!raw.length) throw new Error('ZIP kosong.');
+
+  const hasPackageJson = raw.some((f) => f.path.toLowerCase() === 'package.json');
+  if (hasPackageJson) return raw;
+
+  const topFolders = new Set(raw.map((f) => f.path.split('/')[0]));
+  if (topFolders.size === 1) {
+    const [prefix] = topFolders;
+    const flattened = raw.map((f) => ({ path: f.path.slice(prefix.length + 1), buffer: f.buffer }));
+    if (flattened.some((f) => f.path.toLowerCase() === 'package.json')) return flattened;
+  }
+  return raw;
+}
+
+// ─────────────────────────────────────────────
+// GENERATE BOT — deteksi otomatis file webhook (bot handler) dari ZIP
+// project yang di-upload. Urutan prioritas:
+// 1. vercel.json bawaan ZIP (kalau ada, paling akurat, dipakai apa adanya)
+// 2. Scan folder api/*.js — 1 file = otomatis, banyak file = tanya user,
+//    0 file = webhook tidak didaftarkan otomatis (dijelaskan ke user)
+// ─────────────────────────────────────────────
+
+function detectGenerateBotWebhookPath(files) {
+  const vercelJsonFile = files.find((f) => f.path.toLowerCase() === 'vercel.json');
+  if (vercelJsonFile) {
+    try {
+      const config = JSON.parse(vercelJsonFile.buffer.toString('utf8'));
+      const functionKeys = config?.functions ? Object.keys(config.functions) : [];
+      const jsKey = functionKeys.find((k) => /\.js$/i.test(k));
+      if (jsKey) return { path: jsKey.replace(/^\/+/, ''), source: 'vercel.json', candidates: null };
+
+      if (Array.isArray(config?.rewrites)) {
+        for (const rule of config.rewrites) {
+          if (typeof rule?.destination === 'string' && /^\/?api\/.+\.js$/i.test(rule.destination)) {
+            return { path: rule.destination.replace(/^\/+/, ''), source: 'vercel.json (rewrites)', candidates: null };
+          }
+        }
+      }
+    } catch (_) {
+      // vercel.json tidak valid JSON — lanjut ke fallback scan folder api/
+    }
+  }
+
+  const apiJsFiles = files
+    .map((f) => f.path.replace(/^\/+/, ''))
+    .filter((p) => /^api\/[^/]+\.js$/i.test(p));
+
+  if (apiJsFiles.length === 1) {
+    return { path: apiJsFiles[0], source: 'terdeteksi otomatis (satu-satunya file di folder api/)', candidates: null };
+  }
+  if (apiJsFiles.length > 1) {
+    return { path: null, source: null, candidates: apiJsFiles };
+  }
+  return { path: null, source: null, candidates: [] };
+}
+
 
 async function downloadTelegramFile(ctx, fileId) {
   const link = await ctx.telegram.getFileLink(fileId);
@@ -852,6 +1051,58 @@ async function deleteGithubRepo(owner, repoName) {
 }
 
 // ─────────────────────────────────────────────
+// GET REPO ZIP — ambil ZIP repo GitHub public lewat endpoint resmi GitHub
+// (codeload), lalu diteruskan ke Telegram. Bukan scraping.
+// ─────────────────────────────────────────────
+
+function parseGithubRepoUrl(input) {
+  let value = String(input).trim();
+  value = value.replace(/^https?:\/\//i, '').replace(/^www\./i, '');
+  value = value.replace(/^github\.com\//i, '');
+  value = value.replace(/\.git$/i, '').replace(/\/+$/g, '');
+  const parts = value.split('/').filter(Boolean);
+  if (parts.length < 2) {
+    throw new Error('Format link salah. Contoh: https://github.com/owner/nama-repo');
+  }
+  return { owner: parts[0], repo: parts[1] };
+}
+
+async function getPublicRepoInfo(owner, repo) {
+  try {
+    const response = await axios.get(`${GH_API}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`, {
+      headers: ghHeaders,
+      timeout: 20000,
+    });
+    return response.data;
+  } catch (error) {
+    if (error.response?.status === 404) {
+      throw new Error('Repository tidak ditemukan (mungkin private, salah nama, atau sudah dihapus).');
+    }
+    throw error;
+  }
+}
+
+async function downloadRepoZip(owner, repo, branch) {
+  const url = `https://github.com/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/archive/refs/heads/${encodeURIComponent(branch)}.zip`;
+  const response = await axios.get(url, {
+    responseType: 'arraybuffer',
+    timeout: 120000,
+    maxContentLength: 55 * 1024 * 1024,
+    maxRedirects: 5,
+  });
+  return Buffer.from(response.data);
+}
+
+async function searchGithubRepos(query, limit = 5) {
+  const response = await axios.get(`${GH_API}/search/repositories`, {
+    headers: ghHeaders,
+    params: { q: query, sort: 'stars', order: 'desc', per_page: limit },
+    timeout: 20000,
+  });
+  return response.data?.items || [];
+}
+
+// ─────────────────────────────────────────────
 // GET SOURCE — pengambilan HTML + CSS + JS + asset publik
 //
 // Selain membaca HTML utama, fungsi ini SEKARANG juga membuka tiap file
@@ -1005,7 +1256,13 @@ async function getVercelBuildLogTail(deploymentId, teamId, maxLines = 15) {
   }
 }
 
-async function publishToVercel(name, files, render) {
+async function publishToVercel(name, files, render, envVars) {
+  if (envVars && envVars.length) {
+    await render(15, 'Membuat project & menyimpan .env…');
+    const project = await ensureVercelProject(name);
+    await pushVercelEnvVars(project, envVars);
+  }
+
   await render(30, 'Mengunggah berkas ke Vercel…');
   const deployment = await createVercelDeployment(name, files);
   await render(45, 'Menunggu antrian build…');
@@ -1036,11 +1293,11 @@ async function publishToNetlify(name, files, render) {
   await render(40, 'Mengemas berkas menjadi ZIP…');
   const zipBuffer = await zipFiles(files);
 
-  await render(55, 'Mengunggah ke Netlify…');
-  const deploy = await deployZipToNetlifySite(site.id, zipBuffer);
+  await render(55, 'Mengunggah ke Netlify (Build API)…');
+  const build = await deployZipToNetlifyBuilds(site.id, zipBuffer);
 
   await render(70, 'Menunggu proses publish…');
-  const final = await waitForNetlifyDeploy(deploy.id, 180000, async (state) => {
+  const final = await waitForNetlifyDeploy(build.deployId, 180000, async (state) => {
     if (state === 'processing' || state === 'uploaded') await render(85, 'Memproses build Netlify…');
     else if (state === 'ready') await render(97, 'Menyelesaikan…');
     else await render(75, `Status: ${state || 'memproses'}…`);
@@ -1068,10 +1325,10 @@ async function publishToNetlify(name, files, render) {
 // GitHub — supaya prosesnya ringan & cepat)
 // ─────────────────────────────────────────────
 
-function sanitizeImageFileName(name, fallbackExt) {
+function sanitizeImageFileName(name, fallbackExt, fallbackBase = 'file') {
   let base = String(name || '').trim();
   base = base.replace(/[^a-zA-Z0-9._-]+/g, '-').replace(/^-+|-+$/g, '');
-  if (!base) base = `image.${fallbackExt || 'png'}`;
+  if (!base) base = `${fallbackBase}.${fallbackExt || 'png'}`;
   if (!/\.[a-z0-9]{2,5}$/i.test(base)) base += `.${fallbackExt || 'png'}`;
   return base.toLowerCase();
 }
@@ -1086,18 +1343,33 @@ const IMAGE_MIME_EXT = {
   'image/vnd.microsoft.icon': 'ico',
 };
 
-async function runPhotoUpload(ctx, files, statusMessage) {
+const AUDIO_MIME_EXT = {
+  'audio/mpeg': 'mp3',
+  'audio/mp3': 'mp3',
+  'audio/wav': 'wav',
+  'audio/x-wav': 'wav',
+  'audio/ogg': 'ogg',
+  'audio/m4a': 'm4a',
+  'audio/mp4': 'm4a',
+  'audio/x-m4a': 'm4a',
+  'audio/aac': 'aac',
+  'audio/flac': 'flac',
+};
+
+async function runFileToUrl(ctx, files, statusMessage, kind = 'foto') {
   const fileName = files[0].path;
   const startedAt = Date.now();
-  const projectName = `img-${crypto.randomBytes(4).toString('hex')}`;
+  const projectName = `${kind === 'audio' ? 'aud' : 'img'}-${crypto.randomBytes(4).toString('hex')}`;
+  const modeLabel = kind === 'audio' ? 'Audio ke URL' : 'Foto ke URL';
+  const fileIcon = kind === 'audio' ? '🎵' : '🖼️';
 
   const render = async (percent, activity) => {
     await editPanel(ctx, statusMessage.message_id, panel({
       heading: '📊 <b>DASHBOARD LOG</b>',
       box: infoBox([
         ['📡 Server', '🔵 <b>PROCESSING</b>'],
-        ['🔧 Mode', 'Foto ke URL'],
-        ['🖼️ File', `<code>${escapeHtml(fileName)}</code>`],
+        ['🔧 Mode', modeLabel],
+        [`${fileIcon} File`, `<code>${escapeHtml(fileName)}</code>`],
         ['🔄 Progress', `<code>${progressBar(percent)}</code> ${percent}%`],
         ['📝 Activity', escapeHtml(activity)],
       ]),
@@ -1105,7 +1377,7 @@ async function runPhotoUpload(ctx, files, statusMessage) {
     }));
   };
 
-  await render(10, 'Mengunggah foto…');
+  await render(10, `Mengunggah ${kind === 'audio' ? 'audio' : 'foto'}…`);
 
   try {
     const deployment = await createVercelDeployment(projectName, files);
@@ -1123,22 +1395,25 @@ async function runPhotoUpload(ctx, files, statusMessage) {
     const cleanHost = await getCleanProductionUrl(deployment.id, deployment.teamId, projectSafeName(projectName));
     const url = `https://${cleanHost}/${fileName}`;
     const elapsed = formatElapsed(Date.now() - startedAt);
+    const usageFooter = kind === 'audio'
+      ? '💡 Tinggal pasang di HTML:\n<code>&lt;audio src="LINK_DI_ATAS" controls&gt;&lt;/audio&gt;</code>'
+      : '💡 Tinggal pasang di HTML:\n<code>&lt;img src="LINK_DI_ATAS"&gt;</code>';
 
     await editPanel(ctx, statusMessage.message_id, panel({
-      heading: '<b>FOTO SIAP DIPAKAI ✅️</b>',
+      heading: `<b>${kind === 'audio' ? 'AUDIO' : 'FOTO'} SIAP DIPAKAI ✅️</b>`,
       box: infoBox([
-        ['🖼️ File', escapeHtml(fileName)],
+        [`${fileIcon} File`, escapeHtml(fileName)],
         ['🔗 URL', `<a href="${escapeHtml(url)}">${escapeHtml(url)}</a>`],
         ['⏰ Waktu', escapeHtml(elapsed)],
       ]),
-      footer: '💡 Tinggal pasang di HTML:\n<code>&lt;img src="LINK_DI_ATAS"&gt;</code>',
+      footer: usageFooter,
     }), homeButton());
   } catch (error) {
     const elapsed = formatElapsed(Date.now() - startedAt);
     await editPanel(ctx, statusMessage.message_id, panel({
       heading: '<b>UPLOAD GAGAL ❌</b>',
       box: infoBox([
-        ['🖼️ File', escapeHtml(fileName)],
+        [`${fileIcon} File`, escapeHtml(fileName)],
         ['⚠️ Penyebab', escapeHtml(errorMessage(error))],
         ['⏰ Waktu', escapeHtml(elapsed)],
       ]),
@@ -1149,6 +1424,10 @@ async function runPhotoUpload(ctx, files, statusMessage) {
   }
 }
 
+async function runPhotoUpload(ctx, files, statusMessage) {
+  return runFileToUrl(ctx, files, statusMessage, 'foto');
+}
+
 async function runDeployment(ctx, session, statusMessage) {
   const repoName = repoSafeName(session.name);
   const modeLabel = session.type === 'deploy_zip' ? 'Deploy ZIP' : 'Deploy HTML';
@@ -1157,16 +1436,18 @@ async function runDeployment(ctx, session, statusMessage) {
   const startedAt = Date.now();
 
   const render = async (percent, activity) => {
+    const rows = [
+      ['📡 Server', '🔵 <b>PROCESSING</b>'],
+      ['🛰️ Platform', escapeHtml(platformLabel)],
+      ['🔧 Mode', escapeHtml(modeLabel)],
+      ['📦 Nama Web', `<code>${escapeHtml(repoName)}</code>`],
+    ];
+    if (session.envVars?.length) rows.push(['🔐 .env', `<b>${session.envVars.length}</b> variable`]);
+    rows.push(['🔄 Progress', `<code>${progressBar(percent)}</code> ${percent}%`]);
+    rows.push(['📝 Activity', escapeHtml(activity)]);
     await editPanel(ctx, statusMessage.message_id, panel({
       heading: '📊 <b>DASHBOARD LOG</b>',
-      box: infoBox([
-        ['📡 Server', '🔵 <b>PROCESSING</b>'],
-        ['🛰️ Platform', escapeHtml(platformLabel)],
-        ['🔧 Mode', escapeHtml(modeLabel)],
-        ['📦 Nama Web', `<code>${escapeHtml(repoName)}</code>`],
-        ['🔄 Progress', `<code>${progressBar(percent)}</code> ${percent}%`],
-        ['📝 Activity', escapeHtml(activity)],
-      ]),
+      box: infoBox(rows),
       footer: 'Proses membutuhkan waktu, jadi mohon\nuntuk sabar.....',
     }));
   };
@@ -1185,7 +1466,9 @@ async function runDeployment(ctx, session, statusMessage) {
     }
 
     const publisher = platform === 'netlify' ? publishToNetlify : publishToVercel;
-    const url = await publisher(repoName, session.files, render);
+    const url = platform === 'netlify'
+      ? await publisher(repoName, session.files, render)
+      : await publisher(repoName, session.files, render, session.envVars);
     const elapsed = formatElapsed(Date.now() - startedAt);
 
     await recordDeployment({
@@ -1217,6 +1500,134 @@ async function runDeployment(ctx, session, statusMessage) {
       box: infoBox([
         ['📦 Project', escapeHtml(repoName)],
         ['🛰️ Platform', escapeHtml(platformLabel)],
+        ['⚠️ Penyebab', escapeHtml(errorMessage(error))],
+        ['⏰ Waktu', escapeHtml(elapsed)],
+      ]),
+      body: logBody,
+      footer: '🔁 Silakan coba lagi dari menu utama',
+    }), homeButton());
+  } finally {
+    sessions.delete(uid(ctx));
+  }
+}
+
+// ─────────────────────────────────────────────
+// GENERATE BOT — deploy project bot Node.js (webhook-based) secara otomatis:
+// bikin project Vercel, push .env, deploy file, lalu (kalau file webhook-nya
+// ketemu & ada TOKEN_BOT/BOT_TOKEN di .env) otomatis daftarkan webhook-nya
+// ke Telegram lewat setWebhook. Tidak simulasi — semua panggilan API asli.
+// ─────────────────────────────────────────────
+
+async function runGenerateBot(ctx, session, statusMessage) {
+  const repoName = repoSafeName(session.name);
+  const startedAt = Date.now();
+  const envVars = session.envVars || [];
+
+  const render = async (percent, activity) => {
+    const rows = [
+      ['📡 Server', '🔵 <b>PROCESSING</b>'],
+      ['🔧 Mode', 'Generate Bot'],
+      ['📦 Nama Bot', `<code>${escapeHtml(repoName)}</code>`],
+      ['🔐 .env', `<b>${envVars.length}</b> variable`],
+      ['🔄 Progress', `<code>${progressBar(percent)}</code> ${percent}%`],
+      ['📝 Activity', escapeHtml(activity)],
+    ];
+    await editPanel(ctx, statusMessage.message_id, panel({
+      heading: '📊 <b>DASHBOARD LOG</b>',
+      box: infoBox(rows),
+      footer: 'Proses membutuhkan waktu, jadi mohon\nuntuk sabar.....',
+    }));
+  };
+
+  await render(5, 'Menyiapkan berkas…');
+
+  try {
+    await render(15, 'Membuat project & menyimpan .env…');
+    const project = await ensureVercelProject(repoName);
+    await pushVercelEnvVars(project, envVars);
+
+    // Backup ke GitHub bersifat opsional, tidak boleh menggagalkan proses.
+    try {
+      const repo = await createGitHubRepo(repoName);
+      await uploadFilesToNewRepo(repo, session.files);
+    } catch (_) {
+      // backup gagal, tetap lanjut
+    }
+
+    await render(35, 'Mengunggah berkas bot…');
+    const deployment = await createVercelDeployment(repoName, session.files);
+    await render(50, 'Menunggu antrian build…');
+
+    const final = await waitForDeployment(deployment.id, deployment.teamId, 180000, async (state) => {
+      if (state === 'BUILDING') await render(75, 'Membangun…');
+      else if (state === 'READY') await render(92, 'Menyelesaikan…');
+      else if (state === 'QUEUED' || state === 'INITIALIZING') await render(55, 'Dalam antrian build…');
+      else await render(60, `Status: ${state || 'memproses'}…`);
+    });
+
+    if ((final.readyState || final.state) !== 'READY') {
+      const err = new Error(`Build berakhir dengan status ${final.readyState || final.state || 'ERROR'}.`);
+      const logTail = await getVercelBuildLogTail(deployment.id, deployment.teamId);
+      if (logTail) err.detail = logTail;
+      throw err;
+    }
+
+    const cleanHost = await getCleanProductionUrl(deployment.id, deployment.teamId, projectSafeName(repoName));
+    const baseUrl = `https://${cleanHost}`;
+
+    let webhookStatus = '⚠️ Tidak ada file webhook terdeteksi — perlu setWebhook manual.';
+    if (session.webhookPath) {
+      const tokenEntry = envVars.find((e) => /^(TOKEN_BOT|BOT_TOKEN)$/i.test(e.key));
+      if (tokenEntry?.value) {
+        await render(96, 'Mendaftarkan webhook Telegram…');
+        try {
+          const webhookUrl = `${baseUrl}/${session.webhookPath}`;
+          const setResponse = await axios.get(`https://api.telegram.org/bot${tokenEntry.value}/setWebhook`, {
+            params: { url: webhookUrl },
+            timeout: 20000,
+          });
+          webhookStatus = setResponse.data?.ok
+            ? '✅ Terdaftar otomatis'
+            : `⚠️ Telegram menolak: ${escapeHtml(String(setResponse.data?.description || 'unknown'))}`;
+        } catch (webhookError) {
+          webhookStatus = `⚠️ Gagal daftar webhook: ${escapeHtml(errorMessage(webhookError))}`;
+        }
+      } else {
+        webhookStatus = '⚠️ Tidak ada TOKEN_BOT/BOT_TOKEN di .env — webhook tidak didaftarkan otomatis.';
+      }
+    }
+
+    const elapsed = formatElapsed(Date.now() - startedAt);
+
+    await recordDeployment({
+      name: repoName,
+      platform: 'vercel',
+      url: baseUrl,
+      ownerId: uid(ctx),
+      ownerUsername: ctx.from?.username || null,
+      ts: Date.now(),
+    });
+
+    await editPanel(ctx, statusMessage.message_id, panel({
+      heading: '<b>BOT BERHASIL DIBUAT ✅️</b>',
+      box: infoBox([
+        ['📦 Nama', escapeHtml(repoName)],
+        ['🔗 URL Project', `<a href="${escapeHtml(baseUrl)}">${escapeHtml(baseUrl)}</a>`],
+        ['🧩 File Webhook', session.webhookPath ? `<code>/${escapeHtml(session.webhookPath)}</code>` : '<i>tidak ada</i>'],
+        ['📡 Status Webhook', webhookStatus],
+        ['⏰ Waktu', escapeHtml(elapsed)],
+      ]),
+      footer: '🚀  Bot baru siap dipakai kalau webhook sudah terdaftar',
+    }), homeButton());
+  } catch (error) {
+    const elapsed = formatElapsed(Date.now() - startedAt);
+    const logBody = error.detail
+      ? `📄 <b>Log Error:</b>\n<pre>${escapeHtml(String(error.detail).slice(0, 700))}</pre>`
+      : undefined;
+    await editPanel(ctx, statusMessage.message_id, panel({
+      heading: '<b>GENERATE BOT GAGAL ❌</b>',
+      box: infoBox([
+        ['📦 Nama', escapeHtml(repoName)],
         ['⚠️ Penyebab', escapeHtml(errorMessage(error))],
         ['⏰ Waktu', escapeHtml(elapsed)],
       ]),
@@ -1444,6 +1855,149 @@ bot.action('photo_url', async (ctx) => {
   );
 });
 
+bot.action('audio_url', async (ctx) => {
+  await ctx.answerCbQuery();
+  await sendPrompt(
+    ctx,
+    'Audio ke URL',
+    '🎵 <b>Kirim File Audio</b>\n\nKirim file audio yang mau dijadikan link (untuk dipakai di <code>&lt;audio src&gt;</code> project HTML kamu).\n\nFormat didukung: MP3, WAV, OGG, M4A, AAC, FLAC.\n\n<i>Kirim sebagai File/Dokumen (bukan Voice Note) supaya kualitas asli tidak dikompres Telegram.</i>',
+    { type: 'audio_url', step: 'file' }
+  );
+});
+
+bot.action('screenshot_url', async (ctx) => {
+  await ctx.answerCbQuery();
+  await sendPrompt(
+    ctx,
+    'Screenshot URL',
+    '📸 <b>Kirim URL Website</b>\n\nKirim link website manapun (contoh: <code>https://contoh.com</code>), bot akan mengambil screenshot tampilannya dan mengirim gambarnya ke sini.',
+    { type: 'screenshot', step: 'url' }
+  );
+});
+
+bot.action('repo_zip', async (ctx) => {
+  await ctx.answerCbQuery();
+  await sendPrompt(
+    ctx,
+    'Get Repo ZIP',
+    '📦 <b>Kirim Link Repository GitHub</b>\n\nContoh: <code>https://github.com/owner/nama-repo</code>\n\nBot akan mengambil ZIP branch default repo tersebut lewat endpoint resmi GitHub, lalu mengirimnya ke sini.\n\n⚠️ Hanya untuk repository <b>public</b>. Batas ukuran kirim Telegram: 50MB.',
+    { type: 'repo_zip', step: 'link' }
+  );
+});
+
+bot.action('search_repo', async (ctx) => {
+  await ctx.answerCbQuery();
+  await sendPrompt(
+    ctx,
+    'Cari Repo GitHub',
+    '🔎 <b>Kirim Kata Kunci</b>\n\nContoh: <code>telegram bot starter</code>\n\nBot akan cari repository GitHub publik yang paling relevan (diurutkan dari yang paling banyak star).',
+    { type: 'search_repo', step: 'query' }
+  );
+});
+
+bot.action('generate_bot', async (ctx) => {
+  await ctx.answerCbQuery();
+  await sendPrompt(
+    ctx,
+    'Generate Bot',
+    '🤖 <b>Langkah 1 — Kirim ZIP Project Bot</b>\n\nUpload ZIP project bot Node.js (model <b>webhook</b>, bukan polling) yang mau dideploy otomatis.\n\n⚠️ Wajib ada <code>package.json</code> di root ZIP (atau di dalam satu folder pembungkus tunggal).\n\n<i>Struktur folder bebas — jumlah & nama file di dalam <code>api/</code> boleh apa saja, bot akan coba deteksi otomatis mana file handler-nya.</i>',
+    { type: 'generate_bot', step: 'file' }
+  );
+});
+
+bot.action(/^gbpick_(\d+)$/, async (ctx) => {
+  await ctx.answerCbQuery();
+  const id = uid(ctx);
+  const session = sessions.get(id);
+  if (!session || session.type !== 'generate_bot' || session.step !== 'pick_webhook_file') return;
+  const idx = Number(ctx.match[1]);
+  const chosen = session.webhookCandidates?.[idx];
+  if (!chosen) return;
+  session.webhookPath = chosen;
+  delete session.webhookCandidates;
+  await startGenerateBotEnvCollection(ctx, session, `✅ File webhook dipilih: <code>${escapeHtml(chosen)}</code>`);
+});
+
+bot.action('gb_env_more_add', async (ctx) => {
+  await ctx.answerCbQuery();
+  const id = uid(ctx);
+  const session = sessions.get(id);
+  if (!session || session.type !== 'generate_bot' || session.step !== 'gb_env_more') return;
+  session.step = 'gb_env_key';
+  await sendPrompt(ctx, 'Generate Bot — .env', '🔑 <b>Kirim KEY</b> berikutnya\nContoh: <code>ID_PEMILIK</code>', session);
+});
+
+bot.action('gb_env_more_done', async (ctx) => {
+  await ctx.answerCbQuery();
+  const id = uid(ctx);
+  const session = sessions.get(id);
+  if (!session || session.type !== 'generate_bot' || session.step !== 'gb_env_more') return;
+  const hasToken = (session.envVars || []).some((e) => /^(TOKEN_BOT|BOT_TOKEN)$/i.test(e.key));
+  session.step = 'gb_name';
+  const warn = hasToken ? '' : '⚠️ <i>Tidak ada TOKEN_BOT/BOT_TOKEN — webhook tidak akan otomatis terdaftar, kamu perlu set manual nanti.</i>\n\n';
+  await sendPrompt(ctx, 'Generate Bot', `${warn}🚀 <b>Langkah Terakhir — Nama Bot</b>\n\nKirim nama repository/project untuk bot ini (huruf, angka, dan tanda "-" saja, tanpa spasi).\nContoh: <code>bot-kedua-saya</code>`, session);
+});
+
+bot.action('help_info', async (ctx) => {
+  await ctx.answerCbQuery();
+  await sendPanel(ctx, panel({
+    heading: '<b>ℹ️ TENTANG BOT INI</b>',
+    body:
+      'Cloud Logic — bot otomasi deploy website, kelola project, dan utilitas developer. Semua fitur pakai API resmi (GitHub, Vercel, Netlify), tidak ada yang simulasi.\n\n' +
+      '<b>Ringkasan fitur:</b>\n' +
+      '🚀 Deploy Vercel/Netlify — upload HTML/ZIP, langsung online\n' +
+      '⚙️ Tambah .env — isi environment variable sebelum deploy (Vercel)\n' +
+      '🌐 Get Source — ambil HTML/CSS/JS dari website publik\n' +
+      '🛡️ Encrypt HTML — kunci file HTML pakai password (AES-256)\n' +
+      '🖼️🎵 Foto/Audio ke URL — upload file, dapat link langsung\n' +
+      '📸 Screenshot URL — ambil gambar tampilan website manapun\n' +
+      '📦 Get Repo ZIP — ambil ZIP repo GitHub public\n' +
+      '🔎 Cari Repo GitHub — cari repo publik berdasar kata kunci\n' +
+      '🤖 Generate Bot — deploy project bot lain (Node.js webhook) otomatis\n' +
+      '📋 List Web / 🗑️ Delete Web — kelola website yang sudah live\n' +
+      '📢 Broadcast / 👥 Users — khusus owner\n\n' +
+      '<i>Developer: Raven</i>\n' +
+      '<i>Note: baca dulu instruksi di tiap menu sebelum bertanya — supaya lebih paham cara pakainya.</i>',
+  }), homeButton());
+});
+
+bot.action('env_add', async (ctx) => {
+  await ctx.answerCbQuery();
+  const id = uid(ctx);
+  const session = sessions.get(id);
+  if (!session || session.step !== 'env_choice') return;
+  session.envVars = session.envVars || [];
+  session.step = 'env_key';
+  await sendPrompt(ctx, 'Tambah .env', `🔑 <b>Kirim KEY</b> (nama environment variable)\nContoh: <code>TOKEN_GITHUB</code>`, session);
+});
+
+bot.action('env_skip', async (ctx) => {
+  await ctx.answerCbQuery();
+  const id = uid(ctx);
+  const session = sessions.get(id);
+  if (!session || session.step !== 'env_choice') return;
+  await safeDeleteMessage(ctx, ctx.chat.id, session.controlMessageId);
+  await askForWebsiteName(ctx, session);
+});
+
+bot.action('env_more_add', async (ctx) => {
+  await ctx.answerCbQuery();
+  const id = uid(ctx);
+  const session = sessions.get(id);
+  if (!session || session.step !== 'env_more') return;
+  session.step = 'env_key';
+  await sendPrompt(ctx, 'Tambah .env', `🔑 <b>Kirim KEY</b> berikutnya\nContoh: <code>VERCEL_TOKEN</code>`, session);
+});
+
+bot.action('env_more_done', async (ctx) => {
+  await ctx.answerCbQuery();
+  const id = uid(ctx);
+  const session = sessions.get(id);
+  if (!session || session.step !== 'env_more') return;
+  const count = session.envVars?.length || 0;
+  await askForWebsiteName(ctx, session, `✅ <b>${count}</b> environment variable siap ditambahkan saat deploy.`);
+});
+
 bot.action('delete_web', async (ctx) => {
   await ctx.answerCbQuery();
   await sendPrompt(
@@ -1537,6 +2091,71 @@ bot.on('text', async (ctx) => {
     return;
   }
 
+  if (session.type === 'screenshot' && session.step === 'url') {
+    sessions.delete(id);
+    const status = await sendPanel(ctx, panel({ heading: '<b>SCREENSHOT URL</b>', body: '⏳ Mengambil screenshot…' }));
+    try {
+      const imageBuffer = await screenshotUrl(text);
+      await ctx.replyWithPhoto({ source: imageBuffer, filename: 'screenshot.png' }, { caption: `✅ Screenshot dari ${text}` });
+      await editPanel(ctx, status.message_id, panel({
+        heading: '<b>SCREENSHOT SELESAI ✅</b>',
+        box: infoBox([['🌐 URL', `<code>${escapeHtml(text)}</code>`]]),
+      }), homeButton());
+    } catch (error) {
+      await editPanel(ctx, status.message_id, panel({ heading: '<b>SCREENSHOT GAGAL ❌</b>', body: `<code>${escapeHtml(errorMessage(error))}</code>` }), homeButton());
+    }
+    return;
+  }
+
+  if (session.type === 'repo_zip' && session.step === 'link') {
+    sessions.delete(id);
+    const status = await sendPanel(ctx, panel({ heading: '<b>GET REPO ZIP</b>', body: '⏳ Memeriksa repository…' }));
+    try {
+      const { owner, repo } = parseGithubRepoUrl(text);
+      const info = await getPublicRepoInfo(owner, repo);
+      if (info.private) throw new Error('Repository ini private, tidak bisa diambil ZIP-nya lewat fitur ini.');
+      await editPanel(ctx, status.message_id, panel({
+        heading: '<b>GET REPO ZIP</b>',
+        body: `📦 <code>${escapeHtml(info.full_name)}</code>\n🌿 Branch: <code>${escapeHtml(info.default_branch)}</code>\n\n⏳ Mengunduh ZIP dari GitHub…`,
+      }));
+      const zipBuffer = await downloadRepoZip(owner, repo, info.default_branch);
+      await ctx.replyWithDocument({ source: zipBuffer, filename: `${info.name}-${info.default_branch}.zip` }, { caption: `✅ Source ZIP dari ${info.full_name}` });
+      await editPanel(ctx, status.message_id, panel({
+        heading: '<b>GET REPO ZIP SELESAI ✅</b>',
+        box: infoBox([
+          ['📦 Repository', escapeHtml(info.full_name)],
+          ['🌿 Branch', escapeHtml(info.default_branch)],
+          ['⭐ Stars', `${info.stargazers_count ?? 0}`],
+        ]),
+      }), homeButton());
+    } catch (error) {
+      await editPanel(ctx, status.message_id, panel({ heading: '<b>GET REPO ZIP GAGAL ❌</b>', body: `<code>${escapeHtml(errorMessage(error))}</code>` }), homeButton());
+    }
+    return;
+  }
+
+  if (session.type === 'search_repo' && session.step === 'query') {
+    sessions.delete(id);
+    const status = await sendPanel(ctx, panel({ heading: '<b>CARI REPO GITHUB</b>', body: '⏳ Mencari…' }));
+    try {
+      const items = await searchGithubRepos(text, 5);
+      if (!items.length) {
+        await editPanel(ctx, status.message_id, panel({ heading: '<b>CARI REPO GITHUB</b>', body: '<i>Tidak ada hasil ditemukan.</i>' }), homeButton());
+        return;
+      }
+      const lines = items.map((r, i) =>
+        `${i + 1}. <a href="${escapeHtml(r.html_url)}">${escapeHtml(r.full_name)}</a>\n   ⭐ ${r.stargazers_count} · ${escapeHtml(r.language || '-')}${r.description ? `\n   <i>${escapeHtml(r.description.slice(0, 100))}</i>` : ''}`
+      );
+      await editPanel(ctx, status.message_id, panel({
+        heading: `<b>HASIL: "${escapeHtml(text)}"</b>`,
+        body: lines.join('\n\n'),
+      }), homeButton());
+    } catch (error) {
+      await editPanel(ctx, status.message_id, panel({ heading: '<b>PENCARIAN GAGAL ❌</b>', body: `<code>${escapeHtml(errorMessage(error))}</code>` }), homeButton());
+    }
+    return;
+  }
+
   if (session.type === 'delete' && session.step === 'link') {
     sessions.delete(id);
     const status = await sendPanel(ctx, panel({ heading: '<b>DELETE WEB</b>', body: '⏳ Mencari project dari link…' }));
@@ -1601,6 +2220,92 @@ bot.on('text', async (ctx) => {
       heading: '<b>ENCRYPT SELESAI ✅</b>',
       body: 'File terenkripsi sudah dikirim di atas. Simpan passwordnya baik-baik — tanpa password, isi file tidak bisa dibuka lagi.',
     }), homeButton());
+    return;
+  }
+
+  if ((session.type === 'deploy_html' || session.type === 'deploy_zip') && session.step === 'env_key') {
+    const key = text.trim().replace(/\s+/g, '_').toUpperCase();
+    if (!key || !/^[A-Z_][A-Z0-9_]*$/.test(key)) {
+      await sendPrompt(ctx, 'Tambah .env', '❌ <b>KEY tidak valid.</b>\n\nGunakan huruf/angka/underscore saja, contoh: <code>TOKEN_GITHUB</code>. Kirim ulang KEY-nya.', session);
+      return;
+    }
+    session.pendingEnvKey = key;
+    session.step = 'env_value';
+    sessions.set(id, session);
+    await sendPrompt(ctx, 'Tambah .env', `🔒 <b>Kirim VALUE</b> untuk <code>${escapeHtml(key)}</code>`, session);
+    return;
+  }
+
+  if ((session.type === 'deploy_html' || session.type === 'deploy_zip') && session.step === 'env_value') {
+    session.envVars = session.envVars || [];
+    session.envVars.push({ key: session.pendingEnvKey, value: text });
+    delete session.pendingEnvKey;
+    session.step = 'env_more';
+    sessions.set(id, session);
+    const old = sessions.get(id);
+    if (old?.controlMessageId) await safeDeleteMessage(ctx, ctx.chat.id, old.controlMessageId);
+    const message = await sendPanel(ctx, panel({
+      heading: '<b>Tambah .env</b>',
+      box: infoBox(session.envVars.map((e) => [`🔑 ${escapeHtml(e.key)}`, '<i>tersimpan</i>'])),
+      body: 'Mau tambah environment variable lagi?',
+    }), Markup.inlineKeyboard([
+      [Markup.button.callback('➕  Tambah Lagi', 'env_more_add'), Markup.button.callback('✅  Selesai', 'env_more_done')],
+    ]));
+    session.controlMessageId = message.message_id;
+    sessions.set(id, session);
+    return;
+  }
+
+  if (session.type === 'generate_bot' && session.step === 'gb_env_key') {
+    const key = text.trim().replace(/\s+/g, '_').toUpperCase();
+    if (!key || !/^[A-Z_][A-Z0-9_]*$/.test(key)) {
+      await sendPrompt(ctx, 'Generate Bot — .env', '❌ <b>KEY tidak valid.</b>\n\nGunakan huruf/angka/underscore saja, contoh: <code>TOKEN_BOT</code>. Kirim ulang KEY-nya.', session);
+      return;
+    }
+    session.pendingEnvKey = key;
+    session.step = 'gb_env_value';
+    sessions.set(id, session);
+    await sendPrompt(ctx, 'Generate Bot — .env', `🔒 <b>Kirim VALUE</b> untuk <code>${escapeHtml(key)}</code>`, session);
+    return;
+  }
+
+  if (session.type === 'generate_bot' && session.step === 'gb_env_value') {
+    session.envVars = session.envVars || [];
+    session.envVars.push({ key: session.pendingEnvKey, value: text });
+    delete session.pendingEnvKey;
+    session.step = 'gb_env_more';
+    sessions.set(id, session);
+    const old = sessions.get(id);
+    if (old?.controlMessageId) await safeDeleteMessage(ctx, ctx.chat.id, old.controlMessageId);
+    const message = await sendPanel(ctx, panel({
+      heading: '<b>Generate Bot — .env</b>',
+      box: infoBox(session.envVars.map((e) => [`🔑 ${escapeHtml(e.key)}`, '<i>tersimpan</i>'])),
+      body: 'Mau tambah environment variable lagi?',
+    }), Markup.inlineKeyboard([
+      [Markup.button.callback('➕  Tambah Lagi', 'gb_env_more_add'), Markup.button.callback('✅  Selesai', 'gb_env_more_done')],
+    ]));
+    session.controlMessageId = message.message_id;
+    sessions.set(id, session);
+    return;
+  }
+
+  if (session.type === 'generate_bot' && session.step === 'gb_name') {
+    session.name = repoSafeName(text);
+    session.step = 'gb_deploying';
+    sessions.set(id, session);
+    const status = await sendPanel(ctx, panel({
+      heading: '📊 <b>DASHBOARD LOG</b>',
+      box: infoBox([
+        ['📡 Server', '🔵 <b>PROCESSING</b>'],
+        ['🔧 Mode', 'Generate Bot'],
+        ['📦 Nama Bot', `<code>${escapeHtml(session.name)}</code>`],
+        ['🔐 .env', `<b>${session.envVars?.length || 0}</b> variable`],
+        ['🔄 Progress', `<code>${progressBar(0)}</code> 0%`],
+        ['📝 Activity', 'Memulai proses…'],
+      ]),
+      footer: 'Proses membutuhkan waktu, jadi mohon\nuntuk sabar.....',
+    }));
+    await runGenerateBot(ctx, session, status);
     return;
   }
 
@@ -1704,108 +2409,60 @@ bot.on('document', async (ctx) => {
     return;
   }
 
-  if (session.type === 'deploy_html' && session.step === 'file') {
-    const platformLabel = session.platform === 'netlify' ? 'Netlify' : 'Vercel';
-    if (!/\.html?$/i.test(fileName)) {
-      await sendPrompt(ctx, `Deploy HTML — ${platformLabel}`, '❌ <b>Format salah.</b>\n\nMenu ini hanya menerima file <code>.html</code>. Silakan kirim ulang file yang sesuai.', session);
+  if (session.type === 'audio_url' && session.step === 'file') {
+    const mimeType = document.mime_type || '';
+    const extFromMime = AUDIO_MIME_EXT[mimeType.toLowerCase()];
+    const looksLikeAudioName = /\.(mp3|wav|ogg|m4a|aac|flac)$/i.test(fileName);
+    if (!mimeType.startsWith('audio/') && !looksLikeAudioName) {
+      await sendPrompt(ctx, 'Audio ke URL', '❌ <b>Format tidak didukung.</b>\n\nKirim audio dengan format MP3, WAV, OGG, M4A, AAC, atau FLAC.', session);
       return;
     }
     try {
       const buffer = await downloadTelegramFile(ctx, document.file_id);
-      session.files = [{ path: 'index.html', buffer }];
-      session.step = 'name';
-      await sendPrompt(ctx, `Deploy HTML — ${platformLabel}`, `📄 File diterima: <code>${escapeHtml(fileName)}</code>\n\n🚀 <b>Langkah 2 dari 2 — Nama Website</b>\n\nKirim nama repository/website (huruf, angka, dan tanda "-" saja, tanpa spasi).\nContoh: <code>toko-online-saya</code>`, session);
+      const safeName = sanitizeImageFileName(fileName, extFromMime || 'mp3', 'audio');
+      sessions.delete(id);
+
+      const status = await sendPanel(ctx, panel({
+        heading: '📊 <b>DASHBOARD LOG</b>',
+        box: infoBox([
+          ['📡 Server', '🔵 <b>PROCESSING</b>'],
+          ['🔧 Mode', 'Audio ke URL'],
+          ['🎵 File', `<code>${escapeHtml(safeName)}</code>`],
+          ['🔄 Progress', `<code>${progressBar(0)}</code> 0%`],
+          ['📝 Activity', 'Memulai proses…'],
+        ]),
+        footer: 'Proses membutuhkan waktu, jadi mohon\nuntuk sabar.....',
+      }));
+      await runFileToUrl(ctx, [{ path: safeName, buffer }], status, 'audio');
     } catch (error) {
-      await sendPrompt(ctx, `Deploy HTML — ${platformLabel}`, `❌ <b>Gagal mengambil file dari Telegram.</b>\n\n<code>${escapeHtml(errorMessage(error))}</code>`, session);
+      await sendPrompt(ctx, 'Audio ke URL', `❌ <b>Gagal mengambil file dari Telegram.</b>\n\n<code>${escapeHtml(errorMessage(error))}</code>`, session);
     }
     return;
   }
 
-  if (session.type === 'deploy_zip' && session.step === 'file') {
-    const platformLabel = session.platform === 'netlify' ? 'Netlify' : 'Vercel';
+  if (session.type === 'generate_bot' && session.step === 'file') {
     if (!/\.zip$/i.test(fileName)) {
-      await sendPrompt(ctx, `Deploy ZIP — ${platformLabel}`, '❌ <b>Format salah.</b>\n\nMenu ini hanya menerima file <code>.zip</code>. Silakan kirim ulang file yang sesuai.', session);
+      await sendPrompt(ctx, 'Generate Bot', '❌ <b>Format salah.</b>\n\nMenu ini hanya menerima file <code>.zip</code>. Silakan kirim ulang file yang sesuai.', session);
       return;
     }
     try {
       const buffer = await downloadTelegramFile(ctx, document.file_id);
-      session.files = await extractZip(buffer);
-      session.step = 'name';
-      await sendPrompt(ctx, `Deploy ZIP — ${platformLabel}`, `📦 ZIP diterima: <b>${session.files.length}</b> file ditemukan.\n\n🚀 <b>Langkah 2 dari 2 — Nama Website</b>\n\nKirim nama repository/website (huruf, angka, dan tanda "-" saja, tanpa spasi).\nContoh: <code>toko-online-saya</code>`, session);
-    } catch (error) {
-      await sendPrompt(ctx, `Deploy ZIP — ${platformLabel}`, `❌ <b>ZIP tidak valid.</b>\n\n<code>${escapeHtml(errorMessage(error))}</code>`, session);
-    }
-    return;
-  }
+      const files = await extractZipGeneric(buffer);
+      const hasPackageJson = files.some((f) => f.path.toLowerCase() === 'package.json');
+      if (!hasPackageJson) {
+        await sendPrompt(ctx, 'Generate Bot', '❌ <b>Tidak ditemukan <code>package.json</code>.</b>\n\nProject bot wajib punya <code>package.json</code> di root ZIP (atau di dalam satu folder pembungkus tunggal). Kirim ulang ZIP yang sesuai.', session);
+        return;
+      }
+      session.files = files;
 
-  if (session.type === 'encrypt' && session.step === 'file') {
-    if (!/\.html?$/i.test(fileName)) {
-      await sendPrompt(ctx, 'Encrypt HTML', '❌ <b>Format salah.</b>\n\nMenu ini hanya menerima file <code>.html</code>. Silakan kirim ulang file yang sesuai.', session);
-      return;
-    }
-    try {
-      session.fileBuffer = await downloadTelegramFile(ctx, document.file_id);
-      session.fileName = fileName;
-      session.step = 'password';
-      await sendPrompt(ctx, 'Encrypt HTML', `📄 File diterima: <code>${escapeHtml(fileName)}</code>\n\n🔐 <b>Langkah 2 dari 3 — Password</b>\n\nKirim password yang akan dipakai untuk mengunci file ini.`, session);
-    } catch (error) {
-      await sendPrompt(ctx, 'Encrypt HTML', `❌ <b>Gagal mengambil file dari Telegram.</b>\n\n<code>${escapeHtml(errorMessage(error))}</code>`, session);
-    }
-  }
-});
-
-bot.command('adduser', async (ctx) => {
-  if (uid(ctx) !== OWNER_ID) return;
-  const target = Number(ctx.message.text.split(/\s+/)[1]);
-  if (!Number.isInteger(target) || target <= 0) {
-    await sendPanel(ctx, panel({ heading: '<b>ADD USER</b>', body: '❌ Format salah. Gunakan: <code>/adduser 123456789</code>' }));
-    return;
-  }
-  allowedUsers.add(target);
-  try {
-    await saveUsers();
-    await sendPanel(ctx, panel({ heading: '<b>ADD USER</b>', body: `✅ User <code>${target}</code> berhasil ditambahkan.` }), homeButton());
-  } catch (error) {
-    allowedUsers.delete(target);
-    await sendPanel(ctx, panel({ heading: '<b>ADD USER GAGAL ❌</b>', body: `<code>${escapeHtml(errorMessage(error))}</code>` }), homeButton());
-  }
-});
-
-bot.command('cancel', async (ctx) => {
-  const session = sessions.get(uid(ctx));
-  if (session?.controlMessageId) await safeDeleteMessage(ctx, ctx.chat.id, session.controlMessageId);
-  sessions.delete(uid(ctx));
-  await sendPanel(ctx, panel({ heading: '<b>DIBATALKAN ↩️</b>', body: 'Proses yang sedang berjalan sudah dibatalkan.' }), homeButton());
-});
-
-bot.catch((error) => {
-  console.error('[BOT ERROR]', error.response?.data || error.message || error);
-});
-
-(async () => {
-  await loadUsers();
-  // Sengaja HANYA mendaftarkan /start dan /cancel di daftar perintah "/".
-  // Navigasi utama tetap lewat inline button pada pesan bot, bukan lewat
-  // Reply Keyboard, supaya tidak ada dua menu yang tampil berbarengan.
-  try {
-    await bot.telegram.setMyCommands([
-      { command: 'start', description: 'Buka menu utama' },
-      { command: 'cancel', description: 'Batalkan proses yang sedang berjalan' },
-    ]);
-  } catch (error) {
-    console.error('[SET COMMANDS]', errorMessage(error));
-  }
-})();
-
-module.exports = async (req, res) => {
-  if (req.method === 'POST') {
-    try {
-      await bot.handleUpdate(req.body);
-      return res.status(200).send('OK');
-    } catch (error) {
-      console.error('[WEBHOOK]', error.response?.data || error.message || error);
-      return res.status(500).send('Webhook error');
-    }
-  }
-  return res.status(200).send('⚡ Cloud Logic Bot Online');
-};
+      const detected = detectGenerateBotWebhookPath(files);
+      if (detected.path) {
+        session.webhookPath = detected.path;
+        await startGenerateBotEnvCollection(ctx, session, `📄 ZIP OK (${files.length} file).\n🧩 Webhook terdeteksi: <code>${escapeHtml(detected.path)}</code>\n<i>Sumber: ${escapeHtml(detected.source)}</i>`);
+      } else if (detected.candidates && detected.candidates.length > 1) {
+        session.step = 'pick_webhook_file';
+        session.webhookCandidates = detected.candidates;
+        sessions.set(id, session);
+        const buttons = detected.candidates.map((p, i) => [Markup.button.callback(p, `gbpick_${i}`)]);
+        const old = sessions.get(id);
+        if (old?.controlMessageId) await safeDeleteMessage(ctx, ctx.chat.id, old.contro
