@@ -2513,81 +2513,491 @@ bot.on('text', async (ctx) => {
     return;
   }
 
-    if (session.type === 'repo_zip' && session.step === 'link') {
+  if (session.type === 'repo_zip' && session.step === 'link') {
     sessions.delete(id);
-
-    const status = await sendPanel(
-      ctx,
-      panel({
-        heading: '<b>GET REPO ZIP</b>',
-        body: '⏳ Memeriksa repository…'
-      })
-    );
-
+    const status = await sendPanel(ctx, panel({ heading: '<b>GET REPO ZIP</b>', body: '⏳ Memeriksa repository…' }));
     try {
       const { owner, repo } = parseGithubRepoUrl(text);
-
       const info = await getPublicRepoInfo(owner, repo);
-
-      if (info.private) {
-        throw new Error(
-          'Repository ini private, tidak bisa diambil ZIP-nya lewat fitur ini.'
-        );
-      }
-
-      await editPanel(
-        ctx,
-        status.message_id,
-        panel({
-          heading: '<b>GET REPO ZIP</b>',
-          body:
-            `📦 <code>${escapeHtml(info.full_name)}</code>\n` +
-            `🌿 Branch: <code>${escapeHtml(info.default_branch)}</code>\n\n` +
-            `⏳ Mengunduh ZIP dari GitHub…`,
-        })
-      );
-
-      const zipBuffer = await downloadRepoZip(
-        owner,
-        repo,
-        info.default_branch
-      );
-
-      await ctx.replyWithDocument(
-        {
-          source: zipBuffer,
-          filename: `${info.name}-${info.default_branch}.zip`,
-        },
-        {
-          caption: `✅ Source ZIP dari ${info.full_name}`,
-        }
-      );
-
-      await editPanel(
-        ctx,
-        status.message_id,
-        panel({
-          heading: '<b>GET REPO ZIP SELESAI ✅</b>',
-          box: infoBox([
-            ['📦 Repository', escapeHtml(info.full_name)],
-            ['🌿 Branch', escapeHtml(info.default_branch)],
-            ['⭐ Stars', `${info.stargazers_count ?? 0}`],
-          ]),
-        }),
-        homeButton()
-      );
+      if (info.private) throw new Error('Repository ini private, tidak bisa diambil ZIP-nya lewat fitur ini.');
+      await editPanel(ctx, status.message_id, panel({
+        heading: '<b>GET REPO ZIP</b>',
+        body: `📦 <code>${escapeHtml(info.full_name)}</code>\n🌿 Branch: <code>${escapeHtml(info.default_branch)}</code>\n\n⏳ Mengunduh ZIP dari GitHub…`,
+      }));
+      const zipBuffer = await downloadRepoZip(owner, repo, info.default_branch);
+      await ctx.replyWithDocument({ source: zipBuffer, filename: `${info.name}-${info.default_branch}.zip` }, { caption: `✅ Source ZIP dari ${info.full_name}` });
+      await editPanel(ctx, status.message_id, panel({
+        heading: '<b>GET REPO ZIP SELESAI ✅</b>',
+        box: infoBox([
+          ['📦 Repository', escapeHtml(info.full_name)],
+          ['🌿 Branch', escapeHtml(info.default_branch)],
+          ['⭐ Stars', `${info.stargazers_count ?? 0}`],
+        ]),
+      }), homeButton());
     } catch (error) {
-      await editPanel(
-        ctx,
-        status.message_id,
-        panel({
-          heading: '<b>GET REPO ZIP GAGAL ❌</b>',
-          body: `<code>${escapeHtml(errorMessage(error))}</code>`,
-        }),
-        homeButton()
-      );
+      await editPanel(ctx, status.message_id, panel({ heading: '<b>GET REPO ZIP GAGAL ❌</b>', body: `<code>${escapeHtml(errorMessage(error))}</code>` }), homeButton());
     }
-
     return;
   }
+
+  if (session.type === 'search_repo' && session.step === 'query') {
+    sessions.delete(id);
+    const status = await sendPanel(ctx, panel({ heading: '<b>CARI REPO GITHUB</b>', body: '⏳ Mencari…' }));
+    try {
+      const items = await searchGithubRepos(text, 5);
+      if (!items.length) {
+        await editPanel(ctx, status.message_id, panel({ heading: '<b>CARI REPO GITHUB</b>', body: '<i>Tidak ada hasil ditemukan.</i>' }), homeButton());
+        return;
+      }
+      const lines = items.map((r, i) =>
+        `${i + 1}. <a href="${escapeHtml(r.html_url)}">${escapeHtml(r.full_name)}</a>\n   ⭐ ${r.stargazers_count} · ${escapeHtml(r.language || '-')}${r.description ? `\n   <i>${escapeHtml(r.description.slice(0, 100))}</i>` : ''}`
+      );
+      await editPanel(ctx, status.message_id, panel({
+        heading: `<b>HASIL: "${escapeHtml(text)}"</b>`,
+        body: lines.join('\n\n'),
+      }), homeButton());
+    } catch (error) {
+      await editPanel(ctx, status.message_id, panel({ heading: '<b>PENCARIAN GAGAL ❌</b>', body: `<code>${escapeHtml(errorMessage(error))}</code>` }), homeButton());
+    }
+    return;
+  }
+
+  if (session.type === 'delete' && session.step === 'link') {
+    sessions.delete(id);
+    const status = await sendPanel(ctx, panel({ heading: '<b>DELETE WEB</b>', body: '⏳ Mencari project dari link…' }));
+    try {
+      const target = await resolveDeployTargetFromUrl(text);
+      const platformLabel = platformDisplayName(target.platform);
+
+      await editPanel(ctx, status.message_id, panel({
+        heading: '<b>DELETE WEB</b>',
+        body: `🛰️ Platform: <b>${escapeHtml(platformLabel)}</b>\n🌐 Project ditemukan: <code>${escapeHtml(target.name)}</code>\n\n⏳ Menghapus website & deployment di ${escapeHtml(platformLabel)}…`,
+      }));
+      await deleteDeployTarget(target);
+      await removeDeploymentRecord(target.name, target.platform);
+
+      let repoStatus = '⚠️ Repository tidak ditemukan otomatis';
+      try {
+        const repo = await findGithubRepoByProjectName(target.name);
+        if (repo) {
+          await editPanel(ctx, status.message_id, panel({
+            heading: '<b>DELETE WEB</b>',
+            body: `🛰️ Platform: <b>${escapeHtml(platformLabel)}</b>\n🌐 Project: <code>${escapeHtml(target.name)}</code>\n✅ Website ${escapeHtml(platformLabel)} dihapus.\n\n⏳ Menghapus repository…`,
+          }));
+          await deleteGithubRepo(repo.owner.login, repo.name);
+          repoStatus = '✅ Ikut dihapus';
+        }
+      } catch (repoError) {
+        repoStatus = `⚠️ Gagal dihapus: ${errorMessage(repoError)}`;
+      }
+
+      await editPanel(ctx, status.message_id, panel({
+        heading: '<b>WEB DIHAPUS ✅</b>',
+        box: infoBox([
+          ['📦 Project', escapeHtml(target.name)],
+          ['🛰️ Platform', escapeHtml(platformLabel)],
+          ['🌐 Website', '✅ Dihapus'],
+          ['📁 Repository', escapeHtml(repoStatus)],
+        ]),
+      }), homeButton());
+    } catch (error) {
+      await editPanel(ctx, status.message_id, panel({ heading: '<b>DELETE GAGAL ❌</b>', body: `<code>${escapeHtml(errorMessage(error))}</code>` }), homeButton());
+    }
+    return;
+  }
+
+  if (session.type === 'encrypt' && session.step === 'password') {
+    session.password = text;
+    session.step = 'confirm';
+    sessions.set(id, session);
+    await sendPrompt(ctx, 'Encrypt HTML', '🔐 <b>Langkah 3 dari 3 — Konfirmasi</b>\n\nKetik ulang password yang sama persis untuk konfirmasi.', session);
+    return;
+  }
+
+  if (session.type === 'encrypt' && session.step === 'confirm') {
+    if (text !== session.password) {
+      await sendPrompt(ctx, 'Encrypt HTML', '❌ <b>Password tidak sama.</b>\n\nKirim ulang password yang benar (harus sama persis dengan langkah sebelumnya).', session);
+      return;
+    }
+    sessions.delete(id);
+    const encrypted = encryptedHtml(session.fileBuffer.toString('utf8'), session.password);
+    await ctx.replyWithDocument({ source: Buffer.from(encrypted, 'utf8'), filename: `${session.fileName.replace(/\.html?$/i, '')}-encrypted.html` }, { caption: '✅ HTML berhasil dienkripsi dengan AES-256.' });
+    await sendPanel(ctx, panel({
+      heading: '<b>ENCRYPT SELESAI ✅</b>',
+      body: 'File terenkripsi sudah dikirim di atas. Simpan passwordnya baik-baik — tanpa password, isi file tidak bisa dibuka lagi.',
+    }), homeButton());
+    return;
+  }
+
+  if ((session.type === 'deploy_html' || session.type === 'deploy_zip') && session.step === 'env_key') {
+    const key = text.trim().replace(/\s+/g, '_').toUpperCase();
+    if (!key || !/^[A-Z_][A-Z0-9_]*$/.test(key)) {
+      await sendPrompt(ctx, 'Tambah .env', '❌ <b>KEY tidak valid.</b>\n\nGunakan huruf/angka/underscore saja, contoh: <code>TOKEN_GITHUB</code>. Kirim ulang KEY-nya.', session);
+      return;
+    }
+    session.pendingEnvKey = key;
+    session.step = 'env_value';
+    sessions.set(id, session);
+    await sendPrompt(ctx, 'Tambah .env', `🔒 <b>Kirim VALUE</b> untuk <code>${escapeHtml(key)}</code>`, session);
+    return;
+  }
+
+  if ((session.type === 'deploy_html' || session.type === 'deploy_zip') && session.step === 'env_value') {
+    session.envVars = session.envVars || [];
+    session.envVars.push({ key: session.pendingEnvKey, value: text });
+    delete session.pendingEnvKey;
+    session.step = 'env_more';
+    sessions.set(id, session);
+    const old = sessions.get(id);
+    if (old?.controlMessageId) await safeDeleteMessage(ctx, ctx.chat.id, old.controlMessageId);
+    const message = await sendPanel(ctx, panel({
+      heading: '<b>Tambah .env</b>',
+      box: infoBox(session.envVars.map((e) => [`🔑 ${escapeHtml(e.key)}`, '<i>tersimpan</i>'])),
+      body: 'Mau tambah environment variable lagi?',
+    }), Markup.inlineKeyboard([
+      [Markup.button.callback('➕  Tambah Lagi', 'env_more_add'), Markup.button.callback('✅  Selesai', 'env_more_done')],
+    ]));
+    session.controlMessageId = message.message_id;
+    sessions.set(id, session);
+    return;
+  }
+
+  if (session.type === 'generate_bot' && session.step === 'gb_env_key') {
+    const key = text.trim().replace(/\s+/g, '_').toUpperCase();
+    if (!key || !/^[A-Z_][A-Z0-9_]*$/.test(key)) {
+      await sendPrompt(ctx, 'Generate Bot — .env', '❌ <b>KEY tidak valid.</b>\n\nGunakan huruf/angka/underscore saja, contoh: <code>TOKEN_BOT</code>. Kirim ulang KEY-nya.', session);
+      return;
+    }
+    session.pendingEnvKey = key;
+    session.step = 'gb_env_value';
+    sessions.set(id, session);
+    await sendPrompt(ctx, 'Generate Bot — .env', `🔒 <b>Kirim VALUE</b> untuk <code>${escapeHtml(key)}</code>`, session);
+    return;
+  }
+
+  if (session.type === 'generate_bot' && session.step === 'gb_env_value') {
+    session.envVars = session.envVars || [];
+    session.envVars.push({ key: session.pendingEnvKey, value: text });
+    delete session.pendingEnvKey;
+    session.step = 'gb_env_more';
+    sessions.set(id, session);
+    const old = sessions.get(id);
+    if (old?.controlMessageId) await safeDeleteMessage(ctx, ctx.chat.id, old.controlMessageId);
+    const message = await sendPanel(ctx, panel({
+      heading: '<b>Generate Bot — .env</b>',
+      box: infoBox(session.envVars.map((e) => [`🔑 ${escapeHtml(e.key)}`, '<i>tersimpan</i>'])),
+      body: 'Mau tambah environment variable lagi?',
+    }), Markup.inlineKeyboard([
+      [Markup.button.callback('➕  Tambah Lagi', 'gb_env_more_add'), Markup.button.callback('✅  Selesai', 'gb_env_more_done')],
+    ]));
+    session.controlMessageId = message.message_id;
+    sessions.set(id, session);
+    return;
+  }
+
+  if (session.type === 'generate_bot' && session.step === 'gb_name') {
+    session.name = repoSafeName(text);
+    session.step = 'gb_deploying';
+    sessions.set(id, session);
+    const status = await sendPanel(ctx, panel({
+      heading: '📊 <b>DASHBOARD LOG</b>',
+      box: infoBox([
+        ['📡 Server', '🔵 <b>PROCESSING</b>'],
+        ['🔧 Mode', 'Generate Bot'],
+        ['📦 Nama Bot', `<code>${escapeHtml(session.name)}</code>`],
+        ['🔐 .env', `<b>${session.envVars?.length || 0}</b> variable`],
+        ['🔄 Progress', `<code>${progressBar(0)}</code> 0%`],
+        ['📝 Activity', 'Memulai proses…'],
+      ]),
+      footer: 'Proses membutuhkan waktu, jadi mohon\nuntuk sabar.....',
+    }));
+    await runGenerateBot(ctx, session, status);
+    return;
+  }
+
+  if ((session.type === 'deploy_html' || session.type === 'deploy_zip') && session.step === 'name') {
+    session.name = repoSafeName(text);
+    session.step = 'deploying';
+    sessions.set(id, session);
+    const status = await sendPanel(ctx, panel({
+      heading: '📊 <b>DASHBOARD LOG</b>',
+      box: infoBox([
+        ['📡 Server', '🔵 <b>PROCESSING</b>'],
+        ['🛰️ Platform', escapeHtml(platformDisplayName(session.platform))],
+        ['🔧 Mode', escapeHtml(session.type === 'deploy_zip' ? 'Deploy ZIP' : 'Deploy HTML')],
+        ['📦 Nama Web', `<code>${escapeHtml(session.name)}</code>`],
+        ['🔄 Progress', `<code>${progressBar(0)}</code> 0%`],
+        ['📝 Activity', 'Memulai proses…'],
+      ]),
+      footer: 'Proses membutuhkan waktu, jadi mohon\nuntuk sabar.....',
+    }));
+    await runDeployment(ctx, session, status);
+    return;
+  }
+
+  if (session.type === 'deploy_html' || session.type === 'deploy_zip') {
+    await sendPrompt(ctx, 'Deploy', 'Tahap ini belum meminta nama website. Ikuti instruksi terakhir dari bot di atas, atau tekan tombol Menu Utama untuk mengulang.', session);
+  }
 });
+
+bot.on('photo', async (ctx) => {
+  const id = uid(ctx);
+  const session = sessions.get(id);
+  if (!session || session.type !== 'photo_url' || session.step !== 'file') return;
+
+  if (session.controlMessageId) await safeDeleteMessage(ctx, ctx.chat.id, session.controlMessageId);
+
+  try {
+    // Ambil resolusi terbesar yang dikirim Telegram (foto biasa otomatis
+    // dikompres Telegram jadi JPEG — untuk kualitas asli, sarankan user
+    // kirim sebagai File/Dokumen, sudah dijelaskan di prompt sebelumnya).
+    const sizes = ctx.message.photo;
+    const largest = sizes[sizes.length - 1];
+    const buffer = await downloadTelegramFile(ctx, largest.file_id);
+    const fileName = `foto-${Date.now()}.jpg`;
+    sessions.delete(id);
+
+    const status = await sendPanel(ctx, panel({
+      heading: '📊 <b>DASHBOARD LOG</b>',
+      box: infoBox([
+        ['📡 Server', '🔵 <b>PROCESSING</b>'],
+        ['🔧 Mode', 'Foto ke URL'],
+        ['🖼️ File', `<code>${escapeHtml(fileName)}</code>`],
+        ['🔄 Progress', `<code>${progressBar(0)}</code> 0%`],
+        ['📝 Activity', 'Memulai proses…'],
+      ]),
+      footer: 'Proses membutuhkan waktu, jadi mohon\nuntuk sabar.....',
+    }));
+    await runPhotoUpload(ctx, [{ path: fileName, buffer }], status);
+  } catch (error) {
+    sessions.delete(id);
+    await sendPrompt(ctx, 'Foto ke URL', `❌ <b>Gagal mengambil foto dari Telegram.</b>\n\n<code>${escapeHtml(errorMessage(error))}</code>`, { type: 'photo_url', step: 'file' });
+  }
+});
+
+bot.on('document', async (ctx) => {
+  const id = uid(ctx);
+  const session = sessions.get(id);
+  if (!session) return;
+  const document = ctx.message.document;
+  const fileName = document.file_name || 'file';
+
+  if (session.controlMessageId) await safeDeleteMessage(ctx, ctx.chat.id, session.controlMessageId);
+
+  if (session.type === 'photo_url' && session.step === 'file') {
+    const mimeType = document.mime_type || '';
+    const extFromMime = IMAGE_MIME_EXT[mimeType.toLowerCase()];
+    const looksLikeImageName = /\.(png|jpe?g|gif|webp|svg|ico)$/i.test(fileName);
+    if (!mimeType.startsWith('image/') && !looksLikeImageName) {
+      await sendPrompt(ctx, 'Foto ke URL', '❌ <b>Format tidak didukung.</b>\n\nKirim gambar dengan format PNG, JPG, GIF, WEBP, SVG, atau ICO.', session);
+      return;
+    }
+    try {
+      const buffer = await downloadTelegramFile(ctx, document.file_id);
+      const safeName = sanitizeImageFileName(fileName, extFromMime);
+      sessions.delete(id);
+
+      const status = await sendPanel(ctx, panel({
+        heading: '📊 <b>DASHBOARD LOG</b>',
+        box: infoBox([
+          ['📡 Server', '🔵 <b>PROCESSING</b>'],
+          ['🔧 Mode', 'Foto ke URL'],
+          ['🖼️ File', `<code>${escapeHtml(safeName)}</code>`],
+          ['🔄 Progress', `<code>${progressBar(0)}</code> 0%`],
+          ['📝 Activity', 'Memulai proses…'],
+        ]),
+        footer: 'Proses membutuhkan waktu, jadi mohon\nuntuk sabar.....',
+      }));
+      await runPhotoUpload(ctx, [{ path: safeName, buffer }], status);
+    } catch (error) {
+      await sendPrompt(ctx, 'Foto ke URL', `❌ <b>Gagal mengambil file dari Telegram.</b>\n\n<code>${escapeHtml(errorMessage(error))}</code>`, session);
+    }
+    return;
+  }
+
+  if (session.type === 'audio_url' && session.step === 'file') {
+    const mimeType = document.mime_type || '';
+    const extFromMime = AUDIO_MIME_EXT[mimeType.toLowerCase()];
+    const looksLikeAudioName = /\.(mp3|wav|ogg|m4a|aac|flac)$/i.test(fileName);
+    if (!mimeType.startsWith('audio/') && !looksLikeAudioName) {
+      await sendPrompt(ctx, 'Audio ke URL', '❌ <b>Format tidak didukung.</b>\n\nKirim audio dengan format MP3, WAV, OGG, M4A, AAC, atau FLAC.', session);
+      return;
+    }
+    try {
+      const buffer = await downloadTelegramFile(ctx, document.file_id);
+      const safeName = sanitizeImageFileName(fileName, extFromMime || 'mp3', 'audio');
+      sessions.delete(id);
+
+      const status = await sendPanel(ctx, panel({
+        heading: '📊 <b>DASHBOARD LOG</b>',
+        box: infoBox([
+          ['📡 Server', '🔵 <b>PROCESSING</b>'],
+          ['🔧 Mode', 'Audio ke URL'],
+          ['🎵 File', `<code>${escapeHtml(safeName)}</code>`],
+          ['🔄 Progress', `<code>${progressBar(0)}</code> 0%`],
+          ['📝 Activity', 'Memulai proses…'],
+        ]),
+        footer: 'Proses membutuhkan waktu, jadi mohon\nuntuk sabar.....',
+      }));
+      await runFileToUrl(ctx, [{ path: safeName, buffer }], status, 'audio');
+    } catch (error) {
+      await sendPrompt(ctx, 'Audio ke URL', `❌ <b>Gagal mengambil file dari Telegram.</b>\n\n<code>${escapeHtml(errorMessage(error))}</code>`, session);
+    }
+    return;
+  }
+
+  if (session.type === 'generate_bot' && session.step === 'file') {
+    if (!/\.zip$/i.test(fileName)) {
+      await sendPrompt(ctx, 'Generate Bot', '❌ <b>Format salah.</b>\n\nMenu ini hanya menerima file <code>.zip</code>. Silakan kirim ulang file yang sesuai.', session);
+      return;
+    }
+    try {
+      const buffer = await downloadTelegramFile(ctx, document.file_id);
+      const files = await extractZipGeneric(buffer);
+      const hasPackageJson = files.some((f) => f.path.toLowerCase() === 'package.json');
+      if (!hasPackageJson) {
+        await sendPrompt(ctx, 'Generate Bot', '❌ <b>Tidak ditemukan <code>package.json</code>.</b>\n\nProject bot wajib punya <code>package.json</code> di root ZIP (atau di dalam satu folder pembungkus tunggal). Kirim ulang ZIP yang sesuai.', session);
+        return;
+      }
+      session.files = files;
+
+      if (session.platform === 'render') {
+        // Render server-nya hidup terus (bukan serverless), jadi tidak butuh
+        // deteksi "file handler" khusus seperti Vercel — cukup jalankan
+        // start command project-nya (npm start / node <main>), apapun model
+        // bot-nya (polling atau webhook).
+        session.webhookPath = null;
+        await startGenerateBotEnvCollection(ctx, session, `📄 ZIP OK (${files.length} file), platform Render.`);
+        return;
+      }
+
+      const detected = detectGenerateBotWebhookPath(files);
+      if (detected.path) {
+        session.webhookPath = detected.path;
+        await startGenerateBotEnvCollection(ctx, session, `📄 ZIP OK (${files.length} file).\n🧩 Webhook terdeteksi: <code>${escapeHtml(detected.path)}</code>\n<i>Sumber: ${escapeHtml(detected.source)}</i>`);
+      } else if (detected.candidates && detected.candidates.length > 1) {
+        session.step = 'pick_webhook_file';
+        session.webhookCandidates = detected.candidates;
+        sessions.set(id, session);
+        const buttons = detected.candidates.map((p, i) => [Markup.button.callback(p, `gbpick_${i}`)]);
+        const old = sessions.get(id);
+        if (old?.controlMessageId) await safeDeleteMessage(ctx, ctx.chat.id, old.controlMessageId);
+        const message = await sendPanel(ctx, panel({
+          heading: '<b>Generate Bot</b>',
+          body: `📄 ZIP OK (${files.length} file).\n\n🧩 Ditemukan <b>${detected.candidates.length}</b> file di folder <code>api/</code>. Pilih mana yang jadi handler bot-nya:`,
+        }), Markup.inlineKeyboard(buttons));
+        session.controlMessageId = message.message_id;
+        sessions.set(id, session);
+      } else {
+        session.webhookPath = null;
+        await startGenerateBotEnvCollection(ctx, session, `📄 ZIP OK (${files.length} file).\n⚠️ Tidak ditemukan file <code>.js</code> di folder <code>api/</code> atau <code>vercel.json</code> yang valid — webhook tidak akan didaftarkan otomatis, kamu perlu <code>setWebhook</code> manual nanti.`);
+      }
+    } catch (error) {
+      await sendPrompt(ctx, 'Generate Bot', `❌ <b>ZIP tidak valid.</b>\n\n<code>${escapeHtml(errorMessage(error))}</code>`, session);
+    }
+    return;
+  }
+
+  if (session.type === 'deploy_html' && session.step === 'file') {
+    const platformLabel = platformDisplayName(session.platform);
+    if (!/\.html?$/i.test(fileName)) {
+      await sendPrompt(ctx, `Deploy HTML — ${platformLabel}`, '❌ <b>Format salah.</b>\n\nMenu ini hanya menerima file <code>.html</code>. Silakan kirim ulang file yang sesuai.', session);
+      return;
+    }
+    try {
+      const buffer = await downloadTelegramFile(ctx, document.file_id);
+      session.files = [{ path: 'index.html', buffer }];
+      await askEnvChoiceOrName(ctx, session, `📄 File diterima: <code>${escapeHtml(fileName)}</code>`);
+    } catch (error) {
+      await sendPrompt(ctx, `Deploy HTML — ${platformLabel}`, `❌ <b>Gagal mengambil file dari Telegram.</b>\n\n<code>${escapeHtml(errorMessage(error))}</code>`, session);
+    }
+    return;
+  }
+
+  if (session.type === 'deploy_zip' && session.step === 'file') {
+    const platformLabel = platformDisplayName(session.platform);
+    if (!/\.zip$/i.test(fileName)) {
+      await sendPrompt(ctx, `Deploy ZIP — ${platformLabel}`, '❌ <b>Format salah.</b>\n\nMenu ini hanya menerima file <code>.zip</code>. Silakan kirim ulang file yang sesuai.', session);
+      return;
+    }
+    try {
+      const buffer = await downloadTelegramFile(ctx, document.file_id);
+      session.files = await extractZip(buffer);
+      await askEnvChoiceOrName(ctx, session, `📦 ZIP diterima: <b>${session.files.length}</b> file ditemukan.`);
+    } catch (error) {
+      await sendPrompt(ctx, `Deploy ZIP — ${platformLabel}`, `❌ <b>ZIP tidak valid.</b>\n\n<code>${escapeHtml(errorMessage(error))}</code>`, session);
+    }
+    return;
+  }
+
+  if (session.type === 'encrypt' && session.step === 'file') {
+    if (!/\.html?$/i.test(fileName)) {
+      await sendPrompt(ctx, 'Encrypt HTML', '❌ <b>Format salah.</b>\n\nMenu ini hanya menerima file <code>.html</code>. Silakan kirim ulang file yang sesuai.', session);
+      return;
+    }
+    try {
+      session.fileBuffer = await downloadTelegramFile(ctx, document.file_id);
+      session.fileName = fileName;
+      session.step = 'password';
+      await sendPrompt(ctx, 'Encrypt HTML', `📄 File diterima: <code>${escapeHtml(fileName)}</code>\n\n🔐 <b>Langkah 2 dari 3 — Password</b>\n\nKirim password yang akan dipakai untuk mengunci file ini.`, session);
+    } catch (error) {
+      await sendPrompt(ctx, 'Encrypt HTML', `❌ <b>Gagal mengambil file dari Telegram.</b>\n\n<code>${escapeHtml(errorMessage(error))}</code>`, session);
+    }
+  }
+});
+
+bot.command('adduser', async (ctx) => {
+  if (uid(ctx) !== OWNER_ID) return;
+  const target = Number(ctx.message.text.split(/\s+/)[1]);
+  if (!Number.isInteger(target) || target <= 0) {
+    await sendPanel(ctx, panel({ heading: '<b>ADD USER</b>', body: '❌ Format salah. Gunakan: <code>/adduser 123456789</code>' }));
+    return;
+  }
+  allowedUsers.add(target);
+  try {
+    await saveUsers();
+    await sendPanel(ctx, panel({ heading: '<b>ADD USER</b>', body: `✅ User <code>${target}</code> berhasil ditambahkan.` }), homeButton());
+  } catch (error) {
+    allowedUsers.delete(target);
+    await sendPanel(ctx, panel({ heading: '<b>ADD USER GAGAL ❌</b>', body: `<code>${escapeHtml(errorMessage(error))}</code>` }), homeButton());
+  }
+});
+
+bot.command('cancel', async (ctx) => {
+  const session = sessions.get(uid(ctx));
+  if (session?.controlMessageId) await safeDeleteMessage(ctx, ctx.chat.id, session.controlMessageId);
+  sessions.delete(uid(ctx));
+  await sendPanel(ctx, panel({ heading: '<b>DIBATALKAN ↩️</b>', body: 'Proses yang sedang berjalan sudah dibatalkan.' }), homeButton());
+});
+
+bot.catch((error) => {
+  console.error('[BOT ERROR]', error.response?.data || error.message || error);
+});
+
+(async () => {
+  await loadUsers();
+  // Sengaja HANYA mendaftarkan /start dan /cancel di daftar perintah "/".
+  // Navigasi utama tetap lewat inline button pada pesan bot, bukan lewat
+  // Reply Keyboard, supaya tidak ada dua menu yang tampil berbarengan.
+  try {
+    await bot.telegram.setMyCommands([
+      { command: 'start', description: 'Buka menu utama' },
+      { command: 'cancel', description: 'Batalkan proses yang sedang berjalan' },
+    ]);
+  } catch (error) {
+    console.error('[SET COMMANDS]', errorMessage(error));
+  }
+})();
+
+module.exports = async (req, res) => {
+  if (req.method === 'POST') {
+    try {
+      await bot.handleUpdate(req.body);
+      return res.status(200).send('OK');
+    } catch (error) {
+      console.error('[WEBHOOK]', error.response?.data || error.message || error);
+      return res.status(500).send('Webhook error');
+    }
+  }
+  return res.status(200).send('⚡ Cloud Logic Bot Online');
+};
