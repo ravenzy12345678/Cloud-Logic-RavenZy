@@ -15,6 +15,7 @@ const ENV = {
   VERCEL_HOOK: process.env.VERCEL_HOOK,
   VERCEL_TEAM_ID: process.env.VERCEL_TEAM_ID || '',
   NETLIFY_TOKEN: process.env.NETLIFY_TOKEN,
+  RENDER_API_KEY: process.env.RENDER_API_KEY,
 };
 
 function requireConfig() {
@@ -32,6 +33,7 @@ let allowedUsers = new Set([OWNER_ID]);
 const GH_API = 'https://api.github.com';
 const VERCEL_API = 'https://api.vercel.com';
 const NETLIFY_API = 'https://api.netlify.com/api/v1';
+const RENDER_API = 'https://api.render.com/v1';
 const ghHeaders = {
   Accept: 'application/vnd.github+json',
   Authorization: `Bearer ${ENV.GH_TOKEN}`,
@@ -44,6 +46,11 @@ const vercelHeaders = {
 const netlifyHeaders = {
   Authorization: `Bearer ${ENV.NETLIFY_TOKEN}`,
 };
+const renderHeaders = {
+  Authorization: `Bearer ${ENV.RENDER_API_KEY}`,
+  Accept: 'application/json',
+  'Content-Type': 'application/json',
+};
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const uid = (ctx) => Number(ctx.from?.id);
@@ -52,6 +59,12 @@ function escapeHtml(value) {
   return String(value ?? '').replace(/[&<>"']/g, (ch) => ({
     '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
   }[ch]));
+}
+
+function platformDisplayName(platform) {
+  if (platform === 'netlify') return 'Netlify';
+  if (platform === 'render') return 'Render';
+  return 'Vercel';
 }
 
 function errorMessage(error) {
@@ -116,6 +129,7 @@ function homeButton() {
 function mainMenuMarkup() {
   return Markup.inlineKeyboard([
     [Markup.button.callback('🚀  Deploy Vercel', 'deploy_vercel'), Markup.button.callback('☁️  Deploy Netlify', 'deploy_netlify')],
+    [Markup.button.callback('🎨  Deploy Render', 'deploy_render')],
     [Markup.button.callback('🌐  Get Source', 'get_source'), Markup.button.callback('🛡️  Encrypt HTML', 'encrypt_html')],
     [Markup.button.callback('🖼️  Foto ke URL', 'photo_url'), Markup.button.callback('🎵  Audio ke URL', 'audio_url')],
     [Markup.button.callback('📸  Screenshot URL', 'screenshot_url'), Markup.button.callback('📦  Get Repo ZIP', 'repo_zip')],
@@ -139,7 +153,7 @@ function fileTypeMarkup(platform) {
 // untuk website statis biasa — sudah dijelaskan ke user di teks prompt-nya).
 async function askForWebsiteName(ctx, session, prefixText = '') {
   session.step = 'name';
-  const platformLabel = session.platform === 'netlify' ? 'Netlify' : 'Vercel';
+  const platformLabel = platformDisplayName(session.platform);
   const title = `${session.type === 'deploy_zip' ? 'Deploy ZIP' : 'Deploy HTML'} — ${platformLabel}`;
   const body = `${prefixText ? `${prefixText}\n\n` : ''}🚀 <b>Langkah Terakhir — Nama Website</b>\n\nKirim nama repository/website (huruf, angka, dan tanda "-" saja, tanpa spasi).\nContoh: <code>toko-online-saya</code>`;
   await sendPrompt(ctx, title, body, session);
@@ -713,6 +727,168 @@ async function waitForNetlifyDeploy(deployId, timeoutMs = 180000, onStatus) {
   throw new Error('Deploy Netlify belum selesai dalam 3 menit. Periksa lagi beberapa saat lagi.');
 }
 
+// ─────────────────────────────────────────────
+// RENDER — deploy static site dari repo GitHub. Beda dari Vercel/Netlify:
+// Render TIDAK punya cara "kirim file langsung dapat link", dia WAJIB
+// tarik dari repo Git. Jadi untuk Render, backup ke GitHub yang biasanya
+// opsional di platform lain, di sini WAJIB berhasil dulu.
+// ─────────────────────────────────────────────
+
+async function getRenderOwnerId() {
+  if (!ENV.RENDER_API_KEY) throw new Error('RENDER_API_KEY belum diatur di environment variable bot.');
+  const response = await axios.get(`${RENDER_API}/owners`, {
+    headers: renderHeaders,
+    params: { limit: 1 },
+    timeout: 20000,
+  });
+  const list = response.data;
+  const first = Array.isArray(list) ? list[0] : null;
+  const ownerId = first?.owner?.id || first?.id;
+  if (!ownerId) throw new Error('Tidak menemukan workspace Render dari API key ini.');
+  return ownerId;
+}
+
+async function createRenderStaticSite(name, repoUrl, branch) {
+  const ownerId = await getRenderOwnerId();
+  const payload = {
+    type: 'static_site',
+    name: projectSafeName(name),
+    ownerId,
+    repo: repoUrl,
+    branch: branch || 'main',
+    autoDeploy: 'yes',
+    serviceDetails: {
+      publishPath: '.',
+    },
+  };
+  const response = await axios.post(`${RENDER_API}/services`, payload, {
+    headers: renderHeaders,
+    timeout: 30000,
+  });
+  return response.data?.service || response.data;
+}
+
+function deriveNodeStartCommand(files) {
+  const pkgFile = files.find((f) => f.path.toLowerCase() === 'package.json');
+  if (pkgFile) {
+    try {
+      const pkg = JSON.parse(pkgFile.buffer.toString('utf8'));
+      if (pkg?.scripts?.start) return 'npm start';
+      if (typeof pkg?.main === 'string' && pkg.main.trim()) return `node ${pkg.main.trim()}`;
+    } catch (_) {
+      // package.json tidak valid JSON — pakai fallback
+    }
+  }
+  return 'node index.js';
+}
+
+async function createRenderWebService(name, repoUrl, branch, envVars, startCommand) {
+  const ownerId = await getRenderOwnerId();
+  const payload = {
+    type: 'web_service',
+    name: projectSafeName(name),
+    ownerId,
+    repo: repoUrl,
+    branch: branch || 'main',
+    autoDeploy: 'yes',
+    envVars: (envVars || []).map((e) => ({ key: e.key, value: e.value })),
+    serviceDetails: {
+      env: 'node',
+      plan: 'free',
+      buildCommand: 'npm install',
+      startCommand,
+    },
+  };
+  const response = await axios.post(`${RENDER_API}/services`, payload, {
+    headers: renderHeaders,
+    timeout: 30000,
+  });
+  return response.data?.service || response.data;
+}
+
+async function getRenderLatestDeploy(serviceId) {
+  const response = await axios.get(`${RENDER_API}/services/${encodeURIComponent(serviceId)}/deploys`, {
+    headers: renderHeaders,
+    params: { limit: 1 },
+    timeout: 20000,
+  });
+  const list = response.data;
+  const first = Array.isArray(list) ? list[0] : null;
+  return first?.deploy || first || null;
+}
+
+async function getRenderDeploy(serviceId, deployId) {
+  const response = await axios.get(`${RENDER_API}/services/${encodeURIComponent(serviceId)}/deploys/${encodeURIComponent(deployId)}`, {
+    headers: renderHeaders,
+    timeout: 20000,
+  });
+  return response.data;
+}
+
+async function waitForRenderDeploy(serviceId, timeoutMs = 300000, onStatus) {
+  const start = Date.now();
+  let deployId = null;
+
+  // Deploy pertama otomatis terpicu saat service dibuat, tapi butuh
+  // beberapa detik sebelum muncul di daftar deploys — tunggu dulu.
+  while (!deployId && Date.now() - start < 30000) {
+    const latest = await getRenderLatestDeploy(serviceId);
+    if (latest?.id) deployId = latest.id;
+    else await sleep(3000);
+  }
+  if (!deployId) throw new Error('Deploy Render tidak kunjung terdeteksi setelah service dibuat.');
+
+  let lastStatus = '';
+  while (Date.now() - start < timeoutMs) {
+    const deploy = await getRenderDeploy(serviceId, deployId);
+    const status = deploy.status || '';
+    if (status !== lastStatus) {
+      lastStatus = status;
+      if (onStatus) await onStatus(status, deploy);
+    }
+    if (status === 'live') return deploy;
+    if (['build_failed', 'update_failed', 'canceled', 'deactivated'].includes(status)) return deploy;
+    await sleep(5000);
+  }
+  throw new Error('Deploy Render belum selesai dalam waktu yang ditentukan. Cek dashboard Render untuk detail build.');
+}
+
+async function getRenderServiceUrl(serviceId, fallbackName) {
+  try {
+    const response = await axios.get(`${RENDER_API}/services/${encodeURIComponent(serviceId)}`, {
+      headers: renderHeaders,
+      timeout: 20000,
+    });
+    const data = response.data;
+    const url = data?.serviceDetails?.url || data?.service?.serviceDetails?.url || data?.url;
+    if (url) return url;
+  } catch (_) {}
+  return `https://${projectSafeName(fallbackName)}.onrender.com`;
+}
+
+async function findRenderServiceByName(name) {
+  const response = await axios.get(`${RENDER_API}/services`, {
+    headers: renderHeaders,
+    params: { name: projectSafeName(name), limit: 5 },
+    timeout: 20000,
+  });
+  const list = response.data;
+  const first = Array.isArray(list) ? list[0] : null;
+  return first?.service || first || null;
+}
+
+async function deleteRenderService(serviceId) {
+  await axios.delete(`${RENDER_API}/services/${encodeURIComponent(serviceId)}`, {
+    headers: renderHeaders,
+    timeout: 30000,
+  });
+}
+
+async function checkRender() {
+  const r = await axios.get(`${RENDER_API}/owners`, { headers: renderHeaders, params: { limit: 1 }, timeout: 20000 });
+  return r.data;
+}
+
 async function checkNetlify() {
   const r = await axios.get(`${NETLIFY_API}/user`, { headers: netlifyHeaders, timeout: 30000 });
   return r.data;
@@ -1008,6 +1184,27 @@ async function deleteNetlifySite(site) {
   });
 }
 
+async function resolveRenderServiceFromUrl(urlInput) {
+  if (!ENV.RENDER_API_KEY) throw new Error('RENDER_API_KEY belum diatur di environment variable bot.');
+  let value = String(urlInput).trim();
+  if (!/^https?:\/\//i.test(value)) value = `https://${value}`;
+  let host;
+  try {
+    host = new URL(value).hostname.toLowerCase();
+  } catch (_) {
+    throw new Error('Link tidak valid. Kirim URL lengkap, contoh: https://nama-web.onrender.com');
+  }
+  if (!host.endsWith('.onrender.com')) {
+    throw new Error('Link harus berupa domain *.onrender.com hasil deploy Cloud Logic.');
+  }
+  const baseSlug = host.slice(0, -'.onrender.com'.length);
+  const service = await findRenderServiceByName(baseSlug);
+  if (!service) {
+    throw new Error(`Service Render untuk "${host}" tidak ditemukan. Pastikan link sesuai hasil deploy Cloud Logic.`);
+  }
+  return service;
+}
+
 async function resolveDeployTargetFromUrl(urlInput) {
   let value = String(urlInput).trim();
   if (!/^https?:\/\//i.test(value)) value = `https://${value}`;
@@ -1026,11 +1223,16 @@ async function resolveDeployTargetFromUrl(urlInput) {
     const site = await resolveNetlifySiteFromUrl(urlInput);
     return { platform: 'netlify', name: site.name, data: site };
   }
-  throw new Error('Link harus berupa domain *.vercel.app atau *.netlify.app hasil deploy Cloud Logic.');
+  if (host.endsWith('.onrender.com')) {
+    const service = await resolveRenderServiceFromUrl(urlInput);
+    return { platform: 'render', name: service.name, data: service };
+  }
+  throw new Error('Link harus berupa domain *.vercel.app, *.netlify.app, atau *.onrender.com hasil deploy Cloud Logic.');
 }
 
 async function deleteDeployTarget(target) {
   if (target.platform === 'netlify') return deleteNetlifySite(target.data);
+  if (target.platform === 'render') return deleteRenderService(target.data.id);
   return deleteVercelProject(target.data);
 }
 
@@ -1319,6 +1521,34 @@ async function publishToNetlify(name, files, render) {
   return final.ssl_url || final.url || site.ssl_url || site.url;
 }
 
+async function publishToRender(name, files, render) {
+  // GitHub WAJIB berhasil untuk Render (bukan backup opsional seperti
+  // Vercel/Netlify) — Render cuma bisa deploy dari repo Git, bukan file
+  // langsung.
+  await render(15, 'Membuat repository GitHub (wajib untuk Render)…');
+  const repo = await createGitHubRepo(name);
+  await uploadFilesToNewRepo(repo, files);
+
+  await render(40, 'Membuat static site di Render…');
+  const service = await createRenderStaticSite(name, repo.html_url, repo.default_branch || 'main');
+  const serviceId = service?.id;
+  if (!serviceId) throw new Error('Render tidak mengembalikan service id.');
+
+  await render(55, 'Menunggu build & deploy Render…');
+  const finalDeploy = await waitForRenderDeploy(serviceId, 300000, async (status) => {
+    if (status === 'build_in_progress') await render(75, 'Sedang build…');
+    else if (status === 'update_in_progress' || status === 'pre_deploy_in_progress') await render(88, 'Sedang deploy…');
+    else if (status === 'live') await render(96, 'Menyelesaikan…');
+    else await render(65, `Status: ${status || 'memproses'}…`);
+  });
+
+  if (finalDeploy.status !== 'live') {
+    throw new Error(`Build Render berakhir dengan status ${finalDeploy.status || 'gagal'}. Cek dashboard Render untuk log lengkap.`);
+  }
+
+  return getRenderServiceUrl(serviceId, name);
+}
+
 // ─────────────────────────────────────────────
 // FOTO KE URL — upload 1 gambar, dapat link langsung ke file-nya
 // (numpang infrastruktur deploy Vercel yang sudah ada, tanpa backup
@@ -1431,8 +1661,8 @@ async function runPhotoUpload(ctx, files, statusMessage) {
 async function runDeployment(ctx, session, statusMessage) {
   const repoName = repoSafeName(session.name);
   const modeLabel = session.type === 'deploy_zip' ? 'Deploy ZIP' : 'Deploy HTML';
-  const platform = session.platform === 'netlify' ? 'netlify' : 'vercel';
-  const platformLabel = platform === 'netlify' ? 'Netlify' : 'Vercel';
+  const platform = ['netlify', 'render'].includes(session.platform) ? session.platform : 'vercel';
+  const platformLabel = platform === 'netlify' ? 'Netlify' : platform === 'render' ? 'Render' : 'Vercel';
   const startedAt = Date.now();
 
   const render = async (percent, activity) => {
@@ -1455,20 +1685,25 @@ async function runDeployment(ctx, session, statusMessage) {
   await render(5, 'Menyiapkan berkas…');
 
   try {
-    // Backup ke GitHub bersifat opsional (tidak ditampilkan ke pengguna) dan
-    // TIDAK BOLEH menggagalkan keseluruhan proses deploy kalau bermasalah,
-    // karena deploy ke Vercel/Netlify sekarang sepenuhnya independen dari GitHub.
-    try {
-      const repo = await createGitHubRepo(repoName);
-      await uploadFilesToNewRepo(repo, session.files);
-    } catch (_) {
-      // backup gagal, tetap lanjut — bukan kegagalan fatal
+    // Backup ke GitHub: opsional untuk Vercel/Netlify (tidak ditampilkan ke
+    // pengguna, tidak boleh menggagalkan proses). Untuk Render, backup ini
+    // WAJIB dan sudah ditangani langsung di dalam publishToRender (karena
+    // Render cuma bisa deploy dari repo Git, bukan file langsung) — jadi di
+    // sini SENGAJA dilewati untuk platform Render supaya repo tidak dibuat
+    // dua kali.
+    if (platform !== 'render') {
+      try {
+        const repo = await createGitHubRepo(repoName);
+        await uploadFilesToNewRepo(repo, session.files);
+      } catch (_) {
+        // backup gagal, tetap lanjut — bukan kegagalan fatal
+      }
     }
 
-    const publisher = platform === 'netlify' ? publishToNetlify : publishToVercel;
-    const url = platform === 'netlify'
-      ? await publisher(repoName, session.files, render)
-      : await publisher(repoName, session.files, render, session.envVars);
+    const publisher = platform === 'netlify' ? publishToNetlify : platform === 'render' ? publishToRender : publishToVercel;
+    const url = platform === 'vercel'
+      ? await publisher(repoName, session.files, render, session.envVars)
+      : await publisher(repoName, session.files, render);
     const elapsed = formatElapsed(Date.now() - startedAt);
 
     await recordDeployment({
@@ -1519,6 +1754,11 @@ async function runDeployment(ctx, session, statusMessage) {
 // ─────────────────────────────────────────────
 
 async function runGenerateBot(ctx, session, statusMessage) {
+  if (session.platform === 'render') return runGenerateBotRender(ctx, session, statusMessage);
+  return runGenerateBotVercel(ctx, session, statusMessage);
+}
+
+async function runGenerateBotVercel(ctx, session, statusMessage) {
   const repoName = repoSafeName(session.name);
   const startedAt = Date.now();
   const envVars = session.envVars || [];
@@ -1526,6 +1766,7 @@ async function runGenerateBot(ctx, session, statusMessage) {
   const render = async (percent, activity) => {
     const rows = [
       ['📡 Server', '🔵 <b>PROCESSING</b>'],
+      ['🛰️ Platform', 'Vercel'],
       ['🔧 Mode', 'Generate Bot'],
       ['📦 Nama Bot', `<code>${escapeHtml(repoName)}</code>`],
       ['🔐 .env', `<b>${envVars.length}</b> variable`],
@@ -1612,6 +1853,7 @@ async function runGenerateBot(ctx, session, statusMessage) {
       heading: '<b>BOT BERHASIL DIBUAT ✅️</b>',
       box: infoBox([
         ['📦 Nama', escapeHtml(repoName)],
+        ['🛰️ Platform', 'Vercel'],
         ['🔗 URL Project', `<a href="${escapeHtml(baseUrl)}">${escapeHtml(baseUrl)}</a>`],
         ['🧩 File Webhook', session.webhookPath ? `<code>/${escapeHtml(session.webhookPath)}</code>` : '<i>tidak ada</i>'],
         ['📡 Status Webhook', webhookStatus],
@@ -1632,6 +1874,96 @@ async function runGenerateBot(ctx, session, statusMessage) {
         ['⏰ Waktu', escapeHtml(elapsed)],
       ]),
       body: logBody,
+      footer: '🔁 Silakan coba lagi dari menu utama',
+    }), homeButton());
+  } finally {
+    sessions.delete(uid(ctx));
+  }
+}
+
+async function runGenerateBotRender(ctx, session, statusMessage) {
+  const repoName = repoSafeName(session.name);
+  const startedAt = Date.now();
+  const envVars = session.envVars || [];
+
+  const render = async (percent, activity) => {
+    const rows = [
+      ['📡 Server', '🔵 <b>PROCESSING</b>'],
+      ['🛰️ Platform', 'Render'],
+      ['🔧 Mode', 'Generate Bot'],
+      ['📦 Nama Bot', `<code>${escapeHtml(repoName)}</code>`],
+      ['🔐 .env', `<b>${envVars.length}</b> variable`],
+      ['🔄 Progress', `<code>${progressBar(percent)}</code> ${percent}%`],
+      ['📝 Activity', escapeHtml(activity)],
+    ];
+    await editPanel(ctx, statusMessage.message_id, panel({
+      heading: '📊 <b>DASHBOARD LOG</b>',
+      box: infoBox(rows),
+      footer: 'Proses membutuhkan waktu, jadi mohon\nuntuk sabar.....',
+    }));
+  };
+
+  await render(5, 'Menyiapkan berkas…');
+
+  try {
+    // GitHub WAJIB untuk Render (bukan opsional) — sama seperti Deploy Web
+    // ke Render, servicenya cuma bisa ditarik dari repo Git.
+    await render(15, 'Membuat repository GitHub (wajib untuk Render)…');
+    const repo = await createGitHubRepo(repoName);
+    await uploadFilesToNewRepo(repo, session.files);
+
+    const startCommand = deriveNodeStartCommand(session.files);
+    await render(35, `Membuat web service di Render (start: ${startCommand})…`);
+    const service = await createRenderWebService(repoName, repo.html_url, repo.default_branch || 'main', envVars, startCommand);
+    const serviceId = service?.id;
+    if (!serviceId) throw new Error('Render tidak mengembalikan service id.');
+
+    await render(55, 'Menunggu build & deploy Render…');
+    const finalDeploy = await waitForRenderDeploy(serviceId, 300000, async (status) => {
+      if (status === 'build_in_progress') await render(75, 'Sedang build…');
+      else if (status === 'update_in_progress' || status === 'pre_deploy_in_progress') await render(88, 'Menjalankan start command…');
+      else if (status === 'live') await render(96, 'Menyelesaikan…');
+      else await render(65, `Status: ${status || 'memproses'}…`);
+    });
+
+    if (finalDeploy.status !== 'live') {
+      throw new Error(`Build Render berakhir dengan status ${finalDeploy.status || 'gagal'}. Cek dashboard Render untuk log lengkap.`);
+    }
+
+    const baseUrl = await getRenderServiceUrl(serviceId, repoName);
+    const elapsed = formatElapsed(Date.now() - startedAt);
+
+    await recordDeployment({
+      name: repoName,
+      platform: 'render',
+      url: baseUrl,
+      ownerId: uid(ctx),
+      ownerUsername: ctx.from?.username || null,
+      ts: Date.now(),
+    });
+
+    await editPanel(ctx, statusMessage.message_id, panel({
+      heading: '<b>BOT BERHASIL DIBUAT ✅️</b>',
+      box: infoBox([
+        ['📦 Nama', escapeHtml(repoName)],
+        ['🛰️ Platform', 'Render'],
+        ['▶️ Start Command', `<code>${escapeHtml(startCommand)}</code>`],
+        ['🔗 URL Project', `<a href="${escapeHtml(baseUrl)}">${escapeHtml(baseUrl)}</a>`],
+        ['⏰ Waktu', escapeHtml(elapsed)],
+      ]),
+      body: '💡 Kalau bot ini model <b>polling</b>, dia otomatis jalan sendiri begitu server hidup — tidak perlu langkah lain.\nKalau model <b>webhook</b>, kamu perlu <code>setWebhook</code> manual ke URL project di atas + path handler-nya sendiri (tidak didaftarkan otomatis di Render, supaya tidak bentrok kalau ternyata polling).',
+      footer: '🚀  Bot baru siap dipakai',
+    }), homeButton());
+  } catch (error) {
+    const elapsed = formatElapsed(Date.now() - startedAt);
+    await editPanel(ctx, statusMessage.message_id, panel({
+      heading: '<b>GENERATE BOT GAGAL ❌</b>',
+      box: infoBox([
+        ['📦 Nama', escapeHtml(repoName)],
+        ['🛰️ Platform', 'Render'],
+        ['⚠️ Penyebab', escapeHtml(errorMessage(error))],
+        ['⏰ Waktu', escapeHtml(elapsed)],
+      ]),
       footer: '🔁 Silakan coba lagi dari menu utama',
     }), homeButton());
   } finally {
@@ -1711,6 +2043,34 @@ bot.action('netlify_zip', async (ctx) => {
   );
 });
 
+bot.action('deploy_render', async (ctx) => {
+  await ctx.answerCbQuery();
+  await sendPanel(ctx, panel({
+    heading: '<b>DEPLOY RENDER</b>',
+    body: 'Pilih tipe file yang mau di-deploy:\n\n<i>Catatan: Render deploy dari repo GitHub (bukan file langsung), jadi backup ke GitHub di sini WAJIB berhasil dan build biasanya makan waktu lebih lama dari Vercel/Netlify.</i>',
+  }), fileTypeMarkup('render'));
+});
+
+bot.action('render_html', async (ctx) => {
+  await ctx.answerCbQuery();
+  await sendPrompt(
+    ctx,
+    'Deploy HTML — Render',
+    '🚀 <b>Langkah 1 dari 2 — Kirim File</b>\n\nUnggah 1 file dengan ekstensi <code>.html</code> sebagai halaman utama website kamu.\n\n<i>Balas pesan ini dengan mengirim filenya sebagai dokumen (bukan foto).</i>',
+    { type: 'deploy_html', platform: 'render', step: 'file' }
+  );
+});
+
+bot.action('render_zip', async (ctx) => {
+  await ctx.answerCbQuery();
+  await sendPrompt(
+    ctx,
+    'Deploy ZIP — Render',
+    '📦 <b>Langkah 1 dari 2 — Kirim File</b>\n\nUnggah 1 file <code>.zip</code> berisi seluruh project website kamu.\n\n⚠️ Wajib ada <code>index.html</code> di root ZIP (atau di dalam satu folder pembungkus tunggal).',
+    { type: 'deploy_zip', platform: 'render', step: 'file' }
+  );
+});
+
 bot.action('get_source', async (ctx) => {
   await ctx.answerCbQuery();
   await sendPrompt(
@@ -1738,6 +2098,7 @@ bot.action('system', async (ctx) => {
   try { await checkGitHub(); rows.push(['🐙 GitHub API', '🟢 <b>Terhubung</b>']); } catch (e) { rows.push(['🐙 GitHub API', `🔴 <code>${escapeHtml(errorMessage(e))}</code>`]); }
   try { await checkVercel(); rows.push(['▲ Vercel API', '🟢 <b>Terhubung</b>']); } catch (e) { rows.push(['▲ Vercel API', `🔴 <code>${escapeHtml(errorMessage(e))}</code>`]); }
   try { await checkNetlify(); rows.push(['☁️ Netlify API', '🟢 <b>Terhubung</b>']); } catch (e) { rows.push(['☁️ Netlify API', `🔴 <code>${escapeHtml(errorMessage(e))}</code>`]); }
+  try { await checkRender(); rows.push(['🎨 Render API', '🟢 <b>Terhubung</b>']); } catch (e) { rows.push(['🎨 Render API', `🔴 <code>${escapeHtml(errorMessage(e))}</code>`]); }
   rows.push(['✈️ Telegram', '🟢 <b>Aktif</b>']);
   await editPanel(ctx, status.message_id, panel({ heading: '<b>SYSTEM STATUS</b>', box: infoBox(rows) }), homeButton());
 });
@@ -1897,11 +2258,35 @@ bot.action('search_repo', async (ctx) => {
 
 bot.action('generate_bot', async (ctx) => {
   await ctx.answerCbQuery();
+  await sendPanel(ctx, panel({
+    heading: '<b>GENERATE BOT</b>',
+    body:
+      'Pilih platform tujuan:\n\n' +
+      '⚡ <b>Vercel</b> — serverless, bot HARUS model webhook (bukan polling). Bot ini otomatis daftarkan webhook-nya kalau ketemu TOKEN_BOT.\n\n' +
+      '🎨 <b>Render</b> — server hidup terus, bisa jalanin bot model <b>polling</b> ATAU webhook. Webhook TIDAK didaftarkan otomatis di Render (biar tidak bentrok kalau bot-nya polling).',
+  }), Markup.inlineKeyboard([
+    [Markup.button.callback('⚡  Vercel', 'gb_platform_vercel'), Markup.button.callback('🎨  Render', 'gb_platform_render')],
+    [Markup.button.callback('🏠  Menu Utama', 'home')],
+  ]));
+});
+
+bot.action('gb_platform_vercel', async (ctx) => {
+  await ctx.answerCbQuery();
   await sendPrompt(
     ctx,
-    'Generate Bot',
+    'Generate Bot — Vercel',
     '🤖 <b>Langkah 1 — Kirim ZIP Project Bot</b>\n\nUpload ZIP project bot Node.js (model <b>webhook</b>, bukan polling) yang mau dideploy otomatis.\n\n⚠️ Wajib ada <code>package.json</code> di root ZIP (atau di dalam satu folder pembungkus tunggal).\n\n<i>Struktur folder bebas — jumlah & nama file di dalam <code>api/</code> boleh apa saja, bot akan coba deteksi otomatis mana file handler-nya.</i>',
-    { type: 'generate_bot', step: 'file' }
+    { type: 'generate_bot', platform: 'vercel', step: 'file' }
+  );
+});
+
+bot.action('gb_platform_render', async (ctx) => {
+  await ctx.answerCbQuery();
+  await sendPrompt(
+    ctx,
+    'Generate Bot — Render',
+    '🤖 <b>Langkah 1 — Kirim ZIP Project Bot</b>\n\nUpload ZIP project bot Node.js (boleh model polling ATAU webhook) yang mau dideploy otomatis.\n\n⚠️ Wajib ada <code>package.json</code> di root ZIP, dengan <code>"start"</code> di bagian <code>scripts</code> (atau field <code>"main"</code> terisi) supaya bot tahu cara menjalankan bot-nya.',
+    { type: 'generate_bot', platform: 'render', step: 'file' }
   );
 });
 
@@ -2003,7 +2388,7 @@ bot.action('delete_web', async (ctx) => {
   await sendPrompt(
     ctx,
     'Delete Web',
-    '🗑️ <b>Kirim Link Website</b>\n\nKirim link website hasil deploy Cloud Logic yang ingin dihapus.\nContoh: <code>https://nama-web.vercel.app</code> atau <code>https://nama-web.netlify.app</code>\n\nBot otomatis kenali platform-nya dari link. Website (Vercel/Netlify) dan repository (GitHub) yang cocok akan otomatis ikut terhapus — tidak perlu cari ID atau buka dashboard.',
+    '🗑️ <b>Kirim Link Website</b>\n\nKirim link website hasil deploy Cloud Logic yang ingin dihapus.\nContoh: <code>https://nama-web.vercel.app</code>, <code>https://nama-web.netlify.app</code>, atau <code>https://nama-web.onrender.com</code>\n\nBot otomatis kenali platform-nya dari link. Website (Vercel/Netlify/Render) dan repository (GitHub) yang cocok akan otomatis ikut terhapus — tidak perlu cari ID atau buka dashboard.',
     { type: 'delete', step: 'link' }
   );
 });
@@ -2129,340 +2514,4 @@ bot.on('text', async (ctx) => {
         ]),
       }), homeButton());
     } catch (error) {
-      await editPanel(ctx, status.message_id, panel({ heading: '<b>GET REPO ZIP GAGAL ❌</b>', body: `<code>${escapeHtml(errorMessage(error))}</code>` }), homeButton());
-    }
-    return;
-  }
-
-  if (session.type === 'search_repo' && session.step === 'query') {
-    sessions.delete(id);
-    const status = await sendPanel(ctx, panel({ heading: '<b>CARI REPO GITHUB</b>', body: '⏳ Mencari…' }));
-    try {
-      const items = await searchGithubRepos(text, 5);
-      if (!items.length) {
-        await editPanel(ctx, status.message_id, panel({ heading: '<b>CARI REPO GITHUB</b>', body: '<i>Tidak ada hasil ditemukan.</i>' }), homeButton());
-        return;
-      }
-      const lines = items.map((r, i) =>
-        `${i + 1}. <a href="${escapeHtml(r.html_url)}">${escapeHtml(r.full_name)}</a>\n   ⭐ ${r.stargazers_count} · ${escapeHtml(r.language || '-')}${r.description ? `\n   <i>${escapeHtml(r.description.slice(0, 100))}</i>` : ''}`
-      );
-      await editPanel(ctx, status.message_id, panel({
-        heading: `<b>HASIL: "${escapeHtml(text)}"</b>`,
-        body: lines.join('\n\n'),
-      }), homeButton());
-    } catch (error) {
-      await editPanel(ctx, status.message_id, panel({ heading: '<b>PENCARIAN GAGAL ❌</b>', body: `<code>${escapeHtml(errorMessage(error))}</code>` }), homeButton());
-    }
-    return;
-  }
-
-  if (session.type === 'delete' && session.step === 'link') {
-    sessions.delete(id);
-    const status = await sendPanel(ctx, panel({ heading: '<b>DELETE WEB</b>', body: '⏳ Mencari project dari link…' }));
-    try {
-      const target = await resolveDeployTargetFromUrl(text);
-      const platformLabel = target.platform === 'netlify' ? 'Netlify' : 'Vercel';
-
-      await editPanel(ctx, status.message_id, panel({
-        heading: '<b>DELETE WEB</b>',
-        body: `🛰️ Platform: <b>${escapeHtml(platformLabel)}</b>\n🌐 Project ditemukan: <code>${escapeHtml(target.name)}</code>\n\n⏳ Menghapus website & deployment di ${escapeHtml(platformLabel)}…`,
-      }));
-      await deleteDeployTarget(target);
-      await removeDeploymentRecord(target.name, target.platform);
-
-      let repoStatus = '⚠️ Repository tidak ditemukan otomatis';
-      try {
-        const repo = await findGithubRepoByProjectName(target.name);
-        if (repo) {
-          await editPanel(ctx, status.message_id, panel({
-            heading: '<b>DELETE WEB</b>',
-            body: `🛰️ Platform: <b>${escapeHtml(platformLabel)}</b>\n🌐 Project: <code>${escapeHtml(target.name)}</code>\n✅ Website ${escapeHtml(platformLabel)} dihapus.\n\n⏳ Menghapus repository…`,
-          }));
-          await deleteGithubRepo(repo.owner.login, repo.name);
-          repoStatus = '✅ Ikut dihapus';
-        }
-      } catch (repoError) {
-        repoStatus = `⚠️ Gagal dihapus: ${errorMessage(repoError)}`;
-      }
-
-      await editPanel(ctx, status.message_id, panel({
-        heading: '<b>WEB DIHAPUS ✅</b>',
-        box: infoBox([
-          ['📦 Project', escapeHtml(target.name)],
-          ['🛰️ Platform', escapeHtml(platformLabel)],
-          ['🌐 Website', '✅ Dihapus'],
-          ['📁 Repository', escapeHtml(repoStatus)],
-        ]),
-      }), homeButton());
-    } catch (error) {
-      await editPanel(ctx, status.message_id, panel({ heading: '<b>DELETE GAGAL ❌</b>', body: `<code>${escapeHtml(errorMessage(error))}</code>` }), homeButton());
-    }
-    return;
-  }
-
-  if (session.type === 'encrypt' && session.step === 'password') {
-    session.password = text;
-    session.step = 'confirm';
-    sessions.set(id, session);
-    await sendPrompt(ctx, 'Encrypt HTML', '🔐 <b>Langkah 3 dari 3 — Konfirmasi</b>\n\nKetik ulang password yang sama persis untuk konfirmasi.', session);
-    return;
-  }
-
-  if (session.type === 'encrypt' && session.step === 'confirm') {
-    if (text !== session.password) {
-      await sendPrompt(ctx, 'Encrypt HTML', '❌ <b>Password tidak sama.</b>\n\nKirim ulang password yang benar (harus sama persis dengan langkah sebelumnya).', session);
-      return;
-    }
-    sessions.delete(id);
-    const encrypted = encryptedHtml(session.fileBuffer.toString('utf8'), session.password);
-    await ctx.replyWithDocument({ source: Buffer.from(encrypted, 'utf8'), filename: `${session.fileName.replace(/\.html?$/i, '')}-encrypted.html` }, { caption: '✅ HTML berhasil dienkripsi dengan AES-256.' });
-    await sendPanel(ctx, panel({
-      heading: '<b>ENCRYPT SELESAI ✅</b>',
-      body: 'File terenkripsi sudah dikirim di atas. Simpan passwordnya baik-baik — tanpa password, isi file tidak bisa dibuka lagi.',
-    }), homeButton());
-    return;
-  }
-
-  if ((session.type === 'deploy_html' || session.type === 'deploy_zip') && session.step === 'env_key') {
-    const key = text.trim().replace(/\s+/g, '_').toUpperCase();
-    if (!key || !/^[A-Z_][A-Z0-9_]*$/.test(key)) {
-      await sendPrompt(ctx, 'Tambah .env', '❌ <b>KEY tidak valid.</b>\n\nGunakan huruf/angka/underscore saja, contoh: <code>TOKEN_GITHUB</code>. Kirim ulang KEY-nya.', session);
-      return;
-    }
-    session.pendingEnvKey = key;
-    session.step = 'env_value';
-    sessions.set(id, session);
-    await sendPrompt(ctx, 'Tambah .env', `🔒 <b>Kirim VALUE</b> untuk <code>${escapeHtml(key)}</code>`, session);
-    return;
-  }
-
-  if ((session.type === 'deploy_html' || session.type === 'deploy_zip') && session.step === 'env_value') {
-    session.envVars = session.envVars || [];
-    session.envVars.push({ key: session.pendingEnvKey, value: text });
-    delete session.pendingEnvKey;
-    session.step = 'env_more';
-    sessions.set(id, session);
-    const old = sessions.get(id);
-    if (old?.controlMessageId) await safeDeleteMessage(ctx, ctx.chat.id, old.controlMessageId);
-    const message = await sendPanel(ctx, panel({
-      heading: '<b>Tambah .env</b>',
-      box: infoBox(session.envVars.map((e) => [`🔑 ${escapeHtml(e.key)}`, '<i>tersimpan</i>'])),
-      body: 'Mau tambah environment variable lagi?',
-    }), Markup.inlineKeyboard([
-      [Markup.button.callback('➕  Tambah Lagi', 'env_more_add'), Markup.button.callback('✅  Selesai', 'env_more_done')],
-    ]));
-    session.controlMessageId = message.message_id;
-    sessions.set(id, session);
-    return;
-  }
-
-  if (session.type === 'generate_bot' && session.step === 'gb_env_key') {
-    const key = text.trim().replace(/\s+/g, '_').toUpperCase();
-    if (!key || !/^[A-Z_][A-Z0-9_]*$/.test(key)) {
-      await sendPrompt(ctx, 'Generate Bot — .env', '❌ <b>KEY tidak valid.</b>\n\nGunakan huruf/angka/underscore saja, contoh: <code>TOKEN_BOT</code>. Kirim ulang KEY-nya.', session);
-      return;
-    }
-    session.pendingEnvKey = key;
-    session.step = 'gb_env_value';
-    sessions.set(id, session);
-    await sendPrompt(ctx, 'Generate Bot — .env', `🔒 <b>Kirim VALUE</b> untuk <code>${escapeHtml(key)}</code>`, session);
-    return;
-  }
-
-  if (session.type === 'generate_bot' && session.step === 'gb_env_value') {
-    session.envVars = session.envVars || [];
-    session.envVars.push({ key: session.pendingEnvKey, value: text });
-    delete session.pendingEnvKey;
-    session.step = 'gb_env_more';
-    sessions.set(id, session);
-    const old = sessions.get(id);
-    if (old?.controlMessageId) await safeDeleteMessage(ctx, ctx.chat.id, old.controlMessageId);
-    const message = await sendPanel(ctx, panel({
-      heading: '<b>Generate Bot — .env</b>',
-      box: infoBox(session.envVars.map((e) => [`🔑 ${escapeHtml(e.key)}`, '<i>tersimpan</i>'])),
-      body: 'Mau tambah environment variable lagi?',
-    }), Markup.inlineKeyboard([
-      [Markup.button.callback('➕  Tambah Lagi', 'gb_env_more_add'), Markup.button.callback('✅  Selesai', 'gb_env_more_done')],
-    ]));
-    session.controlMessageId = message.message_id;
-    sessions.set(id, session);
-    return;
-  }
-
-  if (session.type === 'generate_bot' && session.step === 'gb_name') {
-    session.name = repoSafeName(text);
-    session.step = 'gb_deploying';
-    sessions.set(id, session);
-    const status = await sendPanel(ctx, panel({
-      heading: '📊 <b>DASHBOARD LOG</b>',
-      box: infoBox([
-        ['📡 Server', '🔵 <b>PROCESSING</b>'],
-        ['🔧 Mode', 'Generate Bot'],
-        ['📦 Nama Bot', `<code>${escapeHtml(session.name)}</code>`],
-        ['🔐 .env', `<b>${session.envVars?.length || 0}</b> variable`],
-        ['🔄 Progress', `<code>${progressBar(0)}</code> 0%`],
-        ['📝 Activity', 'Memulai proses…'],
-      ]),
-      footer: 'Proses membutuhkan waktu, jadi mohon\nuntuk sabar.....',
-    }));
-    await runGenerateBot(ctx, session, status);
-    return;
-  }
-
-  if ((session.type === 'deploy_html' || session.type === 'deploy_zip') && session.step === 'name') {
-    session.name = repoSafeName(text);
-    session.step = 'deploying';
-    sessions.set(id, session);
-    const status = await sendPanel(ctx, panel({
-      heading: '📊 <b>DASHBOARD LOG</b>',
-      box: infoBox([
-        ['📡 Server', '🔵 <b>PROCESSING</b>'],
-        ['🛰️ Platform', escapeHtml(session.platform === 'netlify' ? 'Netlify' : 'Vercel')],
-        ['🔧 Mode', escapeHtml(session.type === 'deploy_zip' ? 'Deploy ZIP' : 'Deploy HTML')],
-        ['📦 Nama Web', `<code>${escapeHtml(session.name)}</code>`],
-        ['🔄 Progress', `<code>${progressBar(0)}</code> 0%`],
-        ['📝 Activity', 'Memulai proses…'],
-      ]),
-      footer: 'Proses membutuhkan waktu, jadi mohon\nuntuk sabar.....',
-    }));
-    await runDeployment(ctx, session, status);
-    return;
-  }
-
-  if (session.type === 'deploy_html' || session.type === 'deploy_zip') {
-    await sendPrompt(ctx, 'Deploy', 'Tahap ini belum meminta nama website. Ikuti instruksi terakhir dari bot di atas, atau tekan tombol Menu Utama untuk mengulang.', session);
-  }
-});
-
-bot.on('photo', async (ctx) => {
-  const id = uid(ctx);
-  const session = sessions.get(id);
-  if (!session || session.type !== 'photo_url' || session.step !== 'file') return;
-
-  if (session.controlMessageId) await safeDeleteMessage(ctx, ctx.chat.id, session.controlMessageId);
-
-  try {
-    // Ambil resolusi terbesar yang dikirim Telegram (foto biasa otomatis
-    // dikompres Telegram jadi JPEG — untuk kualitas asli, sarankan user
-    // kirim sebagai File/Dokumen, sudah dijelaskan di prompt sebelumnya).
-    const sizes = ctx.message.photo;
-    const largest = sizes[sizes.length - 1];
-    const buffer = await downloadTelegramFile(ctx, largest.file_id);
-    const fileName = `foto-${Date.now()}.jpg`;
-    sessions.delete(id);
-
-    const status = await sendPanel(ctx, panel({
-      heading: '📊 <b>DASHBOARD LOG</b>',
-      box: infoBox([
-        ['📡 Server', '🔵 <b>PROCESSING</b>'],
-        ['🔧 Mode', 'Foto ke URL'],
-        ['🖼️ File', `<code>${escapeHtml(fileName)}</code>`],
-        ['🔄 Progress', `<code>${progressBar(0)}</code> 0%`],
-        ['📝 Activity', 'Memulai proses…'],
-      ]),
-      footer: 'Proses membutuhkan waktu, jadi mohon\nuntuk sabar.....',
-    }));
-    await runPhotoUpload(ctx, [{ path: fileName, buffer }], status);
-  } catch (error) {
-    sessions.delete(id);
-    await sendPrompt(ctx, 'Foto ke URL', `❌ <b>Gagal mengambil foto dari Telegram.</b>\n\n<code>${escapeHtml(errorMessage(error))}</code>`, { type: 'photo_url', step: 'file' });
-  }
-});
-
-bot.on('document', async (ctx) => {
-  const id = uid(ctx);
-  const session = sessions.get(id);
-  if (!session) return;
-  const document = ctx.message.document;
-  const fileName = document.file_name || 'file';
-
-  if (session.controlMessageId) await safeDeleteMessage(ctx, ctx.chat.id, session.controlMessageId);
-
-  if (session.type === 'photo_url' && session.step === 'file') {
-    const mimeType = document.mime_type || '';
-    const extFromMime = IMAGE_MIME_EXT[mimeType.toLowerCase()];
-    const looksLikeImageName = /\.(png|jpe?g|gif|webp|svg|ico)$/i.test(fileName);
-    if (!mimeType.startsWith('image/') && !looksLikeImageName) {
-      await sendPrompt(ctx, 'Foto ke URL', '❌ <b>Format tidak didukung.</b>\n\nKirim gambar dengan format PNG, JPG, GIF, WEBP, SVG, atau ICO.', session);
-      return;
-    }
-    try {
-      const buffer = await downloadTelegramFile(ctx, document.file_id);
-      const safeName = sanitizeImageFileName(fileName, extFromMime);
-      sessions.delete(id);
-
-      const status = await sendPanel(ctx, panel({
-        heading: '📊 <b>DASHBOARD LOG</b>',
-        box: infoBox([
-          ['📡 Server', '🔵 <b>PROCESSING</b>'],
-          ['🔧 Mode', 'Foto ke URL'],
-          ['🖼️ File', `<code>${escapeHtml(safeName)}</code>`],
-          ['🔄 Progress', `<code>${progressBar(0)}</code> 0%`],
-          ['📝 Activity', 'Memulai proses…'],
-        ]),
-        footer: 'Proses membutuhkan waktu, jadi mohon\nuntuk sabar.....',
-      }));
-      await runPhotoUpload(ctx, [{ path: safeName, buffer }], status);
-    } catch (error) {
-      await sendPrompt(ctx, 'Foto ke URL', `❌ <b>Gagal mengambil file dari Telegram.</b>\n\n<code>${escapeHtml(errorMessage(error))}</code>`, session);
-    }
-    return;
-  }
-
-  if (session.type === 'audio_url' && session.step === 'file') {
-    const mimeType = document.mime_type || '';
-    const extFromMime = AUDIO_MIME_EXT[mimeType.toLowerCase()];
-    const looksLikeAudioName = /\.(mp3|wav|ogg|m4a|aac|flac)$/i.test(fileName);
-    if (!mimeType.startsWith('audio/') && !looksLikeAudioName) {
-      await sendPrompt(ctx, 'Audio ke URL', '❌ <b>Format tidak didukung.</b>\n\nKirim audio dengan format MP3, WAV, OGG, M4A, AAC, atau FLAC.', session);
-      return;
-    }
-    try {
-      const buffer = await downloadTelegramFile(ctx, document.file_id);
-      const safeName = sanitizeImageFileName(fileName, extFromMime || 'mp3', 'audio');
-      sessions.delete(id);
-
-      const status = await sendPanel(ctx, panel({
-        heading: '📊 <b>DASHBOARD LOG</b>',
-        box: infoBox([
-          ['📡 Server', '🔵 <b>PROCESSING</b>'],
-          ['🔧 Mode', 'Audio ke URL'],
-          ['🎵 File', `<code>${escapeHtml(safeName)}</code>`],
-          ['🔄 Progress', `<code>${progressBar(0)}</code> 0%`],
-          ['📝 Activity', 'Memulai proses…'],
-        ]),
-        footer: 'Proses membutuhkan waktu, jadi mohon\nuntuk sabar.....',
-      }));
-      await runFileToUrl(ctx, [{ path: safeName, buffer }], status, 'audio');
-    } catch (error) {
-      await sendPrompt(ctx, 'Audio ke URL', `❌ <b>Gagal mengambil file dari Telegram.</b>\n\n<code>${escapeHtml(errorMessage(error))}</code>`, session);
-    }
-    return;
-  }
-
-  if (session.type === 'generate_bot' && session.step === 'file') {
-    if (!/\.zip$/i.test(fileName)) {
-      await sendPrompt(ctx, 'Generate Bot', '❌ <b>Format salah.</b>\n\nMenu ini hanya menerima file <code>.zip</code>. Silakan kirim ulang file yang sesuai.', session);
-      return;
-    }
-    try {
-      const buffer = await downloadTelegramFile(ctx, document.file_id);
-      const files = await extractZipGeneric(buffer);
-      const hasPackageJson = files.some((f) => f.path.toLowerCase() === 'package.json');
-      if (!hasPackageJson) {
-        await sendPrompt(ctx, 'Generate Bot', '❌ <b>Tidak ditemukan <code>package.json</code>.</b>\n\nProject bot wajib punya <code>package.json</code> di root ZIP (atau di dalam satu folder pembungkus tunggal). Kirim ulang ZIP yang sesuai.', session);
-        return;
-      }
-      session.files = files;
-
-      const detected = detectGenerateBotWebhookPath(files);
-      if (detected.path) {
-        session.webhookPath = detected.path;
-        await startGenerateBotEnvCollection(ctx, session, `📄 ZIP OK (${files.length} file).\n🧩 Webhook terdeteksi: <code>${escapeHtml(detected.path)}</code>\n<i>Sumber: ${escapeHtml(detected.source)}</i>`);
-      } else if (detected.candidates && detected.candidates.length > 1) {
-        session.step = 'pick_webhook_file';
-        session.webhookCandidates = detected.candidates;
-        sessions.set(id, session);
-        const buttons = detected.candidates.map((p, i) => [Markup.button.callback(p, `gbpick_${i}`)]);
-        const old = sessions.get(id);
-        if (old?.controlMessageId) await safeDeleteMessage(ctx, ctx.chat.id, old.contro
+      await editPanel(ctx, status.message_id, panel({ heading: '<b>GET REPO ZIP GAGAL ❌</b>', body: `<code>${escapeHtml(e
