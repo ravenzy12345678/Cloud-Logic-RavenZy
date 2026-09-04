@@ -2,7 +2,6 @@ const { Telegraf, Markup } = require('telegraf');
 const axios = require('axios');
 const JSZip = require('jszip');
 const crypto = require('crypto');
-const FormData = require('form-data');
 
 const ENV = {
   BOT_TOKEN: process.env.TOKEN_BOT || process.env.BOT_TOKEN,
@@ -54,6 +53,27 @@ const renderHeaders = {
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const uid = (ctx) => Number(ctx.from?.id);
+
+// Multipart/form-data dibangun manual pakai Node bawaan (Buffer + crypto),
+// SENGAJA tidak pakai package npm 'form-data' — supaya bot tidak bisa
+// crash gara-gara 1 dependency kelupaan ke-install (mis. package.json lupa
+// ditimpa). Cuma butuh axios yang memang sudah wajib ada dari awal.
+function buildMultipartFormData(fields) {
+  const boundary = `----CloudLogicBoundary${crypto.randomBytes(16).toString('hex')}`;
+  const chunks = [];
+  for (const field of fields) {
+    let header = `--${boundary}\r\nContent-Disposition: form-data; name="${field.name}"`;
+    if (field.filename) header += `; filename="${field.filename}"`;
+    header += '\r\n';
+    if (field.contentType) header += `Content-Type: ${field.contentType}\r\n`;
+    header += '\r\n';
+    chunks.push(Buffer.from(header, 'utf8'));
+    chunks.push(Buffer.isBuffer(field.value) ? field.value : Buffer.from(String(field.value), 'utf8'));
+    chunks.push(Buffer.from('\r\n', 'utf8'));
+  }
+  chunks.push(Buffer.from(`--${boundary}--\r\n`, 'utf8'));
+  return { body: Buffer.concat(chunks), contentType: `multipart/form-data; boundary=${boundary}` };
+}
 
 function escapeHtml(value) {
   return String(value ?? '').replace(/[&<>"']/g, (ch) => ({
@@ -685,12 +705,13 @@ async function deployZipToNetlifyBuilds(siteId, zipBuffer) {
   // punya bug lama di Netlify: HTML kadang ke-serve sebagai teks mentah
   // (Content-Type salah), bukan di-render sebagai halaman web. Build API
   // ini yang resmi direkomendasikan Netlify untuk deploy otomatis via tools.
-  const form = new FormData();
-  form.append('title', 'Cloud Logic deployment');
-  form.append('zip', zipBuffer, { filename: 'site.zip', contentType: 'application/zip' });
+  const { body, contentType } = buildMultipartFormData([
+    { name: 'title', value: 'Cloud Logic deployment' },
+    { name: 'zip', value: zipBuffer, filename: 'site.zip', contentType: 'application/zip' },
+  ]);
 
-  const response = await axios.post(`${NETLIFY_API}/sites/${encodeURIComponent(siteId)}/builds`, form, {
-    headers: { ...netlifyHeaders, ...form.getHeaders() },
+  const response = await axios.post(`${NETLIFY_API}/sites/${encodeURIComponent(siteId)}/builds`, body, {
+    headers: { ...netlifyHeaders, 'Content-Type': contentType },
     timeout: 120000,
     maxBodyLength: 60 * 1024 * 1024,
     maxContentLength: 60 * 1024 * 1024,
@@ -2497,21 +2518,4 @@ bot.on('text', async (ctx) => {
     const status = await sendPanel(ctx, panel({ heading: '<b>GET REPO ZIP</b>', body: '⏳ Memeriksa repository…' }));
     try {
       const { owner, repo } = parseGithubRepoUrl(text);
-      const info = await getPublicRepoInfo(owner, repo);
-      if (info.private) throw new Error('Repository ini private, tidak bisa diambil ZIP-nya lewat fitur ini.');
-      await editPanel(ctx, status.message_id, panel({
-        heading: '<b>GET REPO ZIP</b>',
-        body: `📦 <code>${escapeHtml(info.full_name)}</code>\n🌿 Branch: <code>${escapeHtml(info.default_branch)}</code>\n\n⏳ Mengunduh ZIP dari GitHub…`,
-      }));
-      const zipBuffer = await downloadRepoZip(owner, repo, info.default_branch);
-      await ctx.replyWithDocument({ source: zipBuffer, filename: `${info.name}-${info.default_branch}.zip` }, { caption: `✅ Source ZIP dari ${info.full_name}` });
-      await editPanel(ctx, status.message_id, panel({
-        heading: '<b>GET REPO ZIP SELESAI ✅</b>',
-        box: infoBox([
-          ['📦 Repository', escapeHtml(info.full_name)],
-          ['🌿 Branch', escapeHtml(info.default_branch)],
-          ['⭐ Stars', `${info.stargazers_count ?? 0}`],
-        ]),
-      }), homeButton());
-    } catch (error) {
-      await editPanel(ctx, status.message_id, panel({ heading: '<b>GET REPO ZIP GAGAL ❌</b>', body: `<code>${escapeHtml(e
+      const info = await ge
