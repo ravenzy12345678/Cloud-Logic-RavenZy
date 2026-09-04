@@ -2513,9 +2513,81 @@ bot.on('text', async (ctx) => {
     return;
   }
 
-  if (session.type === 'repo_zip' && session.step === 'link') {
+    if (session.type === 'repo_zip' && session.step === 'link') {
     sessions.delete(id);
-    const status = await sendPanel(ctx, panel({ heading: '<b>GET REPO ZIP</b>', body: '⏳ Memeriksa repository…' }));
+
+    const status = await sendPanel(
+      ctx,
+      panel({
+        heading: '<b>GET REPO ZIP</b>',
+        body: '⏳ Memeriksa repository…'
+      })
+    );
+
     try {
       const { owner, repo } = parseGithubRepoUrl(text);
-      const info = await ge
+
+      const info = await getPublicRepoInfo(owner, repo);
+
+      if (info.private) {
+        throw new Error(
+          'Repository ini private, tidak bisa diambil ZIP-nya lewat fitur ini.'
+        );
+      }
+
+      await editPanel(
+        ctx,
+        status.message_id,
+        panel({
+          heading: '<b>GET REPO ZIP</b>',
+          body:
+            `📦 <code>${escapeHtml(info.full_name)}</code>\n` +
+            `🌿 Branch: <code>${escapeHtml(info.default_branch)}</code>\n\n` +
+            `⏳ Mengunduh ZIP dari GitHub…`,
+        })
+      );
+
+      const zipBuffer = await downloadRepoZip(
+        owner,
+        repo,
+        info.default_branch
+      );
+
+      await ctx.replyWithDocument(
+        {
+          source: zipBuffer,
+          filename: `${info.name}-${info.default_branch}.zip`,
+        },
+        {
+          caption: `✅ Source ZIP dari ${info.full_name}`,
+        }
+      );
+
+      await editPanel(
+        ctx,
+        status.message_id,
+        panel({
+          heading: '<b>GET REPO ZIP SELESAI ✅</b>',
+          box: infoBox([
+            ['📦 Repository', escapeHtml(info.full_name)],
+            ['🌿 Branch', escapeHtml(info.default_branch)],
+            ['⭐ Stars', `${info.stargazers_count ?? 0}`],
+          ]),
+        }),
+        homeButton()
+      );
+    } catch (error) {
+      await editPanel(
+        ctx,
+        status.message_id,
+        panel({
+          heading: '<b>GET REPO ZIP GAGAL ❌</b>',
+          body: `<code>${escapeHtml(errorMessage(error))}</code>`,
+        }),
+        homeButton()
+      );
+    }
+
+    return;
+  }
+});
