@@ -14,7 +14,8 @@ const ENV = {
   VERCEL_HOOK: process.env.VERCEL_HOOK,
   VERCEL_TEAM_ID: process.env.VERCEL_TEAM_ID || '',
   NETLIFY_TOKEN: process.env.NETLIFY_TOKEN,
-  RENDER_API_KEY: process.env.RENDER_API_KEY,
+  CLOUDFLARE_API_TOKEN: process.env.CLOUDFLARE_API_TOKEN,
+  CLOUDFLARE_ACCOUNT_ID: process.env.CLOUDFLARE_ACCOUNT_ID,
 };
 
 function requireConfig() {
@@ -32,7 +33,7 @@ let allowedUsers = new Set([OWNER_ID]);
 const GH_API = 'https://api.github.com';
 const VERCEL_API = 'https://api.vercel.com';
 const NETLIFY_API = 'https://api.netlify.com/api/v1';
-const RENDER_API = 'https://api.render.com/v1';
+const CLOUDFLARE_API = 'https://api.cloudflare.com/client/v4';
 const ghHeaders = {
   Accept: 'application/vnd.github+json',
   Authorization: `Bearer ${ENV.GH_TOKEN}`,
@@ -45,10 +46,8 @@ const vercelHeaders = {
 const netlifyHeaders = {
   Authorization: `Bearer ${ENV.NETLIFY_TOKEN}`,
 };
-const renderHeaders = {
-  Authorization: `Bearer ${ENV.RENDER_API_KEY}`,
-  Accept: 'application/json',
-  'Content-Type': 'application/json',
+const cloudflareHeaders = {
+  Authorization: `Bearer ${ENV.CLOUDFLARE_API_TOKEN}`,
 };
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -83,7 +82,7 @@ function escapeHtml(value) {
 
 function platformDisplayName(platform) {
   if (platform === 'netlify') return 'Netlify';
-  if (platform === 'render') return 'Render';
+  if (platform === 'cloudflare') return 'Cloudflare Pages';
   return 'Vercel';
 }
 
@@ -148,9 +147,9 @@ function homeButton() {
 
 function mainMenuMarkup() {
   return Markup.inlineKeyboard([
-    [Markup.button.callback('🚀  Deploy Vercel', 'deploy_vercel'), Markup.button.callback('☁️  Deploy Netlify', 'deploy_netlify')],
-    [Markup.button.callback('🎨  Deploy Render', 'deploy_render')],
-    [Markup.button.callback('🌐  Get Source', 'get_source'), Markup.button.callback('🛡️  Encrypt HTML', 'encrypt_html')],
+    [Markup.button.callback('🚀  Deploy Vercel', 'deploy_vercel'), Markup.button.callback('🌐  Deploy Netlify', 'deploy_netlify')],
+    [Markup.button.callback('☁️  Deploy Cloudflare', 'deploy_cloudflare')],
+    [Markup.button.callback('📄  Get Source', 'get_source'), Markup.button.callback('🛡️  Encrypt HTML', 'encrypt_html')],
     [Markup.button.callback('🖼️  Foto ke URL', 'photo_url'), Markup.button.callback('🎵  Audio ke URL', 'audio_url')],
     [Markup.button.callback('📸  Screenshot URL', 'screenshot_url'), Markup.button.callback('📦  Get Repo ZIP', 'repo_zip')],
     [Markup.button.callback('🔎  Cari Repo GitHub', 'search_repo'), Markup.button.callback('🤖  Generate Bot', 'generate_bot')],
@@ -748,171 +747,159 @@ async function waitForNetlifyDeploy(deployId, timeoutMs = 180000, onStatus) {
   throw new Error('Deploy Netlify belum selesai dalam 3 menit. Periksa lagi beberapa saat lagi.');
 }
 
-// ─────────────────────────────────────────────
-// RENDER — deploy static site dari repo GitHub. Beda dari Vercel/Netlify:
-// Render TIDAK punya cara "kirim file langsung dapat link", dia WAJIB
-// tarik dari repo Git. Jadi untuk Render, backup ke GitHub yang biasanya
-// opsional di platform lain, di sini WAJIB berhasil dulu.
-// ─────────────────────────────────────────────
-
-async function getRenderOwnerId() {
-  if (!ENV.RENDER_API_KEY) throw new Error('RENDER_API_KEY belum diatur di environment variable bot.');
-  const response = await axios.get(`${RENDER_API}/owners`, {
-    headers: renderHeaders,
-    params: { limit: 1 },
-    timeout: 20000,
-  });
-  const list = response.data;
-  const first = Array.isArray(list) ? list[0] : null;
-  const ownerId = first?.owner?.id || first?.id;
-  if (!ownerId) throw new Error('Tidak menemukan workspace Render dari API key ini.');
-  return ownerId;
-}
-
-async function createRenderStaticSite(name, repoUrl, branch) {
-  const ownerId = await getRenderOwnerId();
-  const payload = {
-    type: 'static_site',
-    name: projectSafeName(name),
-    ownerId,
-    repo: repoUrl,
-    branch: branch || 'main',
-    autoDeploy: 'yes',
-    serviceDetails: {
-      publishPath: '.',
-    },
-  };
-  const response = await axios.post(`${RENDER_API}/services`, payload, {
-    headers: renderHeaders,
-    timeout: 30000,
-  });
-  return response.data?.service || response.data;
-}
-
-function deriveNodeStartCommand(files) {
-  const pkgFile = files.find((f) => f.path.toLowerCase() === 'package.json');
-  if (pkgFile) {
-    try {
-      const pkg = JSON.parse(pkgFile.buffer.toString('utf8'));
-      if (pkg?.scripts?.start) return 'npm start';
-      if (typeof pkg?.main === 'string' && pkg.main.trim()) return `node ${pkg.main.trim()}`;
-    } catch (_) {
-      // package.json tidak valid JSON — pakai fallback
-    }
-  }
-  return 'node index.js';
-}
-
-async function createRenderWebService(name, repoUrl, branch, envVars, startCommand) {
-  const ownerId = await getRenderOwnerId();
-  const payload = {
-    type: 'web_service',
-    name: projectSafeName(name),
-    ownerId,
-    repo: repoUrl,
-    branch: branch || 'main',
-    autoDeploy: 'yes',
-    envVars: (envVars || []).map((e) => ({ key: e.key, value: e.value })),
-    serviceDetails: {
-      env: 'node',
-      plan: 'free',
-      buildCommand: 'npm install',
-      startCommand,
-    },
-  };
-  const response = await axios.post(`${RENDER_API}/services`, payload, {
-    headers: renderHeaders,
-    timeout: 30000,
-  });
-  return response.data?.service || response.data;
-}
-
-async function getRenderLatestDeploy(serviceId) {
-  const response = await axios.get(`${RENDER_API}/services/${encodeURIComponent(serviceId)}/deploys`, {
-    headers: renderHeaders,
-    params: { limit: 1 },
-    timeout: 20000,
-  });
-  const list = response.data;
-  const first = Array.isArray(list) ? list[0] : null;
-  return first?.deploy || first || null;
-}
-
-async function getRenderDeploy(serviceId, deployId) {
-  const response = await axios.get(`${RENDER_API}/services/${encodeURIComponent(serviceId)}/deploys/${encodeURIComponent(deployId)}`, {
-    headers: renderHeaders,
-    timeout: 20000,
-  });
-  return response.data;
-}
-
-async function waitForRenderDeploy(serviceId, timeoutMs = 300000, onStatus) {
-  const start = Date.now();
-  let deployId = null;
-
-  // Deploy pertama otomatis terpicu saat service dibuat, tapi butuh
-  // beberapa detik sebelum muncul di daftar deploys — tunggu dulu.
-  while (!deployId && Date.now() - start < 30000) {
-    const latest = await getRenderLatestDeploy(serviceId);
-    if (latest?.id) deployId = latest.id;
-    else await sleep(3000);
-  }
-  if (!deployId) throw new Error('Deploy Render tidak kunjung terdeteksi setelah service dibuat.');
-
-  let lastStatus = '';
-  while (Date.now() - start < timeoutMs) {
-    const deploy = await getRenderDeploy(serviceId, deployId);
-    const status = deploy.status || '';
-    if (status !== lastStatus) {
-      lastStatus = status;
-      if (onStatus) await onStatus(status, deploy);
-    }
-    if (status === 'live') return deploy;
-    if (['build_failed', 'update_failed', 'canceled', 'deactivated'].includes(status)) return deploy;
-    await sleep(5000);
-  }
-  throw new Error('Deploy Render belum selesai dalam waktu yang ditentukan. Cek dashboard Render untuk detail build.');
-}
-
-async function getRenderServiceUrl(serviceId, fallbackName) {
-  try {
-    const response = await axios.get(`${RENDER_API}/services/${encodeURIComponent(serviceId)}`, {
-      headers: renderHeaders,
-      timeout: 20000,
-    });
-    const data = response.data;
-    const url = data?.serviceDetails?.url || data?.service?.serviceDetails?.url || data?.url;
-    if (url) return url;
-  } catch (_) {}
-  return `https://${projectSafeName(fallbackName)}.onrender.com`;
-}
-
-async function findRenderServiceByName(name) {
-  const response = await axios.get(`${RENDER_API}/services`, {
-    headers: renderHeaders,
-    params: { name: projectSafeName(name), limit: 5 },
-    timeout: 20000,
-  });
-  const list = response.data;
-  const first = Array.isArray(list) ? list[0] : null;
-  return first?.service || first || null;
-}
-
-async function deleteRenderService(serviceId) {
-  await axios.delete(`${RENDER_API}/services/${encodeURIComponent(serviceId)}`, {
-    headers: renderHeaders,
-    timeout: 30000,
-  });
-}
-
-async function checkRender() {
-  const r = await axios.get(`${RENDER_API}/owners`, { headers: renderHeaders, params: { limit: 1 }, timeout: 20000 });
-  return r.data;
-}
-
 async function checkNetlify() {
   const r = await axios.get(`${NETLIFY_API}/user`, { headers: netlifyHeaders, timeout: 30000 });
   return r.data;
+}
+
+// ─────────────────────────────────────────────
+// CLOUDFLARE PAGES — deploy langsung via Direct Upload (bukan Git), pakai
+// endpoint resmi Cloudflare Pages REST API. Tidak pernah pakai GitHub OAuth
+// untuk provider ini — Direct Upload sudah cukup, sesuai instruksi.
+// ─────────────────────────────────────────────
+
+function validateCloudflareEnv() {
+  if (!ENV.CLOUDFLARE_API_TOKEN || !ENV.CLOUDFLARE_ACCOUNT_ID) {
+    throw new Error('CLOUDFLARE_API_TOKEN dan/atau CLOUDFLARE_ACCOUNT_ID belum diatur di environment variable bot.');
+  }
+}
+
+async function getCloudflarePagesProject(name) {
+  validateCloudflareEnv();
+  try {
+    const response = await axios.get(
+      `${CLOUDFLARE_API}/accounts/${encodeURIComponent(ENV.CLOUDFLARE_ACCOUNT_ID)}/pages/projects/${encodeURIComponent(name)}`,
+      { headers: cloudflareHeaders, timeout: 20000 }
+    );
+    if (response.data?.success === false) return null;
+    return response.data?.result || null;
+  } catch (error) {
+    if (error.response?.status === 404) return null;
+    throw error;
+  }
+}
+
+async function createCloudflarePagesProject(name) {
+  validateCloudflareEnv();
+  const response = await axios.post(
+    `${CLOUDFLARE_API}/accounts/${encodeURIComponent(ENV.CLOUDFLARE_ACCOUNT_ID)}/pages/projects`,
+    { name: projectSafeName(name), production_branch: 'main' },
+    { headers: { ...cloudflareHeaders, 'Content-Type': 'application/json' }, timeout: 30000 }
+  );
+  if (response.data?.success === false) {
+    const message = response.data?.errors?.map((e) => e.message).join('; ') || 'Gagal membuat project Cloudflare Pages.';
+    throw new Error(message);
+  }
+  return response.data?.result;
+}
+
+async function ensureCloudflarePagesProject(name) {
+  const safeName = projectSafeName(name);
+  const existing = await getCloudflarePagesProject(safeName);
+  if (existing) return existing;
+  return createCloudflarePagesProject(safeName);
+}
+
+function sha256Hex(buffer) {
+  return crypto.createHash('sha256').update(buffer).digest('hex');
+}
+
+async function createCloudflarePagesDeployment(projectName, files) {
+  validateCloudflareEnv();
+  const manifest = {};
+  const parts = [];
+
+  for (const file of files) {
+    const cleanPath = file.path.replace(/^\/+/, '');
+    const hash = sha256Hex(file.buffer);
+    manifest[cleanPath] = hash;
+    parts.push({ name: cleanPath, value: file.buffer, filename: cleanPath, contentType: 'application/octet-stream' });
+  }
+
+  parts.unshift({ name: 'manifest', value: JSON.stringify(manifest) });
+  parts.unshift({ name: 'branch', value: 'main' });
+
+  const { body, contentType } = buildMultipartFormData(parts);
+
+  const response = await axios.post(
+    `${CLOUDFLARE_API}/accounts/${encodeURIComponent(ENV.CLOUDFLARE_ACCOUNT_ID)}/pages/projects/${encodeURIComponent(projectName)}/deployments`,
+    body,
+    {
+      headers: { ...cloudflareHeaders, 'Content-Type': contentType },
+      timeout: 120000,
+      maxBodyLength: 55 * 1024 * 1024,
+      maxContentLength: 55 * 1024 * 1024,
+    }
+  );
+
+  if (response.data?.success === false) {
+    const message = response.data?.errors?.map((e) => e.message).join('; ') || 'Deployment Cloudflare Pages gagal dibuat.';
+    throw new Error(message);
+  }
+  return response.data?.result;
+}
+
+async function getCloudflareDeployment(projectName, deploymentId) {
+  validateCloudflareEnv();
+  const response = await axios.get(
+    `${CLOUDFLARE_API}/accounts/${encodeURIComponent(ENV.CLOUDFLARE_ACCOUNT_ID)}/pages/projects/${encodeURIComponent(projectName)}/deployments/${encodeURIComponent(deploymentId)}`,
+    { headers: cloudflareHeaders, timeout: 20000 }
+  );
+  if (response.data?.success === false) {
+    const message = response.data?.errors?.map((e) => e.message).join('; ') || 'Gagal mengambil status deployment Cloudflare.';
+    throw new Error(message);
+  }
+  return response.data?.result;
+}
+
+async function waitForCloudflareDeployment(projectName, deploymentId, timeoutMs = 180000, onStatus) {
+  const start = Date.now();
+  let lastStage = '';
+  while (Date.now() - start < timeoutMs) {
+    const deployment = await getCloudflareDeployment(projectName, deploymentId);
+    const stages = deployment?.stages || [];
+    const current = stages.slice().reverse().find((s) => s.status === 'active' || s.status === 'failure') || stages[stages.length - 1];
+    const stageName = current?.name || '';
+    const stageStatus = current?.status || '';
+    if (stageName !== lastStage) {
+      lastStage = stageName;
+      if (onStatus) await onStatus(stageName, deployment);
+    }
+    const deployStage = stages.find((s) => s.name === 'deploy');
+    if (deployStage?.status === 'success') return { ...deployment, latest_stage: deployStage };
+    if (stageStatus === 'failure') return { ...deployment, latest_stage: current };
+    await sleep(4000);
+  }
+  throw new Error('Deployment Cloudflare Pages belum selesai dalam waktu yang ditentukan. Cek dashboard Cloudflare untuk detail.');
+}
+
+function getCloudflarePagesUrl(projectName) {
+  return `https://${projectSafeName(projectName)}.pages.dev`;
+}
+
+async function deleteCloudflarePagesProject(name) {
+  validateCloudflareEnv();
+  const response = await axios.delete(
+    `${CLOUDFLARE_API}/accounts/${encodeURIComponent(ENV.CLOUDFLARE_ACCOUNT_ID)}/pages/projects/${encodeURIComponent(name)}`,
+    { headers: cloudflareHeaders, timeout: 30000 }
+  );
+  if (response.data?.success === false) {
+    const message = response.data?.errors?.map((e) => e.message).join('; ') || 'Gagal menghapus project Cloudflare Pages.';
+    throw new Error(message);
+  }
+}
+
+async function checkCloudflare() {
+  validateCloudflareEnv();
+  const response = await axios.get(
+    `${CLOUDFLARE_API}/accounts/${encodeURIComponent(ENV.CLOUDFLARE_ACCOUNT_ID)}/pages/projects`,
+    { headers: cloudflareHeaders, params: { per_page: 1 }, timeout: 20000 }
+  );
+  if (response.data?.success === false) {
+    const message = response.data?.errors?.map((e) => e.message).join('; ') || 'Cloudflare API menolak token ini.';
+    throw new Error(message);
+  }
+  return response.data;
 }
 
 // ─────────────────────────────────────────────
@@ -1205,25 +1192,25 @@ async function deleteNetlifySite(site) {
   });
 }
 
-async function resolveRenderServiceFromUrl(urlInput) {
-  if (!ENV.RENDER_API_KEY) throw new Error('RENDER_API_KEY belum diatur di environment variable bot.');
+async function resolveCloudflarePagesProjectFromUrl(urlInput) {
+  validateCloudflareEnv();
   let value = String(urlInput).trim();
   if (!/^https?:\/\//i.test(value)) value = `https://${value}`;
   let host;
   try {
     host = new URL(value).hostname.toLowerCase();
   } catch (_) {
-    throw new Error('Link tidak valid. Kirim URL lengkap, contoh: https://nama-web.onrender.com');
+    throw new Error('Link tidak valid. Kirim URL lengkap, contoh: https://nama-web.pages.dev');
   }
-  if (!host.endsWith('.onrender.com')) {
-    throw new Error('Link harus berupa domain *.onrender.com hasil deploy Cloud Logic.');
+  if (!host.endsWith('.pages.dev')) {
+    throw new Error('Link harus berupa domain *.pages.dev hasil deploy Cloud Logic.');
   }
-  const baseSlug = host.slice(0, -'.onrender.com'.length);
-  const service = await findRenderServiceByName(baseSlug);
-  if (!service) {
-    throw new Error(`Service Render untuk "${host}" tidak ditemukan. Pastikan link sesuai hasil deploy Cloud Logic.`);
+  const baseSlug = host.slice(0, -'.pages.dev'.length);
+  const project = await getCloudflarePagesProject(baseSlug);
+  if (!project) {
+    throw new Error(`Project Cloudflare Pages untuk "${host}" tidak ditemukan. Pastikan link sesuai hasil deploy Cloud Logic.`);
   }
-  return service;
+  return project;
 }
 
 async function resolveDeployTargetFromUrl(urlInput) {
@@ -1244,16 +1231,16 @@ async function resolveDeployTargetFromUrl(urlInput) {
     const site = await resolveNetlifySiteFromUrl(urlInput);
     return { platform: 'netlify', name: site.name, data: site };
   }
-  if (host.endsWith('.onrender.com')) {
-    const service = await resolveRenderServiceFromUrl(urlInput);
-    return { platform: 'render', name: service.name, data: service };
+  if (host.endsWith('.pages.dev')) {
+    const project = await resolveCloudflarePagesProjectFromUrl(urlInput);
+    return { platform: 'cloudflare', name: project.name, data: project };
   }
-  throw new Error('Link harus berupa domain *.vercel.app, *.netlify.app, atau *.onrender.com hasil deploy Cloud Logic.');
+  throw new Error('Link harus berupa domain *.vercel.app, *.netlify.app, atau *.pages.dev hasil deploy Cloud Logic.');
 }
 
 async function deleteDeployTarget(target) {
   if (target.platform === 'netlify') return deleteNetlifySite(target.data);
-  if (target.platform === 'render') return deleteRenderService(target.data.id);
+  if (target.platform === 'cloudflare') return deleteCloudflarePagesProject(target.data.name);
   return deleteVercelProject(target.data);
 }
 
@@ -1542,32 +1529,30 @@ async function publishToNetlify(name, files, render) {
   return final.ssl_url || final.url || site.ssl_url || site.url;
 }
 
-async function publishToRender(name, files, render) {
-  // GitHub WAJIB berhasil untuk Render (bukan backup opsional seperti
-  // Vercel/Netlify) — Render cuma bisa deploy dari repo Git, bukan file
-  // langsung.
-  await render(15, 'Membuat repository GitHub (wajib untuk Render)…');
-  const repo = await createGitHubRepo(name);
-  await uploadFilesToNewRepo(repo, files);
+async function publishToCloudflare(name, files, render) {
+  validateCloudflareEnv();
+  await render(20, 'Menyiapkan project Cloudflare Pages…');
+  const project = await ensureCloudflarePagesProject(name);
 
-  await render(40, 'Membuat static site di Render…');
-  const service = await createRenderStaticSite(name, repo.html_url, repo.default_branch || 'main');
-  const serviceId = service?.id;
-  if (!serviceId) throw new Error('Render tidak mengembalikan service id.');
-
-  await render(55, 'Menunggu build & deploy Render…');
-  const finalDeploy = await waitForRenderDeploy(serviceId, 300000, async (status) => {
-    if (status === 'build_in_progress') await render(75, 'Sedang build…');
-    else if (status === 'update_in_progress' || status === 'pre_deploy_in_progress') await render(88, 'Sedang deploy…');
-    else if (status === 'live') await render(96, 'Menyelesaikan…');
-    else await render(65, `Status: ${status || 'memproses'}…`);
-  });
-
-  if (finalDeploy.status !== 'live') {
-    throw new Error(`Build Render berakhir dengan status ${finalDeploy.status || 'gagal'}. Cek dashboard Render untuk log lengkap.`);
+  await render(45, 'Mengunggah berkas ke Cloudflare…');
+  const deployment = await createCloudflarePagesDeployment(project.name, files);
+  const deploymentId = deployment?.id;
+  if (!deploymentId) {
+    throw new Error('Cloudflare tidak mengembalikan deployment id yang valid.');
   }
 
-  return getRenderServiceUrl(serviceId, name);
+  await render(70, 'Menunggu status deployment…');
+  const finalDeployment = await waitForCloudflareDeployment(project.name, deploymentId, 180000, async (stage) => {
+    await render(85, `Status: ${stage || 'memproses'}…`);
+  });
+
+  const latestStage = finalDeployment?.latest_stage?.name || finalDeployment?.stages?.slice(-1)?.[0]?.name;
+  const latestStatus = finalDeployment?.latest_stage?.status || finalDeployment?.stages?.slice(-1)?.[0]?.status;
+  if (latestStage === 'deploy' && latestStatus && latestStatus !== 'success') {
+    throw new Error(`Deployment Cloudflare berakhir dengan status ${latestStatus}. Cek dashboard Cloudflare Pages untuk log lengkap.`);
+  }
+
+  return finalDeployment?.url || getCloudflarePagesUrl(project.name);
 }
 
 // ─────────────────────────────────────────────
@@ -1682,8 +1667,8 @@ async function runPhotoUpload(ctx, files, statusMessage) {
 async function runDeployment(ctx, session, statusMessage) {
   const repoName = repoSafeName(session.name);
   const modeLabel = session.type === 'deploy_zip' ? 'Deploy ZIP' : 'Deploy HTML';
-  const platform = ['netlify', 'render'].includes(session.platform) ? session.platform : 'vercel';
-  const platformLabel = platform === 'netlify' ? 'Netlify' : platform === 'render' ? 'Render' : 'Vercel';
+  const platform = ['netlify', 'cloudflare'].includes(session.platform) ? session.platform : 'vercel';
+  const platformLabel = platformDisplayName(platform);
   const startedAt = Date.now();
 
   const render = async (percent, activity) => {
@@ -1706,22 +1691,18 @@ async function runDeployment(ctx, session, statusMessage) {
   await render(5, 'Menyiapkan berkas…');
 
   try {
-    // Backup ke GitHub: opsional untuk Vercel/Netlify (tidak ditampilkan ke
-    // pengguna, tidak boleh menggagalkan proses). Untuk Render, backup ini
-    // WAJIB dan sudah ditangani langsung di dalam publishToRender (karena
-    // Render cuma bisa deploy dari repo Git, bukan file langsung) — jadi di
-    // sini SENGAJA dilewati untuk platform Render supaya repo tidak dibuat
-    // dua kali.
-    if (platform !== 'render') {
-      try {
-        const repo = await createGitHubRepo(repoName);
-        await uploadFilesToNewRepo(repo, session.files);
-      } catch (_) {
-        // backup gagal, tetap lanjut — bukan kegagalan fatal
-      }
+    // Backup ke GitHub bersifat opsional untuk SEMUA platform (Vercel,
+    // Netlify, Cloudflare Pages) — tidak ditampilkan ke pengguna dan tidak
+    // boleh menggagalkan proses deploy kalau bermasalah, karena ketiganya
+    // deploy langsung dari file, tidak bergantung pada GitHub sama sekali.
+    try {
+      const repo = await createGitHubRepo(repoName);
+      await uploadFilesToNewRepo(repo, session.files);
+    } catch (_) {
+      // backup gagal, tetap lanjut — bukan kegagalan fatal
     }
 
-    const publisher = platform === 'netlify' ? publishToNetlify : platform === 'render' ? publishToRender : publishToVercel;
+    const publisher = platform === 'netlify' ? publishToNetlify : platform === 'cloudflare' ? publishToCloudflare : publishToVercel;
     const url = platform === 'vercel'
       ? await publisher(repoName, session.files, render, session.envVars)
       : await publisher(repoName, session.files, render);
@@ -1775,7 +1756,6 @@ async function runDeployment(ctx, session, statusMessage) {
 // ─────────────────────────────────────────────
 
 async function runGenerateBot(ctx, session, statusMessage) {
-  if (session.platform === 'render') return runGenerateBotRender(ctx, session, statusMessage);
   return runGenerateBotVercel(ctx, session, statusMessage);
 }
 
@@ -1902,96 +1882,6 @@ async function runGenerateBotVercel(ctx, session, statusMessage) {
   }
 }
 
-async function runGenerateBotRender(ctx, session, statusMessage) {
-  const repoName = repoSafeName(session.name);
-  const startedAt = Date.now();
-  const envVars = session.envVars || [];
-
-  const render = async (percent, activity) => {
-    const rows = [
-      ['📡 Server', '🔵 <b>PROCESSING</b>'],
-      ['🛰️ Platform', 'Render'],
-      ['🔧 Mode', 'Generate Bot'],
-      ['📦 Nama Bot', `<code>${escapeHtml(repoName)}</code>`],
-      ['🔐 .env', `<b>${envVars.length}</b> variable`],
-      ['🔄 Progress', `<code>${progressBar(percent)}</code> ${percent}%`],
-      ['📝 Activity', escapeHtml(activity)],
-    ];
-    await editPanel(ctx, statusMessage.message_id, panel({
-      heading: '📊 <b>DASHBOARD LOG</b>',
-      box: infoBox(rows),
-      footer: 'Proses membutuhkan waktu, jadi mohon\nuntuk sabar.....',
-    }));
-  };
-
-  await render(5, 'Menyiapkan berkas…');
-
-  try {
-    // GitHub WAJIB untuk Render (bukan opsional) — sama seperti Deploy Web
-    // ke Render, servicenya cuma bisa ditarik dari repo Git.
-    await render(15, 'Membuat repository GitHub (wajib untuk Render)…');
-    const repo = await createGitHubRepo(repoName);
-    await uploadFilesToNewRepo(repo, session.files);
-
-    const startCommand = deriveNodeStartCommand(session.files);
-    await render(35, `Membuat web service di Render (start: ${startCommand})…`);
-    const service = await createRenderWebService(repoName, repo.html_url, repo.default_branch || 'main', envVars, startCommand);
-    const serviceId = service?.id;
-    if (!serviceId) throw new Error('Render tidak mengembalikan service id.');
-
-    await render(55, 'Menunggu build & deploy Render…');
-    const finalDeploy = await waitForRenderDeploy(serviceId, 300000, async (status) => {
-      if (status === 'build_in_progress') await render(75, 'Sedang build…');
-      else if (status === 'update_in_progress' || status === 'pre_deploy_in_progress') await render(88, 'Menjalankan start command…');
-      else if (status === 'live') await render(96, 'Menyelesaikan…');
-      else await render(65, `Status: ${status || 'memproses'}…`);
-    });
-
-    if (finalDeploy.status !== 'live') {
-      throw new Error(`Build Render berakhir dengan status ${finalDeploy.status || 'gagal'}. Cek dashboard Render untuk log lengkap.`);
-    }
-
-    const baseUrl = await getRenderServiceUrl(serviceId, repoName);
-    const elapsed = formatElapsed(Date.now() - startedAt);
-
-    await recordDeployment({
-      name: repoName,
-      platform: 'render',
-      url: baseUrl,
-      ownerId: uid(ctx),
-      ownerUsername: ctx.from?.username || null,
-      ts: Date.now(),
-    });
-
-    await editPanel(ctx, statusMessage.message_id, panel({
-      heading: '<b>BOT BERHASIL DIBUAT ✅️</b>',
-      box: infoBox([
-        ['📦 Nama', escapeHtml(repoName)],
-        ['🛰️ Platform', 'Render'],
-        ['▶️ Start Command', `<code>${escapeHtml(startCommand)}</code>`],
-        ['🔗 URL Project', `<a href="${escapeHtml(baseUrl)}">${escapeHtml(baseUrl)}</a>`],
-        ['⏰ Waktu', escapeHtml(elapsed)],
-      ]),
-      body: '💡 Kalau bot ini model <b>polling</b>, dia otomatis jalan sendiri begitu server hidup — tidak perlu langkah lain.\nKalau model <b>webhook</b>, kamu perlu <code>setWebhook</code> manual ke URL project di atas + path handler-nya sendiri (tidak didaftarkan otomatis di Render, supaya tidak bentrok kalau ternyata polling).',
-      footer: '🚀  Bot baru siap dipakai',
-    }), homeButton());
-  } catch (error) {
-    const elapsed = formatElapsed(Date.now() - startedAt);
-    await editPanel(ctx, statusMessage.message_id, panel({
-      heading: '<b>GENERATE BOT GAGAL ❌</b>',
-      box: infoBox([
-        ['📦 Nama', escapeHtml(repoName)],
-        ['🛰️ Platform', 'Render'],
-        ['⚠️ Penyebab', escapeHtml(errorMessage(error))],
-        ['⏰ Waktu', escapeHtml(elapsed)],
-      ]),
-      footer: '🔁 Silakan coba lagi dari menu utama',
-    }), homeButton());
-  } finally {
-    sessions.delete(uid(ctx));
-  }
-}
-
 // ─────────────────────────────────────────────
 // COMMANDS & ACTIONS
 // ─────────────────────────────────────────────
@@ -2064,31 +1954,31 @@ bot.action('netlify_zip', async (ctx) => {
   );
 });
 
-bot.action('deploy_render', async (ctx) => {
+bot.action('deploy_cloudflare', async (ctx) => {
   await ctx.answerCbQuery();
   await sendPanel(ctx, panel({
-    heading: '<b>DEPLOY RENDER</b>',
-    body: 'Pilih tipe file yang mau di-deploy:\n\n<i>Catatan: Render deploy dari repo GitHub (bukan file langsung), jadi backup ke GitHub di sini WAJIB berhasil dan build biasanya makan waktu lebih lama dari Vercel/Netlify.</i>',
-  }), fileTypeMarkup('render'));
+    heading: '<b>DEPLOY CLOUDFLARE PAGES</b>',
+    body: 'Pilih tipe file yang mau di-deploy:',
+  }), fileTypeMarkup('cloudflare'));
 });
 
-bot.action('render_html', async (ctx) => {
+bot.action('cloudflare_html', async (ctx) => {
   await ctx.answerCbQuery();
   await sendPrompt(
     ctx,
-    'Deploy HTML — Render',
+    'Deploy HTML — Cloudflare',
     '🚀 <b>Langkah 1 dari 2 — Kirim File</b>\n\nUnggah 1 file dengan ekstensi <code>.html</code> sebagai halaman utama website kamu.\n\n<i>Balas pesan ini dengan mengirim filenya sebagai dokumen (bukan foto).</i>',
-    { type: 'deploy_html', platform: 'render', step: 'file' }
+    { type: 'deploy_html', platform: 'cloudflare', step: 'file' }
   );
 });
 
-bot.action('render_zip', async (ctx) => {
+bot.action('cloudflare_zip', async (ctx) => {
   await ctx.answerCbQuery();
   await sendPrompt(
     ctx,
-    'Deploy ZIP — Render',
+    'Deploy ZIP — Cloudflare',
     '📦 <b>Langkah 1 dari 2 — Kirim File</b>\n\nUnggah 1 file <code>.zip</code> berisi seluruh project website kamu.\n\n⚠️ Wajib ada <code>index.html</code> di root ZIP (atau di dalam satu folder pembungkus tunggal).',
-    { type: 'deploy_zip', platform: 'render', step: 'file' }
+    { type: 'deploy_zip', platform: 'cloudflare', step: 'file' }
   );
 });
 
@@ -2119,7 +2009,7 @@ bot.action('system', async (ctx) => {
   try { await checkGitHub(); rows.push(['🐙 GitHub API', '🟢 <b>Terhubung</b>']); } catch (e) { rows.push(['🐙 GitHub API', `🔴 <code>${escapeHtml(errorMessage(e))}</code>`]); }
   try { await checkVercel(); rows.push(['▲ Vercel API', '🟢 <b>Terhubung</b>']); } catch (e) { rows.push(['▲ Vercel API', `🔴 <code>${escapeHtml(errorMessage(e))}</code>`]); }
   try { await checkNetlify(); rows.push(['☁️ Netlify API', '🟢 <b>Terhubung</b>']); } catch (e) { rows.push(['☁️ Netlify API', `🔴 <code>${escapeHtml(errorMessage(e))}</code>`]); }
-  try { await checkRender(); rows.push(['🎨 Render API', '🟢 <b>Terhubung</b>']); } catch (e) { rows.push(['🎨 Render API', `🔴 <code>${escapeHtml(errorMessage(e))}</code>`]); }
+  try { await checkCloudflare(); rows.push(['☁️ Cloudflare API', '🟢 <b>Terhubung</b>']); } catch (e) { rows.push(['☁️ Cloudflare API', `🔴 <code>${escapeHtml(errorMessage(e))}</code>`]); }
   rows.push(['✈️ Telegram', '🟢 <b>Aktif</b>']);
   await editPanel(ctx, status.message_id, panel({ heading: '<b>SYSTEM STATUS</b>', box: infoBox(rows) }), homeButton());
 });
@@ -2279,35 +2169,11 @@ bot.action('search_repo', async (ctx) => {
 
 bot.action('generate_bot', async (ctx) => {
   await ctx.answerCbQuery();
-  await sendPanel(ctx, panel({
-    heading: '<b>GENERATE BOT</b>',
-    body:
-      'Pilih platform tujuan:\n\n' +
-      '⚡ <b>Vercel</b> — serverless, bot HARUS model webhook (bukan polling). Bot ini otomatis daftarkan webhook-nya kalau ketemu TOKEN_BOT.\n\n' +
-      '🎨 <b>Render</b> — server hidup terus, bisa jalanin bot model <b>polling</b> ATAU webhook. Webhook TIDAK didaftarkan otomatis di Render (biar tidak bentrok kalau bot-nya polling).',
-  }), Markup.inlineKeyboard([
-    [Markup.button.callback('⚡  Vercel', 'gb_platform_vercel'), Markup.button.callback('🎨  Render', 'gb_platform_render')],
-    [Markup.button.callback('🏠  Menu Utama', 'home')],
-  ]));
-});
-
-bot.action('gb_platform_vercel', async (ctx) => {
-  await ctx.answerCbQuery();
   await sendPrompt(
     ctx,
-    'Generate Bot — Vercel',
-    '🤖 <b>Langkah 1 — Kirim ZIP Project Bot</b>\n\nUpload ZIP project bot Node.js (model <b>webhook</b>, bukan polling) yang mau dideploy otomatis.\n\n⚠️ Wajib ada <code>package.json</code> di root ZIP (atau di dalam satu folder pembungkus tunggal).\n\n<i>Struktur folder bebas — jumlah & nama file di dalam <code>api/</code> boleh apa saja, bot akan coba deteksi otomatis mana file handler-nya.</i>',
+    'Generate Bot',
+    '🤖 <b>Langkah 1 — Kirim ZIP Project Bot</b>\n\nUpload ZIP project bot Node.js (model <b>webhook</b>, bukan polling — deploy-nya ke Vercel yang serverless) yang mau dideploy otomatis.\n\n⚠️ Wajib ada <code>package.json</code> di root ZIP (atau di dalam satu folder pembungkus tunggal).\n\n<i>Struktur folder bebas — jumlah & nama file di dalam <code>api/</code> boleh apa saja, bot akan coba deteksi otomatis mana file handler-nya.</i>',
     { type: 'generate_bot', platform: 'vercel', step: 'file' }
-  );
-});
-
-bot.action('gb_platform_render', async (ctx) => {
-  await ctx.answerCbQuery();
-  await sendPrompt(
-    ctx,
-    'Generate Bot — Render',
-    '🤖 <b>Langkah 1 — Kirim ZIP Project Bot</b>\n\nUpload ZIP project bot Node.js (boleh model polling ATAU webhook) yang mau dideploy otomatis.\n\n⚠️ Wajib ada <code>package.json</code> di root ZIP, dengan <code>"start"</code> di bagian <code>scripts</code> (atau field <code>"main"</code> terisi) supaya bot tahu cara menjalankan bot-nya.',
-    { type: 'generate_bot', platform: 'render', step: 'file' }
   );
 });
 
@@ -2409,7 +2275,7 @@ bot.action('delete_web', async (ctx) => {
   await sendPrompt(
     ctx,
     'Delete Web',
-    '🗑️ <b>Kirim Link Website</b>\n\nKirim link website hasil deploy Cloud Logic yang ingin dihapus.\nContoh: <code>https://nama-web.vercel.app</code>, <code>https://nama-web.netlify.app</code>, atau <code>https://nama-web.onrender.com</code>\n\nBot otomatis kenali platform-nya dari link. Website (Vercel/Netlify/Render) dan repository (GitHub) yang cocok akan otomatis ikut terhapus — tidak perlu cari ID atau buka dashboard.',
+    '🗑️ <b>Kirim Link Website</b>\n\nKirim link website hasil deploy Cloud Logic yang ingin dihapus.\nContoh: <code>https://nama-web.vercel.app</code>, <code>https://nama-web.netlify.app</code>, atau <code>https://nama-web.pages.dev</code>\n\nBot otomatis kenali platform-nya dari link. Website (Vercel/Netlify/Cloudflare) dan repository (GitHub) yang cocok akan otomatis ikut terhapus — tidak perlu cari ID atau buka dashboard.',
     { type: 'delete', step: 'link' }
   );
 });
@@ -2860,16 +2726,6 @@ bot.on('document', async (ctx) => {
         return;
       }
       session.files = files;
-
-      if (session.platform === 'render') {
-        // Render server-nya hidup terus (bukan serverless), jadi tidak butuh
-        // deteksi "file handler" khusus seperti Vercel — cukup jalankan
-        // start command project-nya (npm start / node <main>), apapun model
-        // bot-nya (polling atau webhook).
-        session.webhookPath = null;
-        await startGenerateBotEnvCollection(ctx, session, `📄 ZIP OK (${files.length} file), platform Render.`);
-        return;
-      }
 
       const detected = detectGenerateBotWebhookPath(files);
       if (detected.path) {
