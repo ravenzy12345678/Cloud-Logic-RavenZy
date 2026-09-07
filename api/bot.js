@@ -642,21 +642,26 @@ async function getDeployment(deploymentId, teamId) {
 async function getCleanProductionUrl(deploymentId, teamId, projectName) {
   // Deployment yang baru dibuat punya URL unik berisi hash acak
   // (mis. nama-b9gt875u5-user.vercel.app). Alias "bersih" produksi
-  // (nama.vercel.app) baru muncul di endpoint alias terpisah, kadang
-  // butuh beberapa detik setelah status READY. Kita coba ambil,
-  // dengan fallback ke pola nama project kalau belum kebentuk.
-  try {
-    const response = await axios.get(`${VERCEL_API}/v2/deployments/${encodeURIComponent(deploymentId)}/aliases`, {
-      headers: vercelHeaders,
-      params: teamId ? { teamId } : undefined,
-      timeout: 30000,
-    });
-    const aliases = (response.data?.aliases || []).map((a) => a.alias).filter(Boolean);
-    const clean = aliases.find((alias) => alias === `${projectName}.vercel.app`) ||
-      aliases.find((alias) => !/-[a-z0-9]{9,}(-[a-z0-9-]+)?\.vercel\.app$/i.test(alias)) ||
-      aliases[0];
-    if (clean) return clean;
-  } catch (_) {}
+  // (nama.vercel.app) baru muncul di endpoint alias terpisah, dan kadang
+  // butuh beberapa detik setelah status READY sebelum benar-benar muncul
+  // di situ — jadi kita coba beberapa kali dengan jeda, bukan cuma sekali.
+  for (let attempt = 0; attempt < 6; attempt += 1) {
+    try {
+      const response = await axios.get(`${VERCEL_API}/v2/deployments/${encodeURIComponent(deploymentId)}/aliases`, {
+        headers: vercelHeaders,
+        params: teamId ? { teamId } : undefined,
+        timeout: 30000,
+      });
+      const aliases = (response.data?.aliases || []).map((a) => a.alias).filter(Boolean);
+      const exact = aliases.find((alias) => alias === `${projectName}.vercel.app`);
+      if (exact) return exact;
+      const nonHashed = aliases.find((alias) => !/-[a-z0-9]{9,}(-[a-z0-9-]+)?\.vercel\.app$/i.test(alias));
+      if (nonHashed) return nonHashed;
+    } catch (_) {
+      // coba lagi di percobaan berikutnya
+    }
+    if (attempt < 5) await sleep(2000);
+  }
   return `${projectName}.vercel.app`;
 }
 
@@ -1552,7 +1557,11 @@ async function publishToCloudflare(name, files, render) {
     throw new Error(`Deployment Cloudflare berakhir dengan status ${latestStatus}. Cek dashboard Cloudflare Pages untuk log lengkap.`);
   }
 
-  return finalDeployment?.url || getCloudflarePagesUrl(project.name);
+  // SENGAJA tidak pakai finalDeployment.url — itu URL unik per-deployment
+  // (mis. https://8374652c.namaproyek.pages.dev), bukan alias produksi.
+  // Domain produksi Cloudflare Pages SELALU {project}.pages.dev dan otomatis
+  // menunjuk ke deployment production terbaru begitu status "success".
+  return getCloudflarePagesUrl(project.name);
 }
 
 // ─────────────────────────────────────────────
