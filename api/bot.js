@@ -2,6 +2,20 @@ const { Telegraf, Markup } = require('telegraf');
 const axios = require('axios');
 const JSZip = require('jszip');
 const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
+
+// blake3 WAJIB untuk hash asset Cloudflare Pages (bukan SHA-256), tapi
+// SENGAJA di-load defensif — kalau gagal (mis. dependency belum ke-install),
+// SELURUH BOT TETAP JALAN NORMAL, cuma fitur Deploy Cloudflare yang kasih
+// error jelas. Pelajaran dari insiden 'form-data' sebelumnya: 1 dependency
+// gagal load TIDAK BOLEH bikin seluruh bot mati.
+let blake3Module = null;
+try {
+  blake3Module = require('blake3');
+} catch (_) {
+  blake3Module = null;
+}
 
 const ENV = {
   BOT_TOKEN: process.env.TOKEN_BOT || process.env.BOT_TOKEN,
@@ -256,10 +270,51 @@ async function editPanel(ctx, messageId, text, keyboard) {
   }
 }
 
+// ─────────────────────────────────────────────
+// BOT.PNG — HANYA dipakai di Menu Utama (/start & tombol Home). Menu/submenu
+// lain TETAP teks biasa, tidak berubah. Kalau file tidak ketemu, otomatis
+// fallback ke menu teks biasa — bot TIDAK BOLEH crash gara-gara ini.
+// ─────────────────────────────────────────────
+
+let cachedBotPhotoBuffer;
+function loadBotPhotoBuffer() {
+  if (cachedBotPhotoBuffer !== undefined) return cachedBotPhotoBuffer;
+  const candidates = [
+    path.join(process.cwd(), 'Bot.png'),
+    path.join(process.cwd(), 'api', 'Bot.png'),
+    path.join(__dirname, 'Bot.png'),
+  ];
+  for (const candidate of candidates) {
+    try {
+      if (fs.existsSync(candidate)) {
+        cachedBotPhotoBuffer = fs.readFileSync(candidate);
+        return cachedBotPhotoBuffer;
+      }
+    } catch (_) {
+      // lanjut coba path berikutnya
+    }
+  }
+  cachedBotPhotoBuffer = null;
+  return null;
+}
+
 async function sendMainMenu(ctx, body = '🟢 Status: Online & siap digunakan.\n\nSilakan pilih salah satu menu di bawah ini.') {
   // SENGAJA tidak menghapus pesan apapun di sini — supaya hasil/status
   // sebelumnya (mis. link deploy) tidak pernah hilang saat kembali ke menu.
-  await sendPanel(ctx, panel({ heading: '<b>MENU UTAMA</b>', body }), mainMenuMarkup());
+  const menuText = panel({ heading: '<b>MENU UTAMA</b>', body });
+  const photoBuffer = loadBotPhotoBuffer();
+  if (photoBuffer) {
+    try {
+      await ctx.replyWithPhoto(
+        { source: photoBuffer },
+        { caption: menuText, parse_mode: 'HTML', ...mainMenuMarkup() }
+      );
+      return;
+    } catch (_) {
+      // gagal kirim foto (format rusak dll) — fallback ke teks biasa, jangan crash
+    }
+  }
+  await sendPanel(ctx, menuText, mainMenuMarkup());
 }
 
 async function sendPrompt(ctx, heading, body, session) {
@@ -805,36 +860,153 @@ async function ensureCloudflarePagesProject(name) {
   return createCloudflarePagesProject(safeName);
 }
 
-function sha256Hex(buffer) {
-  return crypto.createHash('sha256').update(buffer).digest('hex');
+// MIME map buat metadata content-type asset — kalau salah, Cloudflare bisa
+// nyerve file dengan Content-Type yang salah (mis. HTML kebaca sebagai teks).
+const CLOUDFLARE_MIME_MAP = {
+  html: 'text/html; charset=utf-8', htm: 'text/html; charset=utf-8',
+  css: 'text/css; charset=utf-8', js: 'application/javascript; charset=utf-8',
+  mjs: 'application/javascript; charset=utf-8', json: 'application/json; charset=utf-8',
+  png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif',
+  svg: 'image/svg+xml', webp: 'image/webp', ico: 'image/x-icon',
+  mp4: 'video/mp4', webm: 'video/webm', mp3: 'audio/mpeg', wav: 'audio/wav',
+  txt: 'text/plain; charset=utf-8', xml: 'application/xml; charset=utf-8',
+  pdf: 'application/pdf', zip: 'application/zip',
+  woff: 'font/woff', woff2: 'font/woff2', ttf: 'font/ttf', otf: 'font/otf',
+  wasm: 'application/wasm',
+};
+
+function guessContentType(filePath) {
+  const ext = filePath.includes('.') ? filePath.split('.').pop().toLowerCase() : '';
+  return CLOUDFLARE_MIME_MAP[ext] || 'application/octet-stream';
 }
 
-async function createCloudflarePagesDeployment(projectName, files) {
-  validateCloudflareEnv();
-  const manifest = {};
-  const parts = [];
-
-  for (const file of files) {
-    const cleanPath = file.path.replace(/^\/+/, '');
-    const hash = sha256Hex(file.buffer);
-    manifest[cleanPath] = hash;
-    parts.push({ name: cleanPath, value: file.buffer, filename: cleanPath, contentType: 'application/octet-stream' });
+// Algoritma hash ASLI Cloudflare Pages Direct Upload — BUKAN SHA-256/MD5:
+// blake3( base64(isi_file) + ekstensi_tanpa_titik ).hex() diambil 32 karakter
+// pertama (128 bit). Salah 1 detail di sini = asset ke-upload "sukses" tapi
+// 404 selamanya saat diakses (ini persis yang bikin kendala kemarin).
+function cloudflareAssetHash(buffer, extension) {
+  if (!blake3Module || typeof blake3Module.hash !== 'function') {
+    throw new Error('Modul blake3 tidak tersedia di server — Deploy Cloudflare Pages tidak bisa dijalankan sampai dependency ini ter-install dengan benar (lihat package.json).');
   }
+  const base64Content = buffer.toString('base64');
+  const ext = String(extension || '').replace(/^\./, '');
+  const digest = blake3Module.hash(base64Content + ext);
+  return Buffer.from(digest).toString('hex').slice(0, 32);
+}
 
-  parts.unshift({ name: 'manifest', value: JSON.stringify(manifest) });
-  parts.unshift({ name: 'branch', value: 'main' });
+async function getCloudflareUploadToken(projectName) {
+  validateCloudflareEnv();
+  const response = await axios.get(
+    `${CLOUDFLARE_API}/accounts/${encodeURIComponent(ENV.CLOUDFLARE_ACCOUNT_ID)}/pages/projects/${encodeURIComponent(projectName)}/upload-token`,
+    { headers: cloudflareHeaders, timeout: 20000 }
+  );
+  if (response.data?.success === false) {
+    throw new Error(response.data?.errors?.map((e) => e.message).join('; ') || 'Gagal mengambil upload token Cloudflare.');
+  }
+  const jwt = response.data?.result?.jwt;
+  if (!jwt) throw new Error('Cloudflare tidak mengembalikan upload token yang valid.');
+  return jwt;
+}
 
-  const { body, contentType } = buildMultipartFormData(parts);
-
+async function cloudflareCheckMissing(jwt, hashes) {
+  if (!hashes.length) return [];
   const response = await axios.post(
-    `${CLOUDFLARE_API}/accounts/${encodeURIComponent(ENV.CLOUDFLARE_ACCOUNT_ID)}/pages/projects/${encodeURIComponent(projectName)}/deployments`,
+    `${CLOUDFLARE_API}/pages/assets/check-missing`,
+    { hashes },
+    { headers: { Authorization: `Bearer ${jwt}`, 'Content-Type': 'application/json' }, timeout: 30000 }
+  );
+  if (response.data?.success === false) {
+    throw new Error(response.data?.errors?.map((e) => e.message).join('; ') || 'Gagal memeriksa asset yang hilang di Cloudflare.');
+  }
+  return response.data?.result || [];
+}
+
+async function cloudflareUploadAssets(jwt, items) {
+  if (!items.length) return;
+  const body = items.map((item) => ({
+    key: item.hash,
+    value: item.buffer.toString('base64'),
+    base64: true,
+    metadata: { contentType: item.contentType || 'application/octet-stream' },
+  }));
+  const response = await axios.post(
+    `${CLOUDFLARE_API}/pages/assets/upload`,
     body,
     {
-      headers: { ...cloudflareHeaders, 'Content-Type': contentType },
+      headers: { Authorization: `Bearer ${jwt}`, 'Content-Type': 'application/json' },
       timeout: 120000,
       maxBodyLength: 55 * 1024 * 1024,
       maxContentLength: 55 * 1024 * 1024,
     }
+  );
+  if (response.data?.success === false) {
+    throw new Error(response.data?.errors?.map((e) => e.message).join('; ') || 'Gagal upload asset ke Cloudflare.');
+  }
+}
+
+async function cloudflareUpsertHashes(jwt, hashes) {
+  if (!hashes.length) return;
+  const response = await axios.post(
+    `${CLOUDFLARE_API}/pages/assets/upsert-hashes`,
+    { hashes },
+    { headers: { Authorization: `Bearer ${jwt}`, 'Content-Type': 'application/json' }, timeout: 30000 }
+  );
+  if (response.data?.success === false) {
+    throw new Error(response.data?.errors?.map((e) => e.message).join('; ') || 'Gagal registrasi hash ke Cloudflare.');
+  }
+}
+
+async function createCloudflarePagesDeployment(projectName, files, onLog) {
+  validateCloudflareEnv();
+  const log = onLog || (async () => {});
+
+  // 1) Hitung hash BLAKE3 tiap file dulu (lihat cloudflareAssetHash di atas)
+  const items = files.map((file) => {
+    const cleanPath = file.path.replace(/^\/+/, '');
+    const ext = cleanPath.includes('.') ? cleanPath.split('.').pop() : '';
+    return {
+      path: cleanPath,
+      hash: cloudflareAssetHash(file.buffer, ext),
+      buffer: file.buffer,
+      contentType: guessContentType(cleanPath),
+    };
+  });
+  const manifest = {};
+  for (const item of items) manifest[item.path] = item.hash;
+
+  // 2) Ambil upload token (JWT khusus asset, BUKAN token API biasa)
+  await log('Mengambil upload token Cloudflare…');
+  const jwt = await getCloudflareUploadToken(projectName);
+
+  // 3) Cek hash mana yang belum tersimpan di storage Cloudflare
+  await log('Memeriksa asset yang perlu diunggah (check-missing)…');
+  const missing = await cloudflareCheckMissing(jwt, items.map((i) => i.hash));
+  const missingSet = new Set(missing);
+  const toUpload = items.filter((i) => missingSet.has(i.hash));
+
+  // 4) Upload isi file yang belum ada, per-batch biar aman dari limit ukuran
+  if (toUpload.length) {
+    await log(`Mengunggah ${toUpload.length} asset…`);
+    const BATCH_SIZE = 40;
+    for (let i = 0; i < toUpload.length; i += BATCH_SIZE) {
+      await cloudflareUploadAssets(jwt, toUpload.slice(i, i + BATCH_SIZE));
+    }
+    await log('Mendaftarkan hash asset (upsert-hashes)…');
+    await cloudflareUpsertHashes(jwt, toUpload.map((i) => i.hash));
+  }
+
+  // 5) Baru buat deployment sungguhan — isi file sudah ada di storage,
+  //    di sini cuma mereferensikan manifest (path -> hash).
+  await log('Membuat deployment dengan manifest…');
+  const { body, contentType } = buildMultipartFormData([
+    { name: 'branch', value: 'main' },
+    { name: 'manifest', value: JSON.stringify(manifest) },
+  ]);
+
+  const response = await axios.post(
+    `${CLOUDFLARE_API}/accounts/${encodeURIComponent(ENV.CLOUDFLARE_ACCOUNT_ID)}/pages/projects/${encodeURIComponent(projectName)}/deployments`,
+    body,
+    { headers: { ...cloudflareHeaders, 'Content-Type': contentType }, timeout: 60000 }
   );
 
   if (response.data?.success === false) {
@@ -1536,17 +1708,18 @@ async function publishToNetlify(name, files, render) {
 
 async function publishToCloudflare(name, files, render) {
   validateCloudflareEnv();
-  await render(20, 'Menyiapkan project Cloudflare Pages…');
+  await render(15, 'Menyiapkan project Cloudflare Pages…');
   const project = await ensureCloudflarePagesProject(name);
 
-  await render(45, 'Mengunggah berkas ke Cloudflare…');
-  const deployment = await createCloudflarePagesDeployment(project.name, files);
+  const deployment = await createCloudflarePagesDeployment(project.name, files, async (activity) => {
+    await render(45, activity);
+  });
   const deploymentId = deployment?.id;
   if (!deploymentId) {
     throw new Error('Cloudflare tidak mengembalikan deployment id yang valid.');
   }
 
-  await render(70, 'Menunggu status deployment…');
+  await render(75, 'Menunggu status deployment…');
   const finalDeployment = await waitForCloudflareDeployment(project.name, deploymentId, 180000, async (stage) => {
     await render(85, `Status: ${stage || 'memproses'}…`);
   });
@@ -1673,6 +1846,35 @@ async function runPhotoUpload(ctx, files, statusMessage) {
   return runFileToUrl(ctx, files, statusMessage, 'foto');
 }
 
+// ─────────────────────────────────────────────
+// VERIFIKASI DEPLOYMENT — dipakai SEMUA provider (Vercel, Netlify,
+// Cloudflare). Deploy TIDAK dianggap sukses hanya karena API provider
+// bilang "accepted"/"success" — di sini kita beneran HTTP-request ke URL
+// publiknya dan cek responsnya valid (bukan 404/500/gagal konek).
+// ─────────────────────────────────────────────
+
+async function verifyPublicUrl(url, maxAttempts = 5, delayMs = 3000) {
+  let lastStatus = null;
+  let lastError = null;
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    try {
+      const response = await axios.get(url, {
+        timeout: 15000,
+        maxRedirects: 5,
+        validateStatus: () => true,
+      });
+      lastStatus = response.status;
+      if (response.status >= 200 && response.status < 400) {
+        return { ok: true, status: response.status };
+      }
+    } catch (error) {
+      lastError = errorMessage(error);
+    }
+    if (attempt < maxAttempts - 1) await sleep(delayMs);
+  }
+  return { ok: false, status: lastStatus, error: lastError };
+}
+
 async function runDeployment(ctx, session, statusMessage) {
   const repoName = repoSafeName(session.name);
   const modeLabel = session.type === 'deploy_zip' ? 'Deploy ZIP' : 'Deploy HTML';
@@ -1715,6 +1917,16 @@ async function runDeployment(ctx, session, statusMessage) {
     const url = platform === 'vercel'
       ? await publisher(repoName, session.files, render, session.envVars)
       : await publisher(repoName, session.files, render);
+
+    // JANGAN klaim sukses hanya karena API provider bilang "accepted" —
+    // verifikasi beneran ke URL publiknya dulu (HTTP request asli).
+    await render(97, 'Memverifikasi URL publik…');
+    const verification = await verifyPublicUrl(url);
+    if (!verification.ok) {
+      const reason = verification.error || `HTTP ${verification.status ?? 'tidak merespons'}`;
+      throw new Error(`Deployment dianggap GAGAL: URL publik tidak bisa diakses (${reason}), walau ${platformLabel} melaporkan proses selesai.`);
+    }
+
     const elapsed = formatElapsed(Date.now() - startedAt);
 
     await recordDeployment({
