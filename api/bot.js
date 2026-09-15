@@ -169,9 +169,8 @@ function guestMenuMarkup() {
 
 async function sendGuestMenu(ctx) {
   const text = panel({
-    heading: '<b>AKSES DEVTOOLS RAVEN</b>',
-    body: 'Akun kamu belum terdaftar sebagai pengguna bot.\n\nGunakan tombol di bawah untuk membeli akses, melihat penjelasan, atau menghubungi owner.',
-    footer: 'DevTools Raven V3 • Developer: Raven',
+    heading: '<b>Akses DevTools Raven</b>',
+    body: 'Akun kamu belum terdaftar.\n\nPilih salah satu tombol di bawah.',
   });
   return sendPanel(ctx, text, guestMenuMarkup());
 }
@@ -207,8 +206,8 @@ async function safeDeleteMessage(ctx, chatId, messageId) {
 // 4. Menu owner (Add User, Users, Broadcast) HANYA muncul untuk OWNER_ID.
 // ─────────────────────────────────────────────
 
-const BAR = '━━━━━━━━━━━━━━━━━━━━━━━━━━━';
-const BRAND = 'DEVTOOLS RAVEN V3';
+const BAR = '───── ✦ ───── ✦ ─────';
+const BRAND = 'DEVTOOLS RAVEN · V3';
 
 function homeButton() {
   return Markup.inlineKeyboard([[Markup.button.callback('🏠  Menu Utama', 'home')]]);
@@ -248,7 +247,6 @@ function mediaMenuMarkup() {
   ]);
 }
 
-
 function fileTypeMarkup(platform) {
   return Markup.inlineKeyboard([
     [Markup.button.callback('📄  Deploy HTML', `${platform}_html`), Markup.button.callback('📦  Deploy ZIP', `${platform}_zip`)],
@@ -261,19 +259,13 @@ async function askForWebsiteName(ctx, session, prefixText = '') {
   session.step = 'name';
   const platformLabel = platformDisplayName(session.platform);
   const title = `${session.type === 'deploy_zip' ? 'Deploy ZIP' : 'Deploy HTML'} — ${platformLabel}`;
-  const body = `${prefixText ? `${prefixText}\n\n` : ''}🚀 <b>Langkah Terakhir — Nama Website</b>\n\nKirim nama repository/website (huruf, angka, dan tanda "-" saja, tanpa spasi).\nContoh: <code>toko-online-saya</code>`;
+  const body = `${prefixText ? `${prefixText}\n\n` : ''}Kirim nama website.\nGunakan huruf, angka, dan tanda "-" tanpa spasi.\nContoh: <code>toko-online-saya</code>`;
   await sendPrompt(ctx, title, body, session);
 }
 
-// Alur .env KHUSUS Vercel ZIP (Netlify & Cloudflare tidak menerima .env
-// di alur ini; Vercel HTML juga langsung ke nama website tanpa pertanyaan
-// .env, sesuai spesifikasi revisi).
+// Alur .env KHUSUS Vercel ZIP.
 async function askEnvChoiceOrName(ctx, session, prefixText) {
-  if (session.platform !== 'vercel') {
-    await askForWebsiteName(ctx, session, prefixText);
-    return;
-  }
-  if (session.type === 'deploy_html') {
+  if (session.platform !== 'vercel' || session.type === 'deploy_html') {
     await askForWebsiteName(ctx, session, prefixText);
     return;
   }
@@ -281,8 +273,8 @@ async function askEnvChoiceOrName(ctx, session, prefixText) {
   const old = sessions.get(uid(ctx));
   if (old?.controlMessageId) await safeDeleteMessage(ctx, ctx.chat.id, old.controlMessageId);
   const message = await sendPanel(ctx, panel({
-    heading: `<b>${escapeHtml(session.type === 'deploy_zip' ? 'Deploy ZIP' : 'Deploy HTML')} — Vercel</b>`,
-    body: `${prefixText}\n\n⚙️ <b>Tambahkan Environment Variable (.env)?</b>\n\nKalau project ini punya backend/serverless function (folder <code>api/</code>) yang butuh secret/token, bisa ditambahkan dulu sebelum deploy. Kalau cuma website statis biasa, aman untuk Lewati.`,
+    heading: '<b>Deploy ZIP — Vercel</b>',
+    body: `${prefixText}\n\nProject ini membutuhkan <code>.env</code>?\nPilih <b>Tambah .env</b> untuk memasukkan variable, atau <b>Lewati</b> untuk deploy tanpa variable tambahan.`,
   }), Markup.inlineKeyboard([
     [Markup.button.callback('➕  Tambah .env', 'env_add'), Markup.button.callback('⏭️  Lewati', 'env_skip')],
   ]));
@@ -290,17 +282,13 @@ async function askEnvChoiceOrName(ctx, session, prefixText) {
   sessions.set(uid(ctx), session);
 }
 
-// Generate Bot LANGSUNG masuk ke pengisian .env (tidak ada opsi "Lewati"),
-// karena bot Telegram nyaris selalu butuh minimal TOKEN_BOT.
 async function startGenerateBotEnvCollection(ctx, session, prefixText) {
   session.envVars = session.envVars || [];
   session.step = 'gb_env_key';
-  const body = `${prefixText ? `${prefixText}\n\n` : ''}🔑 <b>Kirim KEY</b> environment variable pertama.\nContoh: <code>TOKEN_BOT</code> (wajib ada supaya bot bisa login ke Telegram)`;
-  await sendPrompt(ctx, 'Generate Bot — .env', body, session);
+  const body = `${prefixText ? `${prefixText}\n\n` : ''}Kirim KEY environment variable pertama.\nContoh: <code>TOKEN_BOT</code>`;
+  await sendPrompt(ctx, 'Generate Bot — Environment', body, session);
 }
 
-// Kotak info bergaya "dashboard" — dipakai untuk semua tampilan status/hasil
-// supaya konsisten & terlihat premium di seluruh menu.
 function infoBox(rows) {
   const lines = rows.map(([label, value], idx) => {
     const prefix = idx === rows.length - 1 ? '└' : '├';
@@ -310,13 +298,12 @@ function infoBox(rows) {
 }
 
 function panel({ heading, box, body, footer } = {}) {
-  let out = `⚡ <b>${BRAND}</b>\n${BAR}\n\n`;
+  let out = '';
   if (heading) out += `${heading}\n`;
   if (box) out += `${box}\n`;
   if (body) out += `${body}\n`;
-  out += `\n${BAR}`;
   if (footer) out += `\n${footer}`;
-  return out;
+  return out.trim();
 }
 
 function progressBar(percent) {
@@ -377,22 +364,27 @@ function loadBotPhotoBuffer() {
   return null;
 }
 
-async function sendMainMenu(ctx, body = '🟢 Status: Online & siap digunakan.\n\nSilakan pilih salah satu menu di bawah ini.') {
-  // SENGAJA tidak menghapus pesan apapun di sini — supaya hasil/status
-  // sebelumnya (mis. link deploy) tidak pernah hilang saat kembali ke menu.
-  const menuText = panel({ heading: '<b>MENU UTAMA</b>', body });
+async function sendMainMenu(ctx) {
+  const name = escapeHtml(ctx.from?.username || userDisplayName(ctx.from));
+  const menuText = [
+    `👋 Halo, ${name}! Selamat Datang`,
+    BAR,
+    `🤖 ${BRAND}`,
+    BAR,
+    `┃❏ 🛠<b>developer</b> : RavenZy`,
+    `┃❏ 📡<b>version</b> : 3.0.0`,
+    `┃❏ 🔮<b>status</b> : Online✅`,
+    `╰━──────────────────────━❏`,
+    '',
+    `( 🍃 ) <b>Pilih Menu Di Bawah...</b>`,
+  ].join('\n');
   const photoBuffer = loadBotPhotoBuffer();
   const keyboard = mainMenuMarkup(ctx);
   if (photoBuffer) {
     try {
-      await ctx.replyWithPhoto(
-        { source: photoBuffer },
-        { caption: menuText, parse_mode: 'HTML', ...keyboard }
-      );
+      await ctx.replyWithPhoto({ source: photoBuffer }, { caption: menuText, parse_mode: 'HTML', ...keyboard });
       return;
-    } catch (_) {
-      // gagal kirim foto (format rusak dll) — fallback ke teks biasa, jangan crash
-    }
+    } catch (_) {}
   }
   await sendPanel(ctx, menuText, keyboard);
 }
@@ -1884,7 +1876,7 @@ async function runWebToApk(ctx, session, statusMessage) {
   let tempRepo = null;
   const render = async (percent, activity) => {
     await editPanel(ctx, statusMessage.message_id, panel({
-      heading: '📊 <b>DASHBOARD LOG</b>',
+      heading: '📊 <b>PROSES</b>',
       box: infoBox([
         ['📡 Server', '🔵 <b>PROCESSING</b>'],
         ['🔧 Mode', 'Build Web to APK'],
@@ -2221,7 +2213,7 @@ async function runFileToUrl(ctx, files, statusMessage, kind = 'foto') {
 
   const render = async (percent, activity) => {
     await editPanel(ctx, statusMessage.message_id, panel({
-      heading: '📊 <b>DASHBOARD LOG</b>',
+      heading: '📊 <b>PROSES</b>',
       box: infoBox([
         ['📡 Server', '🔵 <b>PROCESSING</b>'],
         ['🔧 Mode', modeLabel],
@@ -2229,7 +2221,6 @@ async function runFileToUrl(ctx, files, statusMessage, kind = 'foto') {
         ['🔄 Progress', `<code>${progressBar(percent)}</code> ${percent}%`],
         ['📝 Activity', escapeHtml(activity)],
       ]),
-      footer: 'Proses membutuhkan waktu, jadi mohon\nuntuk sabar.....',
     }));
   };
 
@@ -2339,19 +2330,6 @@ function safeGenerateBotAutofix(files, webhookPath) {
   let pkg;
   try { pkg = JSON.parse(packageFile.buffer.toString('utf8')); } catch (_) { throw new Error('Auto-fix dibatalkan: package.json tidak valid JSON.'); }
   let changed = false;
-  if (!pkg.engines || !pkg.engines.node) {
-    pkg.engines = { ...(pkg.engines || {}), node: '22.x' };
-    packageFile.buffer = Buffer.from(JSON.stringify(pkg, null, 2) + '\n', 'utf8');
-    changed = true;
-  }
-  const hasVercelJson = cloned.some((f) => f.path.toLowerCase() === 'vercel.json');
-  if (!hasVercelJson && webhookPath && /^api\/[^/]+\.js$/i.test(webhookPath)) {
-    cloned.push({
-      path: 'vercel.json',
-      buffer: Buffer.from(JSON.stringify({ version: 2, functions: { [webhookPath]: { runtime: 'nodejs22.x' } } }, null, 2) + '\n', 'utf8'),
-    });
-    changed = true;
-  }
   return { files: cloned, changed };
 }
 
@@ -2372,9 +2350,8 @@ async function runGenerateBotVercel(ctx, session, statusMessage) {
       ['📝 Activity', escapeHtml(activity)],
     ];
     await editPanel(ctx, statusMessage.message_id, panel({
-      heading: '📊 <b>DASHBOARD LOG</b>',
+      heading: '📊 <b>PROSES</b>',
       box: infoBox(rows),
-      footer: 'Proses membutuhkan waktu, jadi mohon\nuntuk sabar.....',
     }));
   };
 
@@ -2476,7 +2453,6 @@ async function runGenerateBotVercel(ctx, session, statusMessage) {
         ['📡 Status Webhook', webhookStatus],
         ['⏰ Waktu', escapeHtml(elapsed)],
       ]),
-      footer: '🚀  Bot baru siap dipakai kalau webhook sudah terdaftar',
     }), homeButton());
   } catch (error) {
     const elapsed = formatElapsed(Date.now() - startedAt);
@@ -2505,7 +2481,6 @@ async function runGenerateBotVercel(ctx, session, statusMessage) {
         ['⏰ Waktu', escapeHtml(elapsed)],
       ]),
       body: logBody,
-      footer: 'Tidak meninggalkan project yang gagal dari proses ini.',
     }), homeButton());
   } finally {
     sessions.delete(uid(ctx));
@@ -2535,7 +2510,6 @@ bot.action('guest_help', async (ctx) => {
       '💬 <b>Hubungi WhatsApp Owner</b> — membuka kontak WhatsApp owner.\n' +
       '📣 <b>Saluran Produk Owner</b> — membuka saluran produk resmi.\n\n' +
       'Setelah akses diberikan oleh owner, kirim <code>/start</code> lagi untuk membuka menu DevTools Raven.',
-    footer: 'Akses hanya diberikan oleh owner.',
   }), guestMenuMarkup());
 });
 
@@ -2551,7 +2525,6 @@ bot.action('deployment_menu', async (ctx) => {
   return sendPanel(ctx, panel({
     heading: '<b>DEPLOYMENT</b>',
     body: 'Pilih platform terlebih dahulu. Setelah itu bot akan menampilkan alur file yang sesuai untuk platform tersebut.',
-    footer: 'DevTools Raven V3',
   }), deploymentMenuMarkup());
 });
 
@@ -2827,10 +2800,9 @@ bot.action('donation', async (ctx) => {
     const contentType = String(response.headers?.['content-type'] || '');
     if (!contentType.startsWith('image/')) throw new Error('QRIS tidak mengembalikan file gambar.');
     await ctx.replyWithPhoto({ source: buffer }, {
-      caption: '💝 <b>DONASI DEVTOOLS RAVEN</b>\n\nScan QRIS di atas untuk mendukung pengembangan DevTools Raven V3.\n\n<i>Terima kasih atas dukungannya.</i>',
+      caption: '💝 <b>Donasi DevTools Raven</b>\n\nScan QRIS pada gambar di atas.',
       parse_mode: 'HTML',
     });
-    await sendPanel(ctx, panel({ heading: '<b>QRIS SIAP ✅</b>', body: 'QRIS sudah dikirim sebagai gambar. Tidak ada URL QRIS yang ditampilkan di chat.' }), homeButton());
   } catch (error) {
     await sendPanel(ctx, panel({ heading: '<b>QRIS GAGAL ❌</b>', body: `<code>${escapeHtml(errorMessage(error))}</code>` }), homeButton());
   }
@@ -3301,7 +3273,7 @@ bot.on('text', async (ctx) => {
     session.step = 'gb_deploying';
     sessions.set(id, session);
     const status = await sendPanel(ctx, panel({
-      heading: '📊 <b>DASHBOARD LOG</b>',
+      heading: '📊 <b>PROSES</b>',
       box: infoBox([
         ['📡 Server', '🔵 <b>PROCESSING</b>'],
         ['🔧 Mode', 'Generate Bot'],
@@ -3310,7 +3282,6 @@ bot.on('text', async (ctx) => {
         ['🔄 Progress', `<code>${progressBar(0)}</code> 0%`],
         ['📝 Activity', 'Memulai proses…'],
       ]),
-      footer: 'Proses membutuhkan waktu, jadi mohon\nuntuk sabar.....',
     }));
     await runGenerateBot(ctx, session, status);
     return;
@@ -3321,7 +3292,7 @@ bot.on('text', async (ctx) => {
     session.step = 'deploying';
     sessions.set(id, session);
     const status = await sendPanel(ctx, panel({
-      heading: '📊 <b>DASHBOARD LOG</b>',
+      heading: '📊 <b>PROSES</b>',
       box: infoBox([
         ['📡 Server', '🔵 <b>PROCESSING</b>'],
         ['🛰️ Platform', escapeHtml(platformDisplayName(session.platform))],
@@ -3330,7 +3301,6 @@ bot.on('text', async (ctx) => {
         ['🔄 Progress', `<code>${progressBar(0)}</code> 0%`],
         ['📝 Activity', 'Memulai proses…'],
       ]),
-      footer: 'Proses membutuhkan waktu, jadi mohon\nuntuk sabar.....',
     }));
     await runDeployment(ctx, session, status);
     return;
@@ -3354,7 +3324,7 @@ bot.on('video', async (ctx) => {
     const fileName = sanitizeImageFileName(rawName || `video-${Date.now()}.${ext}`, ext, 'video');
     sessions.delete(id);
     const status = await sendPanel(ctx, panel({
-      heading: '📊 <b>DASHBOARD LOG</b>',
+      heading: '📊 <b>PROSES</b>',
       box: infoBox([
         ['📡 Server', '🔵 <b>PROCESSING</b>'],
         ['🔧 Mode', 'Video ke URL'],
@@ -3362,7 +3332,6 @@ bot.on('video', async (ctx) => {
         ['🔄 Progress', `<code>${progressBar(0)}</code> 0%`],
         ['📝 Activity', 'Memulai proses…'],
       ]),
-      footer: 'Proses membutuhkan waktu, jadi mohon\nuntuk sabar.....',
     }));
     await runFileToUrl(ctx, [{ path: fileName, buffer }], status, 'video');
   } catch (error) {
@@ -3389,7 +3358,7 @@ bot.on('photo', async (ctx) => {
     sessions.delete(id);
 
     const status = await sendPanel(ctx, panel({
-      heading: '📊 <b>DASHBOARD LOG</b>',
+      heading: '📊 <b>PROSES</b>',
       box: infoBox([
         ['📡 Server', '🔵 <b>PROCESSING</b>'],
         ['🔧 Mode', 'Foto ke URL'],
@@ -3397,7 +3366,6 @@ bot.on('photo', async (ctx) => {
         ['🔄 Progress', `<code>${progressBar(0)}</code> 0%`],
         ['📝 Activity', 'Memulai proses…'],
       ]),
-      footer: 'Proses membutuhkan waktu, jadi mohon\nuntuk sabar.....',
     }));
     await runPhotoUpload(ctx, [{ path: fileName, buffer }], status);
   } catch (error) {
@@ -3429,7 +3397,7 @@ bot.on('document', async (ctx) => {
       sessions.delete(id);
 
       const status = await sendPanel(ctx, panel({
-        heading: '📊 <b>DASHBOARD LOG</b>',
+        heading: '📊 <b>PROSES</b>',
         box: infoBox([
           ['📡 Server', '🔵 <b>PROCESSING</b>'],
           ['🔧 Mode', 'Foto ke URL'],
@@ -3437,8 +3405,7 @@ bot.on('document', async (ctx) => {
           ['🔄 Progress', `<code>${progressBar(0)}</code> 0%`],
           ['📝 Activity', 'Memulai proses…'],
         ]),
-        footer: 'Proses membutuhkan waktu, jadi mohon\nuntuk sabar.....',
-      }));
+        }));
       await runPhotoUpload(ctx, [{ path: safeName, buffer }], status);
     } catch (error) {
       await sendPrompt(ctx, 'Foto ke URL', `❌ <b>Gagal mengambil file dari Telegram.</b>\n\n<code>${escapeHtml(errorMessage(error))}</code>`, session);
@@ -3460,7 +3427,7 @@ bot.on('document', async (ctx) => {
       sessions.delete(id);
 
       const status = await sendPanel(ctx, panel({
-        heading: '📊 <b>DASHBOARD LOG</b>',
+        heading: '📊 <b>PROSES</b>',
         box: infoBox([
           ['📡 Server', '🔵 <b>PROCESSING</b>'],
           ['🔧 Mode', 'Audio ke URL'],
@@ -3468,8 +3435,7 @@ bot.on('document', async (ctx) => {
           ['🔄 Progress', `<code>${progressBar(0)}</code> 0%`],
           ['📝 Activity', 'Memulai proses…'],
         ]),
-        footer: 'Proses membutuhkan waktu, jadi mohon\nuntuk sabar.....',
-      }));
+        }));
       await runFileToUrl(ctx, [{ path: safeName, buffer }], status, 'audio');
     } catch (error) {
       await sendPrompt(ctx, 'Audio ke URL', `❌ <b>Gagal mengambil file dari Telegram.</b>\n\n<code>${escapeHtml(errorMessage(error))}</code>`, session);
@@ -3490,7 +3456,7 @@ bot.on('document', async (ctx) => {
       const safeName = sanitizeImageFileName(fileName, extFromMime || 'mp4', 'video');
       sessions.delete(id);
       const status = await sendPanel(ctx, panel({
-        heading: '📊 <b>DASHBOARD LOG</b>',
+        heading: '📊 <b>PROSES</b>',
         box: infoBox([
           ['📡 Server', '🔵 <b>PROCESSING</b>'],
           ['🔧 Mode', 'Video ke URL'],
@@ -3498,8 +3464,7 @@ bot.on('document', async (ctx) => {
           ['🔄 Progress', `<code>${progressBar(0)}</code> 0%`],
           ['📝 Activity', 'Memulai proses…'],
         ]),
-        footer: 'Proses membutuhkan waktu, jadi mohon\nuntuk sabar.....',
-      }));
+        }));
       await runFileToUrl(ctx, [{ path: safeName, buffer }], status, 'video');
     } catch (error) {
       await sendPrompt(ctx, 'Video ke URL', `❌ <b>Gagal mengambil file dari Telegram.</b>\n\n<code>${escapeHtml(errorMessage(error))}</code>`, session);
@@ -3523,7 +3488,7 @@ bot.on('document', async (ctx) => {
       session.step = 'deploying';
       sessions.set(id, session);
       const status = await sendPanel(ctx, panel({
-        heading: '📊 <b>DASHBOARD LOG</b>',
+        heading: '📊 <b>PROSES</b>',
         box: infoBox([
           ['📡 Server', '🔵 <b>PROCESSING</b>'],
           ['🔧 Mode', 'Build Web to APK'],
@@ -3689,5 +3654,5 @@ module.exports = async (req, res) => {
       return res.status(500).send('Webhook error');
     }
   }
-  return res.status(200).send('⚡ DevTools Raven Bot Online');
+  return res.status(200).send('DevTools Raven Bot Online');
 };
