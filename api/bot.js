@@ -5,18 +5,6 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 
-// blake3 WAJIB untuk hash asset Cloudflare Pages (bukan SHA-256), tapi
-// SENGAJA di-load defensif — kalau gagal (mis. dependency belum ke-install),
-// SELURUH BOT TETAP JALAN NORMAL, cuma fitur Deploy Cloudflare yang kasih
-// error jelas. Pelajaran dari insiden 'form-data' sebelumnya: 1 dependency
-// gagal load TIDAK BOLEH bikin seluruh bot mati.
-let blake3Module = null;
-try {
-  blake3Module = require('blake3-wasm');
-} catch (_) {
-  blake3Module = null;
-}
-
 const ENV = {
   BOT_TOKEN: process.env.TOKEN_BOT || process.env.BOT_TOKEN,
   OWNER_ID: process.env.ID_PEMILIK || process.env.OWNER_ID,
@@ -28,8 +16,6 @@ const ENV = {
   VERCEL_HOOK: process.env.VERCEL_HOOK,
   VERCEL_TEAM_ID: process.env.VERCEL_TEAM_ID || '',
   NETLIFY_TOKEN: process.env.NETLIFY_TOKEN,
-  CLOUDFLARE_API_TOKEN: process.env.CLOUDFLARE_API_TOKEN,
-  CLOUDFLARE_ACCOUNT_ID: process.env.CLOUDFLARE_ACCOUNT_ID,
 };
 
 function requireConfig() {
@@ -55,7 +41,6 @@ const BUY_ACCESS_URL = `${OWNER_TELEGRAM_URL}?text=${encodeURIComponent(BUY_MESS
 const GH_API = 'https://api.github.com';
 const VERCEL_API = 'https://api.vercel.com';
 const NETLIFY_API = 'https://api.netlify.com/api/v1';
-const CLOUDFLARE_API = 'https://api.cloudflare.com/client/v4';
 const ghHeaders = {
   Accept: 'application/vnd.github+json',
   Authorization: `Bearer ${ENV.GH_TOKEN}`,
@@ -67,9 +52,6 @@ const vercelHeaders = {
 };
 const netlifyHeaders = {
   Authorization: `Bearer ${ENV.NETLIFY_TOKEN}`,
-};
-const cloudflareHeaders = {
-  Authorization: `Bearer ${ENV.CLOUDFLARE_API_TOKEN}`,
 };
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -104,7 +86,6 @@ function escapeHtml(value) {
 
 function platformDisplayName(platform) {
   if (platform === 'netlify') return 'Netlify';
-  if (platform === 'cloudflare') return 'Cloudflare Pages';
   return 'Vercel';
 }
 
@@ -161,7 +142,6 @@ function rememberUser(ctx) {
 function guestMenuMarkup() {
   return Markup.inlineKeyboard([
     [Markup.button.url('💳  Buy Akses', BUY_ACCESS_URL)],
-    [Markup.button.callback('ℹ️  Bantuan', 'guest_help')],
     [Markup.button.url('💬  Hubungi WhatsApp Owner', OWNER_WHATSAPP_URL)],
     [Markup.button.url('📣  Saluran Produk Owner', OWNER_CHANNEL_URL)],
   ]);
@@ -180,8 +160,7 @@ bot.use(async (ctx, next) => {
   if (isAllowed(ctx)) return next();
   const startText = ctx.message?.text?.trim() || '';
   const isStart = /^\/start(?:\s|$)/i.test(startText);
-  const isGuestHelp = ctx.callbackQuery?.data === 'guest_help';
-  if (isStart || isGuestHelp) return next();
+  if (isStart) return next();
   return undefined;
 });
 
@@ -234,7 +213,6 @@ function mainMenuMarkup(ctx) {
 function deploymentMenuMarkup() {
   return Markup.inlineKeyboard([
     [Markup.button.callback('▲  Vercel', 'deploy_vercel'), Markup.button.callback('🌐  Netlify', 'deploy_netlify')],
-    [Markup.button.callback('☁️  Cloudflare Pages', 'deploy_cloudflare')],
     [Markup.button.callback('🏠  Menu Utama', 'home')],
   ]);
 }
@@ -954,304 +932,6 @@ async function checkNetlify() {
 }
 
 // ─────────────────────────────────────────────
-// CLOUDFLARE PAGES — deploy langsung via Direct Upload (bukan Git), pakai
-// endpoint resmi Cloudflare Pages REST API. Tidak pernah pakai GitHub OAuth
-// untuk provider ini — Direct Upload sudah cukup, sesuai instruksi.
-// ─────────────────────────────────────────────
-
-function validateCloudflareEnv() {
-  if (!ENV.CLOUDFLARE_API_TOKEN || !ENV.CLOUDFLARE_ACCOUNT_ID) {
-    throw new Error('CLOUDFLARE_API_TOKEN dan/atau CLOUDFLARE_ACCOUNT_ID belum diatur di environment variable bot.');
-  }
-}
-
-async function getCloudflarePagesProject(name) {
-  validateCloudflareEnv();
-  try {
-    const response = await axios.get(
-      `${CLOUDFLARE_API}/accounts/${encodeURIComponent(ENV.CLOUDFLARE_ACCOUNT_ID)}/pages/projects/${encodeURIComponent(name)}`,
-      { headers: cloudflareHeaders, timeout: 20000 }
-    );
-    if (response.data?.success === false) return null;
-    return response.data?.result || null;
-  } catch (error) {
-    if (error.response?.status === 404) return null;
-    throw error;
-  }
-}
-
-async function createCloudflarePagesProject(name) {
-  validateCloudflareEnv();
-  const response = await axios.post(
-    `${CLOUDFLARE_API}/accounts/${encodeURIComponent(ENV.CLOUDFLARE_ACCOUNT_ID)}/pages/projects`,
-    { name: projectSafeName(name), production_branch: 'main' },
-    { headers: { ...cloudflareHeaders, 'Content-Type': 'application/json' }, timeout: 30000 }
-  );
-  if (response.data?.success === false) {
-    const message = response.data?.errors?.map((e) => e.message).join('; ') || 'Gagal membuat project Cloudflare Pages.';
-    throw new Error(message);
-  }
-  return response.data?.result;
-}
-
-async function ensureCloudflarePagesProject(name) {
-  const safeName = projectSafeName(name);
-  const existing = await getCloudflarePagesProject(safeName);
-  if (existing) return existing;
-  return createCloudflarePagesProject(safeName);
-}
-
-// MIME map buat metadata content-type asset — kalau salah, Cloudflare bisa
-// nyerve file dengan Content-Type yang salah (mis. HTML kebaca sebagai teks).
-const CLOUDFLARE_MIME_MAP = {
-  html: 'text/html; charset=utf-8', htm: 'text/html; charset=utf-8',
-  css: 'text/css; charset=utf-8', js: 'application/javascript; charset=utf-8',
-  mjs: 'application/javascript; charset=utf-8', json: 'application/json; charset=utf-8',
-  png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif',
-  svg: 'image/svg+xml', webp: 'image/webp', ico: 'image/x-icon',
-  mp4: 'video/mp4', webm: 'video/webm', mp3: 'audio/mpeg', wav: 'audio/wav',
-  txt: 'text/plain; charset=utf-8', xml: 'application/xml; charset=utf-8',
-  pdf: 'application/pdf', zip: 'application/zip',
-  woff: 'font/woff', woff2: 'font/woff2', ttf: 'font/ttf', otf: 'font/otf',
-  wasm: 'application/wasm',
-};
-
-function guessContentType(filePath) {
-  const ext = filePath.includes('.') ? filePath.split('.').pop().toLowerCase() : '';
-  return CLOUDFLARE_MIME_MAP[ext] || 'application/octet-stream';
-}
-
-// Algoritma hash ASLI Cloudflare Pages Direct Upload — BUKAN SHA-256/MD5:
-// blake3( base64(isi_file) + ekstensi_tanpa_titik ).hex() diambil 32 karakter
-// pertama (128 bit). Salah 1 detail di sini = asset ke-upload "sukses" tapi
-// 404 selamanya saat diakses.
-function cloudflareAssetHash(buffer, extension) {
-  if (!blake3Module || typeof blake3Module.hash !== 'function') {
-    throw new Error('Modul blake3 tidak tersedia di server — Deploy Cloudflare Pages tidak bisa dijalankan sampai dependency ini ter-install dengan benar (lihat package.json).');
-  }
-  const base64Content = buffer.toString('base64');
-  const ext = String(extension || '').replace(/^\./, '');
-  const digest = blake3Module.hash(base64Content + ext);
-  return Buffer.from(digest).toString('hex').slice(0, 32);
-}
-
-async function getCloudflareUploadToken(projectName) {
-  validateCloudflareEnv();
-  const response = await axios.get(
-    `${CLOUDFLARE_API}/accounts/${encodeURIComponent(ENV.CLOUDFLARE_ACCOUNT_ID)}/pages/projects/${encodeURIComponent(projectName)}/upload-token`,
-    { headers: cloudflareHeaders, timeout: 20000 }
-  );
-  if (response.data?.success === false) {
-    const message = response.data?.errors?.map((e) => e.message).join('; ') || 'Gagal mengambil upload token Cloudflare.';
-    throw new Error(message);
-  }
-  const jwt = response.data?.result?.jwt;
-  if (!jwt) throw new Error('Cloudflare tidak mengembalikan upload token JWT yang valid.');
-  return jwt;
-}
-
-async function cloudflareRequest(request, label, retries = 3) {
-  let lastError;
-  for (let attempt = 1; attempt <= retries; attempt += 1) {
-    try {
-      const response = await request();
-      if (response.status >= 200 && response.status < 300 && response.data?.success !== false) return response;
-      const status = response.status || 'unknown';
-      const apiMessage = response.data?.errors?.map((e) => e.message).join('; ');
-      const error = new Error(`${label} gagal (${status})${apiMessage ? `: ${apiMessage}` : ''}`);
-      error.response = response;
-      throw error;
-    } catch (error) {
-      lastError = error;
-      const status = error.response?.status;
-      const retryable = !status || status === 408 || status === 429 || status >= 500;
-      if (!retryable || attempt === retries) break;
-      await sleep(1000 * attempt);
-    }
-  }
-  throw lastError || new Error(`${label} gagal.`);
-}
-
-async function cloudflareCheckMissing(jwt, hashes) {
-  if (!hashes.length) return [];
-  const response = await cloudflareRequest(() => axios.post(
-    `${CLOUDFLARE_API}/pages/assets/check-missing`,
-    { hashes },
-    { headers: { Authorization: `Bearer ${jwt}`, 'Content-Type': 'application/json' }, timeout: 30000 }
-  ), 'Cloudflare check-missing');
-  return response.data?.result || [];
-}
-
-async function cloudflareUploadAssets(jwt, items) {
-  if (!items.length) return;
-  const body = items.map((item) => ({
-    key: item.hash,
-    value: item.buffer.toString('base64'),
-    base64: true,
-    metadata: { contentType: item.contentType || 'application/octet-stream' },
-  }));
-  await cloudflareRequest(() => axios.post(
-    `${CLOUDFLARE_API}/pages/assets/upload`,
-    body,
-    {
-      headers: { Authorization: `Bearer ${jwt}`, 'Content-Type': 'application/json' },
-      timeout: 120000,
-      maxBodyLength: 55 * 1024 * 1024,
-      maxContentLength: 55 * 1024 * 1024,
-    }
-  ), 'Cloudflare asset upload');
-}
-
-async function cloudflareUpsertHashes(jwt, hashes) {
-  if (!hashes.length) return;
-  await cloudflareRequest(() => axios.post(
-    `${CLOUDFLARE_API}/pages/assets/upsert-hashes`,
-    { hashes },
-    { headers: { Authorization: `Bearer ${jwt}`, 'Content-Type': 'application/json' }, timeout: 30000 }
-  ), 'Cloudflare upsert-hashes');
-}
-
-async function createCloudflarePagesDeployment(projectName, files, onLog) {
-  validateCloudflareEnv();
-  const log = onLog || (async () => {});
-
-  // 1) Hitung hash BLAKE3 tiap file dulu (lihat cloudflareAssetHash di atas)
-  const items = files.map((file) => {
-    const cleanPath = file.path.replace(/^\/+/, '');
-    const ext = cleanPath.includes('.') ? cleanPath.split('.').pop() : '';
-    return {
-      path: cleanPath,
-      hash: cloudflareAssetHash(file.buffer, ext),
-      buffer: file.buffer,
-      contentType: guessContentType(cleanPath),
-    };
-  });
-  if (items.length > 20000) throw new Error(`Cloudflare Pages Direct Upload membatasi maksimal 20.000 file per deployment (project ini: ${items.length}).`);
-  const oversized = items.filter((item) => item.buffer.length > 25 * 1024 * 1024);
-  if (oversized.length) throw new Error(`Cloudflare Pages menolak file di atas 25 MiB. File terbesar: ${oversized[0].path}`);
-  const manifest = {};
-  for (const item of items) manifest[`/${item.path.replace(/^\/+/, '')}`] = item.hash;
-
-  // 2) Ambil upload token (JWT khusus asset, BUKAN token API biasa)
-  await log('Mengambil upload token Cloudflare…');
-  const jwt = await getCloudflareUploadToken(projectName);
-
-  // 3) Cek hash mana yang belum tersimpan di storage Cloudflare
-  await log('Memeriksa asset yang perlu diunggah (check-missing)…');
-  const missing = await cloudflareCheckMissing(jwt, items.map((i) => i.hash));
-  const missingSet = new Set(missing);
-  const toUpload = items.filter((i) => missingSet.has(i.hash));
-
-  // 4) Upload isi file yang belum ada, per-batch biar aman dari limit ukuran
-  if (toUpload.length) {
-    await log(`Mengunggah ${toUpload.length} asset…`);
-    const MAX_BATCH_BYTES = 38 * 1024 * 1024;
-    const MAX_BATCH_FILES = 1800;
-    let batch = [];
-    let batchBytes = 0;
-    const flush = async () => {
-      if (!batch.length) return;
-      await cloudflareUploadAssets(jwt, batch);
-      batch = [];
-      batchBytes = 0;
-    };
-    for (const item of toUpload) {
-      const base64Bytes = Buffer.byteLength(item.buffer.toString('base64'), 'utf8');
-      if (batch.length && (batch.length >= MAX_BATCH_FILES || batchBytes + base64Bytes > MAX_BATCH_BYTES)) await flush();
-      batch.push(item);
-      batchBytes += base64Bytes;
-    }
-    await flush();
-    await log('Mendaftarkan seluruh hash asset (upsert-hashes)…');
-    await cloudflareUpsertHashes(jwt, items.map((i) => i.hash));
-  }
-
-  // 5) Baru buat deployment sungguhan — isi file sudah ada di storage,
-  //    di sini cuma mereferensikan manifest (path -> hash).
-  await log('Membuat deployment dengan manifest…');
-  const { body, contentType } = buildMultipartFormData([
-    { name: 'branch', value: 'main' },
-    { name: 'manifest', value: JSON.stringify(manifest) },
-  ]);
-
-  const response = await axios.post(
-    `${CLOUDFLARE_API}/accounts/${encodeURIComponent(ENV.CLOUDFLARE_ACCOUNT_ID)}/pages/projects/${encodeURIComponent(projectName)}/deployments`,
-    body,
-    { headers: { ...cloudflareHeaders, 'Content-Type': contentType }, timeout: 60000 }
-  );
-
-  if (response.data?.success === false) {
-    const message = response.data?.errors?.map((e) => e.message).join('; ') || 'Deployment Cloudflare Pages gagal dibuat.';
-    throw new Error(message);
-  }
-  return response.data?.result;
-}
-
-async function getCloudflareDeployment(projectName, deploymentId) {
-  validateCloudflareEnv();
-  const response = await axios.get(
-    `${CLOUDFLARE_API}/accounts/${encodeURIComponent(ENV.CLOUDFLARE_ACCOUNT_ID)}/pages/projects/${encodeURIComponent(projectName)}/deployments/${encodeURIComponent(deploymentId)}`,
-    { headers: cloudflareHeaders, timeout: 20000 }
-  );
-  if (response.data?.success === false) {
-    const message = response.data?.errors?.map((e) => e.message).join('; ') || 'Gagal mengambil status deployment Cloudflare.';
-    throw new Error(message);
-  }
-  return response.data?.result;
-}
-
-async function waitForCloudflareDeployment(projectName, deploymentId, timeoutMs = 180000, onStatus) {
-  const start = Date.now();
-  let lastStage = '';
-  while (Date.now() - start < timeoutMs) {
-    const deployment = await getCloudflareDeployment(projectName, deploymentId);
-    const stages = deployment?.stages || [];
-    const current = stages.slice().reverse().find((s) => s.status === 'active' || s.status === 'failure') || stages[stages.length - 1];
-    const stageName = current?.name || '';
-    const stageStatus = current?.status || '';
-    if (stageName !== lastStage) {
-      lastStage = stageName;
-      if (onStatus) await onStatus(stageName, deployment);
-    }
-    const deployStage = stages.find((s) => s.name === 'deploy');
-    if (deployStage?.status === 'success') return { ...deployment, latest_stage: deployStage };
-    if (stageStatus === 'failure') return { ...deployment, latest_stage: current };
-    await sleep(4000);
-  }
-  throw new Error('Deployment Cloudflare Pages belum selesai dalam waktu yang ditentukan. Cek dashboard Cloudflare untuk detail.');
-}
-
-function getCloudflarePagesUrl(projectOrName) {
-  const raw = typeof projectOrName === 'object' ? (projectOrName.subdomain || projectOrName.name) : projectOrName;
-  return `https://${String(raw).replace(/\.pages\.dev$/i, '')}.pages.dev`;
-}
-
-async function deleteCloudflarePagesProject(name) {
-  validateCloudflareEnv();
-  const response = await axios.delete(
-    `${CLOUDFLARE_API}/accounts/${encodeURIComponent(ENV.CLOUDFLARE_ACCOUNT_ID)}/pages/projects/${encodeURIComponent(name)}`,
-    { headers: cloudflareHeaders, timeout: 30000 }
-  );
-  if (response.data?.success === false) {
-    const message = response.data?.errors?.map((e) => e.message).join('; ') || 'Gagal menghapus project Cloudflare Pages.';
-    throw new Error(message);
-  }
-}
-
-async function checkCloudflare() {
-  validateCloudflareEnv();
-  const response = await axios.get(
-    `${CLOUDFLARE_API}/accounts/${encodeURIComponent(ENV.CLOUDFLARE_ACCOUNT_ID)}/pages/projects`,
-    { headers: cloudflareHeaders, params: { per_page: 1 }, timeout: 20000 }
-  );
-  if (response.data?.success === false) {
-    const message = response.data?.errors?.map((e) => e.message).join('; ') || 'Cloudflare API menolak token ini.';
-    throw new Error(message);
-  }
-  return response.data;
-}
-
-// ─────────────────────────────────────────────
 // SCREENSHOT URL — pakai layanan publik thum.io, tidak butuh API key.
 // ─────────────────────────────────────────────
 
@@ -1541,27 +1221,6 @@ async function deleteNetlifySite(site) {
   });
 }
 
-async function resolveCloudflarePagesProjectFromUrl(urlInput) {
-  validateCloudflareEnv();
-  let value = String(urlInput).trim();
-  if (!/^https?:\/\//i.test(value)) value = `https://${value}`;
-  let host;
-  try {
-    host = new URL(value).hostname.toLowerCase();
-  } catch (_) {
-    throw new Error('Link tidak valid. Kirim URL lengkap, contoh: https://nama-web.pages.dev');
-  }
-  if (!host.endsWith('.pages.dev')) {
-    throw new Error('Link harus berupa domain *.pages.dev hasil deploy DevTools Raven.');
-  }
-  const baseSlug = host.slice(0, -'.pages.dev'.length);
-  const project = await getCloudflarePagesProject(baseSlug);
-  if (!project) {
-    throw new Error(`Project Cloudflare Pages untuk "${host}" tidak ditemukan. Pastikan link sesuai hasil deploy DevTools Raven.`);
-  }
-  return project;
-}
-
 async function resolveDeployTargetFromUrl(urlInput) {
   let value = String(urlInput).trim();
   if (!/^https?:\/\//i.test(value)) value = `https://${value}`;
@@ -1580,16 +1239,11 @@ async function resolveDeployTargetFromUrl(urlInput) {
     const site = await resolveNetlifySiteFromUrl(urlInput);
     return { platform: 'netlify', name: site.name, data: site };
   }
-  if (host.endsWith('.pages.dev')) {
-    const project = await resolveCloudflarePagesProjectFromUrl(urlInput);
-    return { platform: 'cloudflare', name: project.name, data: project };
-  }
-  throw new Error('Link harus berupa domain *.vercel.app, *.netlify.app, atau *.pages.dev hasil deploy DevTools Raven.');
+  throw new Error('Link harus berupa domain *.vercel.app atau *.netlify.app hasil deploy DevTools Raven.');
 }
 
 async function deleteDeployTarget(target) {
   if (target.platform === 'netlify') return deleteNetlifySite(target.data);
-  if (target.platform === 'cloudflare') return deleteCloudflarePagesProject(target.data.name);
   return deleteVercelProject(target.data);
 }
 
@@ -2031,7 +1685,6 @@ async function checkVercel() {
 // Vercel ZIP : boleh tambah .env (opsional), lalu didorong ke GitHub
 //              SEBELUM deployment Vercel (backup + source of truth repo).
 // Netlify    : direct deploy, tanpa GitHub.
-// Cloudflare : direct deploy, tanpa GitHub.
 //
 // Di semua alur, URL publik diverifikasi dulu sebelum dinyatakan sukses.
 // ─────────────────────────────────────────────
@@ -2126,38 +1779,8 @@ async function publishToNetlify(name, files, render) {
   return final.ssl_url || final.url || site.ssl_url || site.url;
 }
 
-async function publishToCloudflare(name, files, render) {
-  validateCloudflareEnv();
-  await render(15, 'Menyiapkan project Cloudflare Pages…');
-  const project = await ensureCloudflarePagesProject(name);
-
-  const deployment = await createCloudflarePagesDeployment(project.name, files, async (activity) => {
-    await render(45, activity);
-  });
-  const deploymentId = deployment?.id;
-  if (!deploymentId) {
-    throw new Error('Cloudflare tidak mengembalikan deployment id yang valid.');
-  }
-
-  await render(75, 'Menunggu status deployment…');
-  const finalDeployment = await waitForCloudflareDeployment(project.name, deploymentId, 180000, async (stage) => {
-    await render(85, `Status: ${stage || 'memproses'}…`);
-  });
-
-  const latestStage = finalDeployment?.latest_stage?.name || finalDeployment?.stages?.slice(-1)?.[0]?.name;
-  const latestStatus = finalDeployment?.latest_stage?.status || finalDeployment?.stages?.slice(-1)?.[0]?.status;
-  if (latestStage === 'deploy' && latestStatus && latestStatus !== 'success') {
-    throw new Error(`Deployment Cloudflare berakhir dengan status ${latestStatus}. Cek dashboard Cloudflare Pages untuk log lengkap.`);
-  }
-
-  // SENGAJA tidak pakai finalDeployment.url — itu URL unik per-deployment
-  // (mis. https://8374652c.namaproyek.pages.dev), bukan alias produksi.
-  // Domain produksi Cloudflare Pages SELALU {project}.pages.dev dan otomatis
-  // menunjuk ke deployment production terbaru begitu status "success".
-  return getCloudflarePagesUrl(project);
-}
-
 // ─────────────────────────────────────────────
+// FOTO / AUDIO KE URL// ─────────────────────────────────────────────
 // FOTO / AUDIO KE URL — upload 1 file, dapat link langsung ke file-nya
 // (numpang infrastruktur deploy Vercel yang sudah ada, tanpa backup
 // GitHub — supaya prosesnya ringan & cepat)
@@ -2278,7 +1901,6 @@ async function runPhotoUpload(ctx, files, statusMessage) {
 
 // ─────────────────────────────────────────────
 // VERIFIKASI DEPLOYMENT — dipakai SEMUA provider (Vercel, Netlify,
-// Cloudflare). Deploy TIDAK dianggap sukses hanya karena API provider
 // bilang "accepted"/"success" — di sini kita beneran HTTP-request ke URL
 // publiknya dan cek responsnya valid (bukan 404/500/gagal konek).
 // ─────────────────────────────────────────────
@@ -2303,6 +1925,106 @@ async function verifyPublicUrl(url, maxAttempts = 6, delayMs = 3000) {
     if (attempt < maxAttempts - 1) await sleep(delayMs);
   }
   return { ok: false, status: lastStatus, error: lastError };
+}
+
+// ─────────────────────────────────────────────
+// DEPLOYMENT ORCHESTRATOR — Vercel / Netlify.
+// Dipulihkan dari baseline source awal. Tidak membuat alur baru;
+// hanya mengarahkan session ke publisher yang tersedia.
+// ─────────────────────────────────────────────
+
+async function runDeployment(ctx, session, statusMessage) {
+  const repoName = repoSafeName(session.name);
+  const modeLabel = session.type === 'deploy_zip' ? 'Deploy ZIP' : 'Deploy HTML';
+  const platform = session.platform === 'netlify' ? 'netlify' : 'vercel';
+  const platformLabel = platformDisplayName(platform);
+  const startedAt = Date.now();
+  const isVercelHtml = platform === 'vercel' && session.type === 'deploy_html';
+  const isVercelZip = platform === 'vercel' && session.type === 'deploy_zip';
+
+  const render = async (percent, activity) => {
+    const rows = [
+      ['📡 Server', '🔵 <b>PROCESSING</b>'],
+      ['🛰️ Platform', escapeHtml(platformLabel)],
+      ['🔧 Mode', escapeHtml(modeLabel)],
+      ['📦 Nama Web', `<code>${escapeHtml(repoName)}</code>`],
+    ];
+    if (session.envVars?.length) rows.push(['🔐 .env', `<b>${session.envVars.length}</b> variable`]);
+    rows.push(['🔄 Progress', `<code>${progressBar(percent)}</code> ${percent}%`]);
+    rows.push(['📝 Activity', escapeHtml(activity)]);
+    await editPanel(ctx, statusMessage.message_id, panel({
+      heading: '📊 <b>PROSES</b>',
+      box: infoBox(rows),
+    }));
+  };
+
+  await render(5, 'Menyiapkan berkas…');
+
+  try {
+    if (isVercelZip) {
+      await render(10, 'Menyimpan berkas ke GitHub…');
+      const repo = await createGitHubRepo(repoName);
+      await uploadFilesToNewRepo(repo, session.files);
+    } else if (!isVercelHtml) {
+      try {
+        const repo = await createGitHubRepo(repoName);
+        await uploadFilesToNewRepo(repo, session.files);
+      } catch (_) {
+        // Backup GitHub bersifat best-effort untuk Netlify.
+      }
+    }
+
+    let url;
+    if (platform === 'netlify') {
+      url = await publishToNetlify(repoName, session.files, render);
+    } else {
+      url = await publishToVercel(repoName, session.files, render, session.envVars);
+    }
+
+    await render(97, 'Memverifikasi URL publik…');
+    const verification = await verifyPublicUrl(url);
+    if (!verification.ok) {
+      const reason = verification.error || `HTTP ${verification.status ?? 'tidak merespons'}`;
+      throw new Error(`Deployment dianggap GAGAL: URL publik tidak bisa diakses (${reason}), walau ${platformLabel} melaporkan proses selesai.`);
+    }
+
+    const elapsed = formatElapsed(Date.now() - startedAt);
+    await recordDeployment({
+      name: repoName,
+      platform,
+      url,
+      ownerId: uid(ctx),
+      ownerUsername: ctx.from?.username || null,
+      ts: Date.now(),
+    });
+
+    await editPanel(ctx, statusMessage.message_id, panel({
+      heading: '<b>DEPLOY BERHASIL ✅</b>',
+      box: infoBox([
+        ['📦 Project', escapeHtml(repoName)],
+        ['🛰️ Platform', escapeHtml(platformLabel)],
+        ['🔗 Link web', `<a href="${escapeHtml(url)}">${escapeHtml(url)}</a>`],
+        ['⏰ Waktu', escapeHtml(elapsed)],
+      ]),
+    }), homeButton());
+  } catch (error) {
+    const elapsed = formatElapsed(Date.now() - startedAt);
+    const logBody = error.detail
+      ? `📄 <b>Log Error:</b>\n<pre>${escapeHtml(String(error.detail).slice(0, 700))}</pre>`
+      : undefined;
+    await editPanel(ctx, statusMessage.message_id, panel({
+      heading: '<b>DEPLOY GAGAL ❌</b>',
+      box: infoBox([
+        ['📦 Project', escapeHtml(repoName)],
+        ['🛰️ Platform', escapeHtml(platformLabel)],
+        ['⚠️ Penyebab', escapeHtml(errorMessage(error))],
+        ['⏰ Waktu', escapeHtml(elapsed)],
+      ]),
+      body: logBody,
+    }), homeButton());
+  } finally {
+    sessions.delete(uid(ctx));
+  }
 }
 
 // ─────────────────────────────────────────────
@@ -2498,20 +2220,6 @@ bot.start(async (ctx) => {
   return sendMainMenu(ctx);
 });
 
-bot.action('guest_help', async (ctx) => {
-  await ctx.answerCbQuery();
-  if (isAllowed(ctx)) return sendMainMenu(ctx);
-  await sendPanel(ctx, panel({
-    heading: '<b>BANTUAN AKSES</b>',
-    body:
-      'Bot ini menyediakan otomasi deployment dan tools developer untuk user yang sudah memiliki akses.\n\n' +
-      '💳 <b>Buy Akses</b> — membuka chat owner dengan pesan pembelian otomatis.\n' +
-      '💬 <b>Hubungi WhatsApp Owner</b> — membuka kontak WhatsApp owner.\n' +
-      '📣 <b>Saluran Produk Owner</b> — membuka saluran produk resmi.\n\n' +
-      'Setelah akses diberikan oleh owner, kirim <code>/start</code> lagi untuk membuka menu DevTools Raven.',
-  }), guestMenuMarkup());
-});
-
 bot.action('home', async (ctx) => {
   await ctx.answerCbQuery();
   sessions.delete(uid(ctx));
@@ -2583,33 +2291,6 @@ bot.action('netlify_zip', async (ctx) => {
   );
 });
 
-bot.action('deploy_cloudflare', async (ctx) => {
-  await ctx.answerCbQuery();
-  await sendPanel(ctx, panel({
-    heading: '<b>DEPLOY CLOUDFLARE PAGES</b>',
-    body: 'Pilih tipe file yang mau di-deploy:',
-  }), fileTypeMarkup('cloudflare'));
-});
-
-bot.action('cloudflare_html', async (ctx) => {
-  await ctx.answerCbQuery();
-  await sendPrompt(
-    ctx,
-    'Deploy HTML — Cloudflare',
-    '🚀 <b>Langkah 1 dari 2 — Kirim File</b>\n\nUnggah 1 file dengan ekstensi <code>.html</code> sebagai halaman utama website kamu.\n\n<i>Balas pesan ini dengan mengirim filenya sebagai dokumen (bukan foto).</i>',
-    { type: 'deploy_html', platform: 'cloudflare', step: 'file' }
-  );
-});
-
-bot.action('cloudflare_zip', async (ctx) => {
-  await ctx.answerCbQuery();
-  await sendPrompt(
-    ctx,
-    'Deploy ZIP — Cloudflare',
-    '📦 <b>Langkah 1 dari 2 — Kirim File</b>\n\nUnggah 1 file <code>.zip</code> berisi seluruh project website kamu.\n\n⚠️ Wajib ada <code>index.html</code> di root ZIP (atau di dalam satu folder pembungkus tunggal).',
-    { type: 'deploy_zip', platform: 'cloudflare', step: 'file' }
-  );
-});
 
 bot.action('get_source', async (ctx) => {
   await ctx.answerCbQuery();
@@ -2633,12 +2314,11 @@ bot.action('encrypt_html', async (ctx) => {
 
 bot.action('system', async (ctx) => {
   await ctx.answerCbQuery('Memeriksa koneksi…');
-  const status = await sendPanel(ctx, panel({ heading: '<b>SYSTEM CHECK</b>', body: '⏳ Memeriksa koneksi Telegram, GitHub, dan Vercel…' }));
+  const status = await sendPanel(ctx, panel({ heading: '<b>SYSTEM CHECK</b>', body: '⏳ Memeriksa koneksi Telegram, GitHub, Vercel, dan Netlify…' }));
   const rows = [];
   try { await checkGitHub(); rows.push(['🐙 GitHub API', '🟢 <b>Terhubung</b>']); } catch (e) { rows.push(['🐙 GitHub API', `🔴 <code>${escapeHtml(errorMessage(e))}</code>`]); }
   try { await checkVercel(); rows.push(['▲ Vercel API', '🟢 <b>Terhubung</b>']); } catch (e) { rows.push(['▲ Vercel API', `🔴 <code>${escapeHtml(errorMessage(e))}</code>`]); }
   try { await checkNetlify(); rows.push(['☁️ Netlify API', '🟢 <b>Terhubung</b>']); } catch (e) { rows.push(['☁️ Netlify API', `🔴 <code>${escapeHtml(errorMessage(e))}</code>`]); }
-  try { await checkCloudflare(); rows.push(['☁️ Cloudflare API', blake3Module ? '🟢 <b>Terhubung + BLAKE3 OK</b>' : '🔴 <b>BLAKE3 belum terpasang</b>']); } catch (e) { rows.push(['☁️ Cloudflare API', `🔴 <code>${escapeHtml(errorMessage(e))}</code>`]); }
   rows.push(['✈️ Telegram', '🟢 <b>Aktif</b>']);
   await editPanel(ctx, status.message_id, panel({ heading: '<b>SYSTEM STATUS</b>', box: infoBox(rows) }), homeButton());
 });
@@ -2721,7 +2401,8 @@ bot.action('list_web', async (ctx) => {
   await ctx.answerCbQuery('Memuat daftar…');
   const all = await loadDeployments();
   const ownerView = isOwner(ctx);
-  const relevant = ownerView ? all : all.filter((d) => d.ownerId === uid(ctx));
+  const supportedDeployments = all.filter((d) => d.platform === 'vercel' || d.platform === 'netlify');
+  const relevant = ownerView ? supportedDeployments : supportedDeployments.filter((d) => d.ownerId === uid(ctx));
   const recent = relevant.slice(-20).reverse();
 
   if (!recent.length) {
@@ -2931,7 +2612,7 @@ bot.action('help_info', async (ctx) => {
     heading: '<b>ℹ️ TENTANG BOT INI</b>',
     body:
       '<b>DevTools Raven V3</b> menyediakan utilitas deployment, pengelolaan project, media, source, dan otomasi bot dengan API resmi.\n\n<b>Ringkasan fitur:</b>\n' +
-      '🚀 Deploy Vercel/Netlify/Cloudflare — upload HTML/ZIP, langsung online\n' +
+      '🚀 Deploy Vercel/Netlify — upload HTML/ZIP, langsung online\n' +
       '⚙️ Tambah .env — isi environment variable sebelum deploy (Vercel ZIP)\n' +
       '📱 Web ke APK — build APK Android dari HTML/ZIP menggunakan GitHub Actions\n' +
       '🌐 Get Source — repository GitHub diambil sebagai ZIP asli; website publik hanya mengambil byte source/assets yang benar-benar tersedia\n' +
@@ -2990,7 +2671,7 @@ bot.action('delete_web', async (ctx) => {
   await sendPrompt(
     ctx,
     'Delete Web',
-    '🗑️ <b>Kirim Link Website</b>\n\nKirim link website hasil deploy DevTools Raven yang ingin dihapus.\nContoh: <code>https://nama-web.vercel.app</code>, <code>https://nama-web.netlify.app</code>, atau <code>https://nama-web.pages.dev</code>\n\nBot otomatis kenali platform-nya dari link. Website (Vercel/Netlify/Cloudflare) dan repository (GitHub) yang cocok akan otomatis ikut terhapus — tidak perlu cari ID atau buka dashboard.',
+    '🗑️ <b>Kirim Link Website</b>\n\nKirim link website hasil deploy DevTools Raven yang ingin dihapus.\nContoh: <code>https://nama-web.vercel.app</code> atau <code>https://nama-web.netlify.app</code>\n\nBot otomatis mengenali platform dari link dan menghapus website beserta repository GitHub yang cocok bila ditemukan.',
     { type: 'delete', step: 'link' }
   );
 });
