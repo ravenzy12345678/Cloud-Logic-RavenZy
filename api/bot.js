@@ -12,7 +12,7 @@ const path = require('path');
 // gagal load TIDAK BOLEH bikin seluruh bot mati.
 let blake3Module = null;
 try {
-  blake3Module = require('blake3');
+  blake3Module = require('blake3-wasm');
 } catch (_) {
   blake3Module = null;
 }
@@ -298,12 +298,12 @@ function infoBox(rows) {
 }
 
 function panel({ heading, box, body, footer } = {}) {
-  let out = '';
-  if (heading) out += `${heading}\n`;
-  if (box) out += `${box}\n`;
-  if (body) out += `${body}\n`;
-  if (footer) out += `\n${footer}`;
-  return out.trim();
+  const sections = [];
+  if (heading) sections.push(heading);
+  if (box) sections.push(box);
+  if (body) sections.push(body);
+  if (footer) sections.push(footer);
+  return sections.filter(Boolean).join('\n\n').trim();
 }
 
 function progressBar(percent) {
@@ -369,14 +369,13 @@ async function sendMainMenu(ctx) {
   const menuText = [
     `👋 Halo, ${name}! Selamat Datang`,
     BAR,
-    `🤖 ${BRAND}`,
+    `🤖 DEVTOOLS RAVEN  ·  V3`,
     BAR,
-    `┃❏ 🛠<b>developer</b> : RavenZy`,
-    `┃❏ 📡<b>version</b> : 3.0.0`,
-    `┃❏ 🔮<b>status</b> : Online✅`,
+    `┃❏ 🛠𝗱𝗲𝘃𝗲𝗹𝗼𝗽𝗲𝗿 : RavenZy`,
+    `┃❏ 📡𝘃𝗲𝗿𝘀𝗶𝗼𝗻 : 3.0.0`,
+    `┃❏ 🔮𝘀𝘁𝗮𝘁𝘂𝘀: Online✅`,
     `╰━──────────────────────━❏`,
-    '',
-    `( 🍃 ) <b>Pilih Menu Di Bawah...</b>`,
+    `( 🍃 ) 𝗣𝗶𝗹𝗶𝗵 𝗠𝗲𝗻𝘂 𝗗𝗶 𝗕𝗮𝘄𝗮𝗵...ᝄ`,
   ].join('\n');
   const photoBuffer = loadBotPhotoBuffer();
   const keyboard = mainMenuMarkup(ctx);
@@ -2931,8 +2930,7 @@ bot.action('help_info', async (ctx) => {
   await sendPanel(ctx, panel({
     heading: '<b>ℹ️ TENTANG BOT INI</b>',
     body:
-      `${BRAND} — bot otomasi deploy website, kelola project, dan utilitas developer. Semua fitur pakai API resmi (GitHub, Vercel, Netlify, Cloudflare), tidak ada yang simulasi.\n\n` +
-      '<b>Ringkasan fitur:</b>\n' +
+      '<b>DevTools Raven V3</b> menyediakan utilitas deployment, pengelolaan project, media, source, dan otomasi bot dengan API resmi.\n\n<b>Ringkasan fitur:</b>\n' +
       '🚀 Deploy Vercel/Netlify/Cloudflare — upload HTML/ZIP, langsung online\n' +
       '⚙️ Tambah .env — isi environment variable sebelum deploy (Vercel ZIP)\n' +
       '📱 Web ke APK — build APK Android dari HTML/ZIP menggunakan GitHub Actions\n' +
