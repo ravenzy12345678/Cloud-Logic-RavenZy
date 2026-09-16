@@ -16,6 +16,9 @@ const ENV = {
   VERCEL_HOOK: process.env.VERCEL_HOOK,
   VERCEL_TEAM_ID: process.env.VERCEL_TEAM_ID || '',
   NETLIFY_TOKEN: process.env.NETLIFY_TOKEN,
+  QRIS_URL: process.env.QRIS_URL || process.env.DONATION_QRIS_URL || '',
+  TIME_ZONE: process.env.TIME_ZONE || 'Asia/Jakarta',
+  DOWNLOAD_API_URL: process.env.DOWNLOAD_API_URL || '',
 };
 
 function requireConfig() {
@@ -31,7 +34,6 @@ const sessions = new Map();
 let allowedUsers = new Set([OWNER_ID]);
 const userProfiles = new Map();
 
-const DONATION_QRIS_URL = 'https://n.uguu.se/WbYEStaW.jpeg';
 const OWNER_TELEGRAM_URL = 'https://t.me/RavenZyPT';
 const OWNER_WHATSAPP_URL = 'https://wa.me/6288271102065';
 const OWNER_CHANNEL_URL = 'https://whatsapp.com/channel/0029Vb89MImFHWptXTOThg3G';
@@ -57,10 +59,6 @@ const netlifyHeaders = {
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const uid = (ctx) => Number(ctx.from?.id);
 
-// Multipart/form-data dibangun manual pakai Node bawaan (Buffer + crypto),
-// SENGAJA tidak pakai package npm 'form-data' — supaya bot tidak bisa
-// crash gara-gara 1 dependency kelupaan ke-install (mis. package.json lupa
-// ditimpa). Cuma butuh axios yang memang sudah wajib ada dari awal.
 function buildMultipartFormData(fields) {
   const boundary = `----DevToolsRavenBoundary${crypto.randomBytes(16).toString('hex')}`;
   const chunks = [];
@@ -86,7 +84,16 @@ function escapeHtml(value) {
 
 function platformDisplayName(platform) {
   if (platform === 'netlify') return 'Netlify';
+  if (platform === 'github_pages') return 'GitHub Pages';
   return 'Vercel';
+}
+
+function formatCreatedDate(ts) {
+  return new Intl.DateTimeFormat('id-ID', { timeZone: ENV.TIME_ZONE, day: '2-digit', month: 'long', year: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false }).format(new Date(ts)).replace(' pukul ', ', ').replace(/\./g, '');
+}
+
+function deploySuccessMessage(name, url, ts) {
+  return `WEBSITE BERHASIL DI-DEPLOY! ✅️\n━━━━━━━━━━━━━━━━━━━━━━━━━\n🏷 Proyek : ${escapeHtml(name)}\n🔗 URL    : <a href="${escapeHtml(url)}">${escapeHtml(url)}</a>\n✨️ Dibuat : ${escapeHtml(formatCreatedDate(ts))}`;
 }
 
 function errorMessage(error) {
@@ -169,21 +176,6 @@ async function safeDeleteMessage(ctx, chatId, messageId) {
   try { await ctx.telegram.deleteMessage(chatId, messageId); } catch (_) {}
 }
 
-// ─────────────────────────────────────────────
-// TAMPILAN / UI HELPERS
-//
-// Aturan tampilan bot ini:
-// 1. Navigasi HANYA lewat inline button pada pesan bot (tidak ada Reply
-//    Keyboard, tidak ada daftar perintah "/" selain /start dan /cancel),
-//    supaya tidak ada dua menu berbeda yang membingungkan.
-// 2. Semua pesan mematikan link preview (disable_web_page_preview) supaya
-//    tidak ada kartu/gambar preview GitHub atau Vercel yang muncul —
-//    tampilan tetap murni teks & status.
-// 3. Tombol "Menu Utama" TIDAK PERNAH menghapus pesan yang ditempelinya,
-//    jadi hasil (link deploy, hasil delete, dsb) tidak pernah hilang saat
-//    pengguna menekan tombol itu atau /start ulang.
-// 4. Menu owner (Add User, Users, Broadcast) HANYA muncul untuk OWNER_ID.
-// ─────────────────────────────────────────────
 
 const BAR = '───── ✦ ───── ✦ ─────';
 const BRAND = 'DEVTOOLS RAVEN · V3';
@@ -196,12 +188,12 @@ function mainMenuMarkup(ctx) {
   const rows = [
     [Markup.button.callback('🚀  Deployment', 'deployment_menu')],
     [Markup.button.callback('📄  Get Source', 'get_source'), Markup.button.callback('🛡️  Encrypt HTML', 'encrypt_html')],
-    [Markup.button.callback('🖼️  Media ke URL', 'media_menu'), Markup.button.callback('📸  Screenshot URL', 'screenshot_url')],
-    [Markup.button.callback('📦  Get Repo ZIP', 'repo_zip'), Markup.button.callback('🔎  Cari Repo', 'search_repo')],
-    [Markup.button.callback('🤖  Generate Bot', 'generate_bot'), Markup.button.callback('📱  Web ke APK', 'web_to_apk')],
-    [Markup.button.callback('📋  List Web', 'list_web'), Markup.button.callback('🗑️  Delete Web', 'delete_web')],
-    [Markup.button.callback('📡  System Check', 'system'), Markup.button.callback('ℹ️  Bantuan', 'help_info')],
-    [Markup.button.callback('💝  Donasi', 'donation')],
+    [Markup.button.callback('🖼️  Media ke URL', 'media_menu'), Markup.button.callback('📥  Download Media', 'download_menu')],
+    [Markup.button.callback('📸  Screenshot URL', 'screenshot_url'), Markup.button.callback('📦  Get Repo ZIP', 'repo_zip')],
+    [Markup.button.callback('🔎  Cari Repo', 'search_repo'), Markup.button.callback('🤖  Generate Bot', 'generate_bot')],
+    [Markup.button.callback('📱  Web ke APK', 'web_to_apk'), Markup.button.callback('📋  List Web', 'list_web')],
+    [Markup.button.callback('🗑️  Delete Web', 'delete_web'), Markup.button.callback('📡  System Check', 'system')],
+    [Markup.button.callback('ℹ️  Bantuan', 'help_info'), Markup.button.callback('💝  Donasi', 'donation')],
   ];
   if (ctx && isOwner(ctx)) {
     rows.push([Markup.button.callback('👤  Add User', 'add_user'), Markup.button.callback('👥  Users', 'users')]);
@@ -213,6 +205,7 @@ function mainMenuMarkup(ctx) {
 function deploymentMenuMarkup() {
   return Markup.inlineKeyboard([
     [Markup.button.callback('▲  Vercel', 'deploy_vercel'), Markup.button.callback('🌐  Netlify', 'deploy_netlify')],
+    [Markup.button.callback('🐙  GitHub Pages', 'github_pages_menu')],
     [Markup.button.callback('🏠  Menu Utama', 'home')],
   ]);
 }
@@ -221,6 +214,22 @@ function mediaMenuMarkup() {
   return Markup.inlineKeyboard([
     [Markup.button.callback('🖼️  Foto ke URL', 'photo_url'), Markup.button.callback('🎵  Audio ke URL', 'audio_url')],
     [Markup.button.callback('🎬  Video ke URL', 'video_url')],
+    [Markup.button.callback('📋  List Media', 'media_list'), Markup.button.callback('🗑️  Delete Media', 'media_delete')],
+    [Markup.button.callback('🏠  Menu Utama', 'home')],
+  ]);
+}
+
+function downloadMenuMarkup() {
+  return Markup.inlineKeyboard([
+    [Markup.button.callback('🎵  TikTok', 'download_tiktok'), Markup.button.callback('📸  Instagram', 'download_instagram')],
+    [Markup.button.callback('▶️  YouTube', 'download_youtube')],
+    [Markup.button.callback('🏠  Menu Utama', 'home')],
+  ]);
+}
+
+function githubPagesMenuMarkup() {
+  return Markup.inlineKeyboard([
+    [Markup.button.callback('📄  Deploy HTML', 'github_pages_html'), Markup.button.callback('📦  Deploy ZIP', 'github_pages_zip')],
     [Markup.button.callback('🏠  Menu Utama', 'home')],
   ]);
 }
@@ -232,7 +241,6 @@ function fileTypeMarkup(platform) {
   ]);
 }
 
-// Alur nama website — dipakai setelah file diterima (HTML/ZIP).
 async function askForWebsiteName(ctx, session, prefixText = '') {
   session.step = 'name';
   const platformLabel = platformDisplayName(session.platform);
@@ -241,7 +249,6 @@ async function askForWebsiteName(ctx, session, prefixText = '') {
   await sendPrompt(ctx, title, body, session);
 }
 
-// Alur .env KHUSUS Vercel ZIP.
 async function askEnvChoiceOrName(ctx, session, prefixText) {
   if (session.platform !== 'vercel' || session.type === 'deploy_html') {
     await askForWebsiteName(ctx, session, prefixText);
@@ -314,11 +321,6 @@ async function editPanel(ctx, messageId, text, keyboard) {
   }
 }
 
-// ─────────────────────────────────────────────
-// BOT.PNG — HANYA dipakai di Menu Utama (/start & tombol Home). Menu/submenu
-// lain TETAP teks biasa, tidak berubah. Kalau file tidak ketemu, otomatis
-// fallback ke menu teks biasa — bot TIDAK BOLEH crash gara-gara ini.
-// ─────────────────────────────────────────────
 
 let cachedBotPhotoBuffer;
 function loadBotPhotoBuffer() {
@@ -335,7 +337,6 @@ function loadBotPhotoBuffer() {
         return cachedBotPhotoBuffer;
       }
     } catch (_) {
-      // lanjut coba path berikutnya
     }
   }
   cachedBotPhotoBuffer = null;
@@ -353,7 +354,7 @@ async function sendMainMenu(ctx) {
     `┃❏ 📡𝘃𝗲𝗿𝘀𝗶𝗼𝗻 : 3.0.0`,
     `┃❏ 🔮𝘀𝘁𝗮𝘁𝘂𝘀: Online✅`,
     `╰━──────────────────────━❏`,
-    `( 🍃 ) 𝗣𝗶𝗹𝗶𝗵 𝗠𝗲𝗻𝘂 𝗗𝗶 𝗕𝗮𝘄𝗮𝗵...ᝄ`,
+    `( ⬇️ ) 𝗣𝗶𝗹𝗶𝗵 𝗠𝗲𝗻𝘂 𝗗𝗶 𝗕𝗮𝘄𝗮𝗵...ᝄ`,
   ].join('\n');
   const photoBuffer = loadBotPhotoBuffer();
   const keyboard = mainMenuMarkup(ctx);
@@ -464,11 +465,6 @@ async function refreshUserProfileById(id) {
   }
 }
 
-// ─────────────────────────────────────────────
-// RIWAYAT DEPLOY — dipakai fitur "List Web". Disimpan di file JSON yang
-// sama polanya dengan daftar user (di repo backup GitHub), supaya List Web
-// benar-benar berisi data deploy asli, bukan data karangan/simulasi.
-// ─────────────────────────────────────────────
 
 async function loadDeployments() {
   try {
@@ -482,9 +478,6 @@ async function loadDeployments() {
 }
 
 async function recordDeployment(entry) {
-  // Best-effort: kalau gagal simpan catatan, JANGAN gagalkan proses deploy
-  // itu sendiri. Ada 1x retry kalau kena konflik versi (409) karena ada
-  // proses lain yang menulis file yang sama nyaris bersamaan.
   for (let attempt = 0; attempt < 2; attempt += 1) {
     try {
       const file = await getBotRepoFile('devtools-raven-deployments.json');
@@ -539,6 +532,55 @@ async function removeDeploymentRecord(name, platform) {
       return;
     }
   }
+}
+
+async function loadMediaRecords() {
+  try {
+    const file = await getBotRepoFile('devtools-raven-media.json');
+    if (!file?.content) return [];
+    const parsed = JSON.parse(Buffer.from(file.content, 'base64').toString('utf8'));
+    return Array.isArray(parsed) ? parsed : [];
+  } catch (_) {
+    return [];
+  }
+}
+
+async function recordMedia(entry) {
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      const file = await getBotRepoFile('devtools-raven-media.json');
+      let list = [];
+      if (file?.content) { try { list = JSON.parse(Buffer.from(file.content, 'base64').toString('utf8')); } catch (_) { list = []; } }
+      if (!Array.isArray(list)) list = [];
+      list.push(entry);
+      if (list.length > 300) list = list.slice(-300);
+      await writeBotRepoFile('devtools-raven-media.json', JSON.stringify(list, null, 2), 'chore: record DevTools Raven media', file?.sha);
+      return true;
+    } catch (error) {
+      if (attempt === 0 && error.response?.status === 409) continue;
+      return false;
+    }
+  }
+  return false;
+}
+
+async function removeMediaRecord(projectName, ownerId) {
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      const file = await getBotRepoFile('devtools-raven-media.json');
+      if (!file?.content) return false;
+      const list = JSON.parse(Buffer.from(file.content, 'base64').toString('utf8'));
+      if (!Array.isArray(list)) return false;
+      const filtered = list.filter((x) => !(x.projectName === projectName && Number(x.ownerId) === Number(ownerId)));
+      if (filtered.length === list.length) return false;
+      await writeBotRepoFile('devtools-raven-media.json', JSON.stringify(filtered, null, 2), 'chore: remove DevTools Raven media', file.sha);
+      return true;
+    } catch (error) {
+      if (attempt === 0 && error.response?.status === 409) continue;
+      return false;
+    }
+  }
+  return false;
 }
 
 async function githubApi(method, path, data, config = {}) {
@@ -674,12 +716,6 @@ async function getVercelTeamIds() {
   return ids;
 }
 
-// ─────────────────────────────────────────────
-// VERCEL PROJECT + ENV VAR — dipakai untuk fitur "Tambah .env" (Deploy ZIP
-// Vercel) dan "Generate Bot". Project harus dibuat/ada duluan sebelum env
-// var bisa ditempel, dan env var harus sudah ada sebelum deployment dibuat
-// supaya langsung terpakai deployment pertamanya.
-// ─────────────────────────────────────────────
 
 async function ensureVercelProject(name) {
   const projectName = projectSafeName(name);
@@ -722,9 +758,6 @@ async function pushVercelEnvVars(project, envVars) {
 }
 
 async function createVercelDeployment(name, files) {
-  // Deploy langsung dari isi file (bukan gitSource) supaya TIDAK bergantung
-  // sama sekali pada GitHub App Integration Vercel <-> GitHub. Hanya butuh
-  // VERCEL_TOKEN yang valid untuk akun/scope yang dipakai.
   const payload = {
     name: projectSafeName(name),
     target: 'production',
@@ -778,11 +811,6 @@ async function getDeployment(deploymentId, teamId) {
 }
 
 async function getCleanProductionUrl(deploymentId, teamId, projectName) {
-  // Deployment yang baru dibuat punya URL unik berisi hash acak
-  // (mis. nama-b9gt875u5-user.vercel.app). Alias "bersih" produksi
-  // (nama.vercel.app) baru muncul di endpoint alias terpisah, dan kadang
-  // butuh beberapa detik setelah status READY sebelum benar-benar muncul
-  // di situ — jadi kita coba beberapa kali dengan jeda, bukan cuma sekali.
   const target = `${projectName}.vercel.app`;
   for (let attempt = 0; attempt < 8; attempt += 1) {
     try {
@@ -797,15 +825,12 @@ async function getCleanProductionUrl(deploymentId, teamId, projectName) {
       const nonHashed = aliases.find((alias) => !/-[a-z0-9]{9,}(-[a-z0-9-]+)?\.vercel\.app$/i.test(alias));
       if (nonHashed) return nonHashed;
     } catch (_) {
-      // coba lagi di percobaan berikutnya
     }
     if (attempt < 7) await sleep(2000);
   }
   return target;
 }
 
-// Set explicit alias {project}.vercel.app supaya URL yang dikembalikan
-// ke user SELALU bentuk bersih, bukan URL ber-hash dari deployment baru.
 async function ensureVercelAlias(projectName, deploymentId, teamId) {
   const target = `${projectSafeName(projectName)}.vercel.app`;
   const scopes = [teamId || null, ...(await getVercelTeamIds())];
@@ -826,16 +851,12 @@ async function ensureVercelAlias(projectName, deploymentId, teamId) {
     } catch (error) {
       lastError = error;
       const status = error.response?.status;
-      // 409 = alias sudah dipakai deployment lain; coba tetap lanjut karena
-      // deployment baru seharusnya menang untuk target production.
       if (status === 409) {
         return target;
       }
       if (![401, 403].includes(status)) break;
     }
   }
-  // Kalau memang gagal menetapkan alias eksplisit, tidak fatal — biarkan
-  // pemanggil fallback ke getCleanProductionUrl.
   if (lastError) console.error('[VERCEL ALIAS]', errorMessage(lastError));
   return null;
 }
@@ -856,9 +877,6 @@ async function waitForDeployment(deploymentId, teamId, timeoutMs = 180000, onSta
   throw new Error('Deployment belum selesai dalam 3 menit. Periksa lagi beberapa saat lagi.');
 }
 
-// ─────────────────────────────────────────────
-// NETLIFY — deploy langsung via upload ZIP, tanpa GitHub sama sekali
-// ─────────────────────────────────────────────
 
 async function zipFiles(files) {
   const zip = new JSZip();
@@ -878,11 +896,6 @@ async function createNetlifySite(name) {
 }
 
 async function deployZipToNetlifyBuilds(siteId, zipBuffer) {
-  // PAKAI Build API (multipart/form-data ke /builds), BUKAN kirim ZIP mentah
-  // langsung ke /deploys. Metode raw-zip (Content-Type: application/zip)
-  // punya bug lama di Netlify: HTML kadang ke-serve sebagai teks mentah
-  // (Content-Type salah), bukan di-render sebagai halaman web. Build API
-  // ini yang resmi direkomendasikan Netlify untuk deploy otomatis via tools.
   const { body, contentType } = buildMultipartFormData([
     { name: 'title', value: 'DevTools Raven deployment' },
     { name: 'zip', value: zipBuffer, filename: 'site.zip', contentType: 'application/zip' },
@@ -931,15 +944,12 @@ async function checkNetlify() {
   return r.data;
 }
 
-// ─────────────────────────────────────────────
-// SCREENSHOT URL — pakai layanan publik thum.io, tidak butuh API key.
-// ─────────────────────────────────────────────
 
 async function screenshotUrl(targetUrl) {
   let value = String(targetUrl).trim();
   if (!/^https?:\/\//i.test(value)) value = `https://${value}`;
   try {
-    new URL(value); // validasi format
+    new URL(value);
   } catch (_) {
     throw new Error('URL tidak valid.');
   }
@@ -977,7 +987,6 @@ async function extractZip(buffer) {
   const lowerIndex = raw.find((f) => f.path.toLowerCase() === 'index.html');
   if (lowerIndex) return raw;
 
-  // Coba ratakan folder pembungkus tunggal (mis. "my-site/index.html" → "index.html")
   const topFolders = new Set(raw.map((f) => f.path.split('/')[0]));
   if (topFolders.size === 1) {
     const [prefix] = topFolders;
@@ -987,9 +996,6 @@ async function extractZip(buffer) {
   throw new Error('ZIP harus mempunyai index.html sebagai halaman utama.');
 }
 
-// Versi lebih longgar buat fitur Generate Bot — TIDAK mewajibkan index.html
-// (project bot backend nggak butuh itu), cukup ratakan folder pembungkus
-// tunggal kalau ada, sisanya diserahkan apa adanya.
 async function extractZipGeneric(buffer) {
   const zip = await JSZip.loadAsync(buffer);
   const raw = [];
@@ -1013,13 +1019,6 @@ async function extractZipGeneric(buffer) {
   return raw;
 }
 
-// ─────────────────────────────────────────────
-// GENERATE BOT — deteksi otomatis file webhook (bot handler) dari ZIP
-// project yang di-upload. Urutan prioritas:
-// 1. vercel.json bawaan ZIP (kalau ada, paling akurat, dipakai apa adanya)
-// 2. Scan folder api/*.js — 1 file = otomatis, banyak file = tanya user,
-//    0 file = webhook tidak didaftarkan otomatis (dijelaskan ke user)
-// ─────────────────────────────────────────────
 
 function detectGenerateBotWebhookPath(files) {
   const vercelJsonFile = files.find((f) => f.path.toLowerCase() === 'vercel.json');
@@ -1038,7 +1037,6 @@ function detectGenerateBotWebhookPath(files) {
         }
       }
     } catch (_) {
-      // vercel.json tidak valid JSON — lanjut ke fallback scan folder api/
     }
   }
 
@@ -1077,17 +1075,12 @@ async function tryGetVercelProject(idOrName) {
       });
       return { ...response.data, teamId: teamId || null };
     } catch (_) {
-      // coba scope berikutnya
     }
   }
   return null;
 }
 
 async function findProjectByDeploymentHost(host) {
-  // Cocokkan persis ke deployment.url (bukan menebak pola nama), ini yang
-  // paling akurat untuk link lama berformat "nama-hashacak-teamslug.vercel.app"
-  // karena teamslug sendiri bisa berisi tanda "-" sehingga tebak-tebakan
-  // pemotongan teks jadi tidak bisa diandalkan.
   const scopes = [null, ...(await getVercelTeamIds())];
   for (const teamId of scopes) {
     let cursor;
@@ -1129,12 +1122,9 @@ async function resolveVercelProjectFromUrl(urlInput) {
 
   const baseSlug = host.slice(0, -'.vercel.app'.length);
 
-  // 1) Coba langsung: cocok untuk link bersih (nama-project.vercel.app)
   let project = await tryGetVercelProject(baseSlug);
   if (project) return project;
 
-  // 2) Coba cocokkan persis ke deployment aslinya (akurat untuk link lama
-  //    yang masih ada hash acak di belakangnya)
   project = await findProjectByDeploymentHost(host);
   if (project) return project;
 
@@ -1163,9 +1153,6 @@ async function tryGetNetlifySite(idOrName) {
 }
 
 async function findNetlifySiteByHost(host) {
-  // Fallback kalau site_id/name langsung tidak cocok (mis. site sudah pakai
-  // custom domain tapi kita masih terima link *.netlify.app lama, atau
-  // sebaliknya) — telusuri daftar site milik akun dan cocokkan.
   if (!ENV.NETLIFY_TOKEN) return null;
   for (let page = 1; page <= 10; page += 1) {
     try {
@@ -1221,31 +1208,28 @@ async function deleteNetlifySite(site) {
   });
 }
 
+async function resolveGithubPagesRepoFromUrl(urlInput) {
+  let value = String(urlInput).trim();
+  if (!/^https?:\/\//i.test(value)) value = `https://${value}`;
+  const parsed = new URL(value);
+  const ownerHost = `${String(ENV.GH_OWNER).toLowerCase()}.github.io`;
+  if (parsed.hostname.toLowerCase() !== ownerHost) throw new Error(`Link GitHub Pages harus berada di ${ownerHost}.`);
+  const parts = parsed.pathname.split('/').filter(Boolean);
+  const repoName = parts[0] || `${ENV.GH_OWNER}.github.io`;
+  return (await githubApi('GET', `/repos/${encodeURIComponent(ENV.GH_OWNER)}/${encodeURIComponent(repoName)}`, undefined, { timeout: 30000 })).data;
+}
+
 async function resolveDeployTargetFromUrl(urlInput) {
   let value = String(urlInput).trim();
   if (!/^https?:\/\//i.test(value)) value = `https://${value}`;
   let host;
-  try {
-    host = new URL(value).hostname.toLowerCase();
-  } catch (_) {
-    throw new Error('Link tidak valid. Kirim URL lengkap, contoh: https://nama-web.vercel.app');
-  }
-
-  if (host.endsWith('.vercel.app')) {
-    const project = await resolveVercelProjectFromUrl(urlInput);
-    return { platform: 'vercel', name: project.name, data: project };
-  }
-  if (host.endsWith('.netlify.app')) {
-    const site = await resolveNetlifySiteFromUrl(urlInput);
-    return { platform: 'netlify', name: site.name, data: site };
-  }
-  throw new Error('Link harus berupa domain *.vercel.app atau *.netlify.app hasil deploy DevTools Raven.');
+  try { host = new URL(value).hostname.toLowerCase(); } catch (_) { throw new Error('Link tidak valid.'); }
+  if (host.endsWith('.vercel.app')) { const project = await resolveVercelProjectFromUrl(urlInput); return { platform: 'vercel', name: project.name, data: project }; }
+  if (host.endsWith('.netlify.app')) { const site = await resolveNetlifySiteFromUrl(urlInput); return { platform: 'netlify', name: site.name, data: site }; }
+  if (host === `${String(ENV.GH_OWNER).toLowerCase()}.github.io`) { const repo = await resolveGithubPagesRepoFromUrl(urlInput); return { platform: 'github_pages', name: repo.name, data: repo }; }
+  throw new Error('Link harus berupa domain *.vercel.app, *.netlify.app, atau GitHub Pages milik bot.');
 }
 
-async function deleteDeployTarget(target) {
-  if (target.platform === 'netlify') return deleteNetlifySite(target.data);
-  return deleteVercelProject(target.data);
-}
 
 async function findGithubRepoByProjectName(projectName) {
   for (let page = 1; page <= 10; page += 1) {
@@ -1263,10 +1247,19 @@ async function deleteGithubRepo(owner, repoName) {
   await githubApi('DELETE', `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repoName)}`);
 }
 
-// ─────────────────────────────────────────────
-// GET REPO ZIP — ambil ZIP repo GitHub public lewat endpoint resmi GitHub
-// (codeload), lalu diteruskan ke Telegram. Bukan scraping.
-// ─────────────────────────────────────────────
+async function deleteGithubPagesSite(repo) {
+  try { await githubApi('DELETE', `/repos/${encodeURIComponent(repo.owner.login)}/${encodeURIComponent(repo.name)}/pages`, undefined, { timeout: 30000 }); } catch (error) { if (error.response?.status !== 404) throw error; }
+  await deleteGithubRepo(repo.owner.login, repo.name);
+}
+
+async function deleteDeployTarget(target) {
+  if (!target?.platform) throw new Error('Platform deployment tidak dikenali.');
+  if (target.platform === 'vercel') return deleteVercelProject(target.data);
+  if (target.platform === 'netlify') return deleteNetlifySite(target.data);
+  if (target.platform === 'github_pages') return deleteGithubPagesSite(target.data);
+  throw new Error(`Platform ${target.platform} tidak didukung.`);
+}
+
 
 function parseGithubRepoUrl(input) {
   let value = String(input).trim();
@@ -1330,14 +1323,6 @@ async function searchGithubRepos(query, limit = 6) {
   return merged;
 }
 
-// ─────────────────────────────────────────────
-// GET SOURCE — pengambilan HTML + CSS + JS + asset publik
-//
-// Response HTML utama dipertahankan sebagai byte asli yang diterima
-// (bukan di-parse lalu direkonstruksi ulang), supaya isi source tidak
-// berubah/terpotong. Asset yang gagal diambil dicatat, bukan diam-diam
-// dianggap berhasil.
-// ─────────────────────────────────────────────
 
 function looksLikeSpaShell(html) {
   const bodyMatch = html.match(/<body[^>]*>([\s\S]*?)<\/body>/i);
@@ -1375,7 +1360,6 @@ async function getPublicSource(url) {
     headers: { 'User-Agent': 'Mozilla/5.0 (compatible; DevToolsRavenSourceFetcher/1.0)' },
   });
 
-  // Simpan HTML sebagai byte asli yang diterima (tidak di-decode-encode ulang)
   const htmlBuffer = Buffer.from(response.data);
   const html = htmlBuffer.toString('utf8');
 
@@ -1432,8 +1416,6 @@ async function getPublicSource(url) {
         for (const match of cssText.matchAll(/@import\s+['"]([^'"]+)['"]/gi)) addAsset(match[1], assetUrl);
       }
     } catch (error) {
-      // Asset gagal diambil (mis. diblokir CORS/hotlink protection) —
-      // dicatat, bukan diam-diam dianggap berhasil.
       failedAssets.push({ url: assetUrl, reason: errorMessage(error) });
     }
   }
@@ -1585,89 +1567,40 @@ async function runWebToApk(ctx, session, statusMessage) {
   }
 }
 
-// ─────────────────────────────────────────────
-// ENCRYPT HTML — Base64 + XOR + Shuffle, TANPA password.
-// Hasilnya tetap bisa direkonstruksi kembali menjadi HTML yang sama persis
-// (reversible), bukan password-lock seperti versi lama.
-// ─────────────────────────────────────────────
 
 function encryptHtmlReversible(html) {
   const KEY_LEN = 32;
   const key = crypto.randomBytes(KEY_LEN);
   const plain = Buffer.from(html, 'utf8');
-  const b64 = plain.toString('base64');
-  const dataBytes = Buffer.from(b64, 'utf8');
-
-  // XOR setiap byte data dengan key yang di-cycling
-  const xored = Buffer.alloc(dataBytes.length);
-  for (let i = 0; i < dataBytes.length; i += 1) {
-    xored[i] = dataBytes[i] ^ key[i % KEY_LEN];
-  }
-
-  // Shuffle deterministik pakai indeks berbasis key (Fisher-Yates dengan PRNG
-  // yang di-seed dari key) supaya reversible tanpa menyimpan permutasi terpisah.
-  function makePrng(seed) {
-    let s = 0;
-    for (const b of seed) s = (s * 31 + b) >>> 0;
-    if (s === 0) s = 0x9e3779b9;
-    return () => {
-      s ^= s << 13; s >>>= 0;
-      s ^= s >> 17;
-      s ^= s << 5; s >>>= 0;
-      return s >>> 0;
-    };
-  }
-  const prng = makePrng(key);
-  const indices = new Array(xored.length);
-  for (let i = 0; i < indices.length; i += 1) indices[i] = i;
-  for (let i = indices.length - 1; i > 0; i -= 1) {
-    const j = prng() % (i + 1);
-    const tmp = indices[i];
-    indices[i] = indices[j];
-    indices[j] = tmp;
-  }
-  const shuffled = Buffer.alloc(xored.length);
-  for (let i = 0; i < xored.length; i += 1) {
-    shuffled[i] = xored[indices[i]];
-  }
-
-  // Payload akhir: base64 dari [key(32 byte) || shuffled_data]
-  const payload = Buffer.concat([key, shuffled]);
-  const encoded = payload.toString('base64');
-  const keyHex = key.toString('hex');
-
-  // HTML hasil — hanya berisi data terenkripsi + script decoder kecil yang
-  // merekonstruksi HTML ASLI saat dibuka di browser (tanpa minta password).
-  return `<!doctype html><meta charset="utf-8"><title>Encrypted HTML</title><div id="app">Decrypting…</div><script>
+  const xored = Buffer.alloc(plain.length);
+  for (let i = 0; i < plain.length; i += 1) xored[i] = plain[i] ^ key[i % KEY_LEN];
+  const payload = Buffer.concat([Buffer.from('RAVEN2'), key, xored]).toString('base64');
+  return `<!doctype html><html><head><meta charset="utf-8"><script>
 (function(){
-var PAYLOAD=${JSON.stringify(encoded)};
-function b64ToBytes(s){var bin=atob(s);var out=new Uint8Array(bin.length);for(var i=0;i<bin.length;i++)out[i]=bin.charCodeAt(i);return out;}
-var raw=b64ToBytes(PAYLOAD);
-var KEYLEN=${KEY_LEN};
-var key=raw.slice(0,KEYLEN);
-var shuffled=raw.slice(KEYLEN);
-function makePrng(seed){var s=0;for(var i=0;i<seed.length;i++){s=((s*31)+seed[i])>>>0;}if(s===0)s=0x9e3779b9;return function(){s^=s<<13;s>>>=0;s^=s>>17;s^=s<<5;s>>>=0;return s>>>0;};}
-var prng=makePrng(key);
-var n=shuffled.length;
-var indices=new Array(n);
-for(var i=0;i<n;i++)indices[i]=i;
-for(var i=n-1;i>0;i--){var j=prng()%(i+1);var t=indices[i];indices[i]=indices[j];indices[j]=t;}
-var xored=new Uint8Array(n);
-for(var i=0;i<n;i++){xored[indices[i]]=shuffled[i];}
-var data=new Uint8Array(n);
-for(var i=0;i<n;i++){data[i]=xored[i]^key[i%KEYLEN];}
-var bin='';
-for(var i=0;i<data.length;i++)bin+=String.fromCharCode(data[i]);
-var b64=bin;
-var decoded=atob(b64);
-var bytes=new Uint8Array(decoded.length);
-for(var i=0;i<decoded.length;i++)bytes[i]=decoded.charCodeAt(i);
-var html=new TextDecoder('utf-8').decode(bytes);
-document.open();document.write(html);document.close();
-})();
-</script>`;
+var P=${JSON.stringify(payload)};
+function b(s){var x=atob(s),u=new Uint8Array(x.length);for(var i=0;i<x.length;i++)u[i]=x.charCodeAt(i);return u;}
+var r=b(P),h='';
+if(r.length>=38&&r[0]===82&&r[1]===65&&r[2]===86&&r[3]===69&&r[4]===78&&r[5]===50){
+ var k=r.slice(6,38),d=r.slice(38),o=new Uint8Array(d.length);
+ for(var i=0;i<d.length;i++)o[i]=d[i]^k[i%32];
+ h=new TextDecoder('utf-8').decode(o);
+}else{
+ var KEYLEN=32,key=r.slice(0,KEYLEN),shuffled=r.slice(KEYLEN),makePrng=function(seed){var z=0;for(var j=0;j<seed.length;j++)z=((z*31)+seed[j])>>>0;if(z===0)z=0x9e3779b9;return function(){z^=z<<13;z>>>=0;z^=z>>17;z^=z<<5;z>>>=0;return z>>>0;};};
+ var prng=makePrng(key),n=shuffled.length,indices=new Array(n);
+ for(var i=0;i<n;i++)indices[i]=i;
+ for(var i=n-1;i>0;i--){var j=prng()%(i+1),t=indices[i];indices[i]=indices[j];indices[j]=t;}
+ var xored=new Uint8Array(n);
+ for(var i=0;i<n;i++)xored[indices[i]]=shuffled[i];
+ var data=new Uint8Array(n);
+ for(var i=0;i<n;i++)data[i]=xored[i]^key[i%KEYLEN];
+ var bin='';for(var i=0;i<data.length;i++)bin+=String.fromCharCode(data[i]);
+ h=new TextDecoder('utf-8').decode(Uint8Array.from(atob(bin),function(c){return c.charCodeAt(0);}));
 }
-
+if(!/^\\s*<!doctype\\s+html/i.test(h) && !/^\\s*<html[\\s>]/i.test(h))throw new Error('Encrypted HTML decode failed');
+document.open();document.write(h);document.close();
+})();
+</script></head></html>`;
+}
 async function checkGitHub() {
   const r = await axios.get(`${GH_API}/user`, { headers: ghHeaders, timeout: 30000 });
   return r.data;
@@ -1678,16 +1611,6 @@ async function checkVercel() {
   return r.data;
 }
 
-// ─────────────────────────────────────────────
-// DEPLOY — dashboard log + hasil premium
-//
-// Vercel HTML: direct deploy tanpa GitHub, tanpa pertanyaan .env.
-// Vercel ZIP : boleh tambah .env (opsional), lalu didorong ke GitHub
-//              SEBELUM deployment Vercel (backup + source of truth repo).
-// Netlify    : direct deploy, tanpa GitHub.
-//
-// Di semua alur, URL publik diverifikasi dulu sebelum dinyatakan sukses.
-// ─────────────────────────────────────────────
 
 async function getVercelBuildLogTail(deploymentId, teamId, maxLines = 15) {
   try {
@@ -1737,13 +1660,53 @@ async function publishToVercel(name, files, render, envVars) {
   await render(98, 'Mengambil link publik…');
   const projectName = projectSafeName(name);
 
-  // Coba set alias eksplisit supaya URL yang dikembalikan SELALU bersih:
-  // https://{nama}.vercel.app
   let cleanHost = await ensureVercelAlias(projectName, deployment.id, deployment.teamId);
   if (!cleanHost) {
     cleanHost = await getCleanProductionUrl(deployment.id, deployment.teamId, projectName);
   }
   return `https://${cleanHost}`;
+}
+
+async function createGithubPagesSite(owner, repo, branch) {
+  const body = { source: { branch, path: '/' }, build_type: 'legacy', https_enforced: true };
+  try { return (await githubApi('POST', `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/pages`, body, { timeout: 30000 })).data; }
+  catch (error) {
+    if (![409, 422].includes(error.response?.status)) throw error;
+    try { return (await githubApi('PUT', `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/pages`, body, { timeout: 30000 })).data || null; }
+    catch (updateError) { if (updateError.response?.status === 409) return null; throw updateError; }
+  }
+}
+
+async function waitForGithubPages(owner, repo, timeoutMs = 120000) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    try {
+      const page = (await githubApi('GET', `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/pages`, undefined, { timeout: 30000 })).data;
+      const status = String(page?.status || '').toLowerCase();
+      if (page?.html_url && ['built', 'ready'].includes(status)) return page;
+      if (page?.html_url && status && !['building', 'queued', 'deploying'].includes(status)) return page;
+    } catch (error) { if (error.response?.status !== 404) throw error; }
+    await sleep(4000);
+  }
+  throw new Error('GitHub Pages belum selesai dipublikasikan dalam 2 menit.');
+}
+
+async function publishToGithubPages(name, files, render) {
+  if (!ENV.GH_TOKEN || !ENV.GH_OWNER) throw new Error('TOKEN_GITHUB dan PEMILIK_GITHUB wajib diatur untuk GitHub Pages.');
+  await render(15, 'Membuat repository GitHub…');
+  const repo = await createGitHubRepo(projectSafeName(name), { private: false });
+  const pageFiles = files.some((f) => f.path.replace(/^\/+/, '').toLowerCase() === '.nojekyll') ? files : [...files, { path: '.nojekyll', buffer: Buffer.from('', 'utf8') }];
+  await render(35, 'Mengunggah berkas website…');
+  const uploaded = await uploadFilesToNewRepo(repo, pageFiles);
+  await render(65, 'Mengaktifkan GitHub Pages…');
+  await createGithubPagesSite(repo.owner.login, repo.name, uploaded.branch);
+  await render(80, 'Menunggu website dipublikasikan…');
+  const page = await waitForGithubPages(repo.owner.login, repo.name);
+  const url = page.html_url || `https://${String(repo.owner.login).toLowerCase()}.github.io/${repo.name}`;
+  await render(95, 'Memverifikasi URL publik…');
+  const verification = await verifyPublicUrl(url, 8, 4000);
+  if (!verification.ok) throw new Error(`GitHub Pages aktif tetapi URL publik belum merespons (${verification.error || `HTTP ${verification.status ?? '-'}`}).`);
+  return url;
 }
 
 async function publishToNetlify(name, files, render) {
@@ -1779,12 +1742,6 @@ async function publishToNetlify(name, files, render) {
   return final.ssl_url || final.url || site.ssl_url || site.url;
 }
 
-// ─────────────────────────────────────────────
-// FOTO / AUDIO KE URL// ─────────────────────────────────────────────
-// FOTO / AUDIO KE URL — upload 1 file, dapat link langsung ke file-nya
-// (numpang infrastruktur deploy Vercel yang sudah ada, tanpa backup
-// GitHub — supaya prosesnya ringan & cepat)
-// ─────────────────────────────────────────────
 
 function sanitizeImageFileName(name, fallbackExt, fallbackBase = 'file') {
   let base = String(name || '').trim();
@@ -1863,6 +1820,7 @@ async function runFileToUrl(ctx, files, statusMessage, kind = 'foto') {
 
     const cleanHost = await getCleanProductionUrl(deployment.id, deployment.teamId, projectSafeName(projectName));
     const url = `https://${cleanHost}/${fileName}`;
+    await recordMedia({ projectName, url, fileName, kind, ownerId: uid(ctx), ownerUsername: ctx.from?.username || null, ts: Date.now() });
     const elapsed = formatElapsed(Date.now() - startedAt);
     const usageFooter = kind === 'audio'
       ? '💡 Tinggal pasang di HTML:\n<code>&lt;audio src="LINK_DI_ATAS" controls&gt;&lt;/audio&gt;</code>'
@@ -1899,11 +1857,72 @@ async function runPhotoUpload(ctx, files, statusMessage) {
   return runFileToUrl(ctx, files, statusMessage, 'foto');
 }
 
-// ─────────────────────────────────────────────
-// VERIFIKASI DEPLOYMENT — dipakai SEMUA provider (Vercel, Netlify,
-// bilang "accepted"/"success" — di sini kita beneran HTTP-request ke URL
-// publiknya dan cek responsnya valid (bukan 404/500/gagal konek).
-// ─────────────────────────────────────────────
+
+function normalizeDownloadUrl(text) { let value = String(text || '').trim(); if (!/^https?:\/\//i.test(value)) value = `https://${value}`; return new URL(value).toString(); }
+function detectDownloadPlatform(url) { const host = new URL(url).hostname.toLowerCase().replace(/^www\./, ''); if (host === 'tiktok.com' || host.endsWith('.tiktok.com')) return 'tiktok'; if (host === 'instagram.com' || host.endsWith('.instagram.com')) return 'instagram'; if (host === 'youtube.com' || host === 'youtu.be' || host.endsWith('.youtube.com')) return 'youtube'; return null; }
+async function resolveDownloadMedia(url, platform) {
+  if (ENV.DOWNLOAD_API_URL.trim()) {
+    const base = ENV.DOWNLOAD_API_URL.trim();
+    const endpoint = base.includes('{url}') ? base.replaceAll('{url}', encodeURIComponent(url)) : `${base}${base.includes('?') ? '&' : '?'}url=${encodeURIComponent(url)}`;
+    const response = await axios.get(endpoint, { timeout: 60000, maxContentLength: 8 * 1024 * 1024, validateStatus: () => true });
+    if (response.status >= 400) throw new Error(`Download API HTTP ${response.status}.`);
+    const direct = response.data?.download_url || response.data?.url || response.data?.result?.download_url || response.data?.result?.url || response.data?.video_url;
+    if (!direct) throw new Error('DOWNLOAD_API_URL tidak mengembalikan link media.');
+    return { url: direct, title: response.data?.title || response.data?.result?.title || 'Media' };
+  }
+  if (platform === 'tiktok') {
+    const response = await axios.get(`https://tdownv4.sl-bjs.workers.dev/?down=${encodeURIComponent(url)}`, { timeout: 60000, maxContentLength: 8 * 1024 * 1024, validateStatus: () => true });
+    if (response.status >= 400) throw new Error(`TikTok downloader HTTP ${response.status}.`);
+    const direct = response.data?.download_url || response.data?.video_url || response.data?.data?.download_url;
+    if (!direct) throw new Error('TikTok downloader tidak mengembalikan link video.');
+    return { url: direct, title: response.data?.title || 'TikTok' };
+  }
+  const candidates = [
+    `https://api.vevioz.com/api/single/mp4?url=${encodeURIComponent(url)}`,
+    `https://api.vevioz.com/api/v1/info?url=${encodeURIComponent(url)}`
+  ];
+  let lastError = null;
+  for (const endpoint of candidates) {
+    try {
+      const response = await axios.get(endpoint, { timeout: 60000, maxContentLength: 8 * 1024 * 1024, validateStatus: () => true });
+      if (response.status >= 400) { lastError = new Error(`Downloader HTTP ${response.status}.`); continue; }
+      const direct = response.data?.download_url || response.data?.url || response.data?.result?.download_url || response.data?.result?.url || response.data?.video_url || response.data?.data?.download_url;
+      if (direct) return { url: direct, title: response.data?.title || response.data?.result?.title || response.data?.data?.title || (platform === 'youtube' ? 'YouTube' : 'Instagram') };
+      const returned = typeof response.data === 'string' && /^https?:\/\//i.test(response.data.trim()) ? response.data.trim() : null;
+      if (returned) return { url: returned, title: platform === 'youtube' ? 'YouTube' : 'Instagram' };
+      if (endpoint.includes('/api/single/')) return { url: endpoint, title: platform === 'youtube' ? 'YouTube' : 'Instagram' };
+    } catch (error) { lastError = error; }
+  }
+  throw lastError || new Error('Downloader publik tidak mengembalikan media.');
+}
+async function downloadRemoteMediaBuffer(mediaUrl) {
+  const response = await axios.get(mediaUrl, { responseType: 'arraybuffer', timeout: 120000, maxRedirects: 7, maxContentLength: 55 * 1024 * 1024, validateStatus: () => true, headers: { 'User-Agent': 'Mozilla/5.0' } });
+  const type = String(response.headers?.['content-type'] || '').toLowerCase();
+  if (response.status >= 400) throw new Error(`Media server HTTP ${response.status}.`);
+  if (!response.data || !Buffer.from(response.data).length) throw new Error('Media kosong.');
+  if (type.includes('text/html') || type.includes('application/json')) throw new Error('Downloader mengembalikan halaman/API, bukan file media langsung.');
+  return { buffer: Buffer.from(response.data), contentType: type };
+}
+async function runExternalDownload(ctx, statusMessage, sourceUrl, requestedPlatform) {
+  try {
+    const resolvedPlatform = detectDownloadPlatform(sourceUrl);
+    if (!resolvedPlatform) throw new Error('URL harus dari TikTok, Instagram, atau YouTube.');
+    if (resolvedPlatform !== requestedPlatform) throw new Error(`Link ini terdeteksi sebagai ${resolvedPlatform}, bukan ${requestedPlatform}.`);
+    await editPanel(ctx, statusMessage.message_id, panel({ heading: '📥 <b>DOWNLOAD MEDIA</b>', body: '⏳ Mencari file media…' }));
+    const media = await resolveDownloadMedia(sourceUrl, resolvedPlatform);
+    const caption = `✅ <b>${escapeHtml(media.title || 'Media')} siap diunduh</b>`;
+    try {
+      await ctx.replyWithDocument({ url: media.url }, { caption, parse_mode: 'HTML' });
+    } catch (_) {
+      const remote = await downloadRemoteMediaBuffer(media.url);
+      const ext = remote.contentType.includes('audio') ? 'mp3' : 'mp4';
+      await ctx.replyWithDocument({ source: remote.buffer, filename: `${resolvedPlatform}-${Date.now()}.${ext}` }, { caption, parse_mode: 'HTML' });
+    }
+    await editPanel(ctx, statusMessage.message_id, panel({ heading: '<b>DOWNLOAD SELESAI ✅</b>', body: `Platform: <b>${escapeHtml(resolvedPlatform)}</b>\n🔗 Sumber: <code>${escapeHtml(sourceUrl)}</code>` }), homeButton());
+  } catch (error) {
+    await editPanel(ctx, statusMessage.message_id, panel({ heading: '<b>DOWNLOAD GAGAL ❌</b>', body: `<code>${escapeHtml(errorMessage(error))}</code>` }), homeButton());
+  } finally { sessions.delete(uid(ctx)); }
+}
 
 async function verifyPublicUrl(url, maxAttempts = 6, delayMs = 3000) {
   let lastStatus = null;
@@ -1927,16 +1946,11 @@ async function verifyPublicUrl(url, maxAttempts = 6, delayMs = 3000) {
   return { ok: false, status: lastStatus, error: lastError };
 }
 
-// ─────────────────────────────────────────────
-// DEPLOYMENT ORCHESTRATOR — Vercel / Netlify.
-// Dipulihkan dari baseline source awal. Tidak membuat alur baru;
-// hanya mengarahkan session ke publisher yang tersedia.
-// ─────────────────────────────────────────────
 
 async function runDeployment(ctx, session, statusMessage) {
   const repoName = repoSafeName(session.name);
   const modeLabel = session.type === 'deploy_zip' ? 'Deploy ZIP' : 'Deploy HTML';
-  const platform = session.platform === 'netlify' ? 'netlify' : 'vercel';
+  const platform = session.platform || 'vercel';
   const platformLabel = platformDisplayName(platform);
   const startedAt = Date.now();
   const isVercelHtml = platform === 'vercel' && session.type === 'deploy_html';
@@ -1970,13 +1984,14 @@ async function runDeployment(ctx, session, statusMessage) {
         const repo = await createGitHubRepo(repoName);
         await uploadFilesToNewRepo(repo, session.files);
       } catch (_) {
-        // Backup GitHub bersifat best-effort untuk Netlify.
       }
     }
 
     let url;
     if (platform === 'netlify') {
       url = await publishToNetlify(repoName, session.files, render);
+    } else if (platform === 'github_pages') {
+      url = await publishToGithubPages(repoName, session.files, render);
     } else {
       url = await publishToVercel(repoName, session.files, render, session.envVars);
     }
@@ -1998,15 +2013,7 @@ async function runDeployment(ctx, session, statusMessage) {
       ts: Date.now(),
     });
 
-    await editPanel(ctx, statusMessage.message_id, panel({
-      heading: '<b>DEPLOY BERHASIL ✅</b>',
-      box: infoBox([
-        ['📦 Project', escapeHtml(repoName)],
-        ['🛰️ Platform', escapeHtml(platformLabel)],
-        ['🔗 Link web', `<a href="${escapeHtml(url)}">${escapeHtml(url)}</a>`],
-        ['⏰ Waktu', escapeHtml(elapsed)],
-      ]),
-    }), homeButton());
+    await editPanel(ctx, statusMessage.message_id, panel({ body: deploySuccessMessage(repoName, url, Date.now()) }), homeButton());
   } catch (error) {
     const elapsed = formatElapsed(Date.now() - startedAt);
     const logBody = error.detail
@@ -2027,12 +2034,6 @@ async function runDeployment(ctx, session, statusMessage) {
   }
 }
 
-// ─────────────────────────────────────────────
-// GENERATE BOT — deploy project bot Node.js (webhook-based) secara otomatis:
-// bikin project Vercel, push .env, deploy file, lalu (kalau file webhook-nya
-// ketemu & ada TOKEN_BOT/BOT_TOKEN di .env) otomatis daftarkan webhook-nya
-// ke Telegram lewat setWebhook. Tidak simulasi — semua panggilan API asli.
-// ─────────────────────────────────────────────
 
 async function runGenerateBot(ctx, session, statusMessage) {
   return runGenerateBotVercel(ctx, session, statusMessage);
@@ -2087,13 +2088,11 @@ async function runGenerateBotVercel(ctx, session, statusMessage) {
     await pushVercelEnvVars(project, envVars);
 
 
-    // Backup ke GitHub bersifat opsional, tidak boleh menggagalkan proses.
     try {
       const repo = await createGitHubRepo(repoName);
       createdRepo = repo;
       await uploadFilesToNewRepo(repo, session.files);
     } catch (_) {
-      // backup gagal, tetap lanjut
     }
 
     let deployFiles = session.files;
@@ -2208,9 +2207,6 @@ async function runGenerateBotVercel(ctx, session, statusMessage) {
   }
 }
 
-// ─────────────────────────────────────────────
-// COMMANDS & ACTIONS
-// ─────────────────────────────────────────────
 
 bot.start(async (ctx) => {
   rememberUser(ctx);
@@ -2223,7 +2219,6 @@ bot.start(async (ctx) => {
 bot.action('home', async (ctx) => {
   await ctx.answerCbQuery();
   sessions.delete(uid(ctx));
-  // TIDAK menghapus pesan apapun — lihat catatan di bagian UI HELPERS.
   return sendMainMenu(ctx);
 });
 
@@ -2234,6 +2229,8 @@ bot.action('deployment_menu', async (ctx) => {
     body: 'Pilih platform terlebih dahulu. Setelah itu bot akan menampilkan alur file yang sesuai untuk platform tersebut.',
   }), deploymentMenuMarkup());
 });
+
+bot.action('github_pages_menu', async (ctx) => { await ctx.answerCbQuery(); return sendPanel(ctx, panel({ heading: '<b>GITHUB PAGES</b>', body: 'Pilih tipe file yang mau dipublikasikan.' }), githubPagesMenuMarkup()); });
 
 bot.action('deploy_vercel', async (ctx) => {
   await ctx.answerCbQuery();
@@ -2291,6 +2288,16 @@ bot.action('netlify_zip', async (ctx) => {
   );
 });
 
+
+bot.action('github_pages_html', async (ctx) => {
+  await ctx.answerCbQuery();
+  await sendPrompt(ctx, 'Deploy HTML — GitHub Pages', '🚀 <b>Kirim file HTML</b>\n\nURL hasil: <code>https://OWNER.github.io/PROJECT</code>.', { type: 'deploy_html', platform: 'github_pages', step: 'file' });
+});
+
+bot.action('github_pages_zip', async (ctx) => {
+  await ctx.answerCbQuery();
+  await sendPrompt(ctx, 'Deploy ZIP — GitHub Pages', '📦 <b>Kirim file ZIP</b>\n\nZIP wajib memiliki <code>index.html</code>. URL hasil: <code>https://OWNER.github.io/PROJECT</code>.', { type: 'deploy_zip', platform: 'github_pages', step: 'file' });
+});
 
 bot.action('get_source', async (ctx) => {
   await ctx.answerCbQuery();
@@ -2401,7 +2408,7 @@ bot.action('list_web', async (ctx) => {
   await ctx.answerCbQuery('Memuat daftar…');
   const all = await loadDeployments();
   const ownerView = isOwner(ctx);
-  const supportedDeployments = all.filter((d) => d.platform === 'vercel' || d.platform === 'netlify');
+  const supportedDeployments = all.filter((d) => ['vercel', 'netlify', 'github_pages'].includes(d.platform));
   const relevant = ownerView ? supportedDeployments : supportedDeployments.filter((d) => d.ownerId === uid(ctx));
   const recent = relevant.slice(-20).reverse();
 
@@ -2424,7 +2431,6 @@ bot.action('list_web', async (ctx) => {
       const verification = await verifyPublicUrl(d.url, 1, 0);
       if (verification.ok) active.push(d);
     } catch (_) {
-      // lewati yang tidak respons
     }
   }
 
@@ -2468,25 +2474,42 @@ bot.action('media_menu', async (ctx) => {
   }), mediaMenuMarkup());
 });
 
+bot.action('download_menu', async (ctx) => { await ctx.answerCbQuery(); return sendPanel(ctx, panel({ heading: '<b>DOWNLOAD MEDIA</b>', body: 'Pilih platform lalu kirim URL publik.' }), downloadMenuMarkup()); });
+for (const [action, platform, label] of [['download_tiktok', 'tiktok', 'TikTok'], ['download_instagram', 'instagram', 'Instagram'], ['download_youtube', 'youtube', 'YouTube']]) {
+  bot.action(action, async (ctx) => { await ctx.answerCbQuery(); await sendPrompt(ctx, `Download ${label}`, `📥 <b>Kirim Link ${label}</b>\n\nKirim URL publik ${label}.`, { type: 'download', platform, step: 'url' }); });
+}
+
 bot.action('donation', async (ctx) => {
   await ctx.answerCbQuery();
   try {
-    const response = await axios.get(DONATION_QRIS_URL, {
-      responseType: 'arraybuffer',
-      timeout: 30000,
-      maxContentLength: 10 * 1024 * 1024,
-    });
-    const buffer = Buffer.from(response.data);
-    const contentType = String(response.headers?.['content-type'] || '');
-    if (!contentType.startsWith('image/')) throw new Error('QRIS tidak mengembalikan file gambar.');
-    await ctx.replyWithPhoto({ source: buffer }, {
-      caption: '💝 <b>Donasi DevTools Raven</b>\n\nScan QRIS pada gambar di atas.',
-      parse_mode: 'HTML',
-    });
+    let buffer;
+    if (ENV.QRIS_URL) {
+      const response = await axios.get(ENV.QRIS_URL, { responseType: 'arraybuffer', timeout: 30000, maxContentLength: 10 * 1024 * 1024, validateStatus: () => true });
+      const ct = String(response.headers?.['content-type'] || '').toLowerCase();
+      if (response.status >= 400 || !ct.startsWith('image/')) throw new Error(`QRIS_URL tidak dapat diambil (HTTP ${response.status}).`);
+      buffer = Buffer.from(response.data);
+    } else {
+      const local = [path.join(process.cwd(), 'qris.png'), path.join(process.cwd(), 'api', 'qris.png'), path.join(__dirname, 'qris.png')].find((x) => fs.existsSync(x));
+      if (!local) throw new Error('QRIS belum dikonfigurasi. Isi QRIS_URL atau tambahkan qris.png ke project.');
+      buffer = fs.readFileSync(local);
+    }
+    await ctx.replyWithPhoto({ source: buffer }, { caption: '💝 <b>Donasi DevTools Raven</b>\n\nScan QRIS pada gambar di atas.', parse_mode: 'HTML' });
   } catch (error) {
-    await sendPanel(ctx, panel({ heading: '<b>QRIS GAGAL ❌</b>', body: `<code>${escapeHtml(errorMessage(error))}</code>` }), homeButton());
+    await sendPanel(ctx, panel({ heading: '<b>QRIS BELUM SIAP ❌</b>', body: `<code>${escapeHtml(errorMessage(error))}</code>` }), homeButton());
   }
 });
+
+bot.action('media_list', async (ctx) => {
+  await ctx.answerCbQuery('Memuat media…');
+  const all = await loadMediaRecords();
+  const relevant = isOwner(ctx) ? all : all.filter((x) => Number(x.ownerId) === uid(ctx));
+  const recent = relevant.slice(-30).reverse();
+  if (!recent.length) return sendPanel(ctx, panel({ heading: '<b>LIST MEDIA</b>', body: '<i>Belum ada media yang tersimpan.</i>' }), homeButton());
+  const lines = recent.map((x, i) => `${i + 1}. <a href="${escapeHtml(x.url)}">${escapeHtml(x.fileName || x.projectName)}</a> · ${escapeHtml(String(x.kind || 'media').toUpperCase())}${isOwner(ctx) ? ` · <code>${escapeHtml(String(x.ownerId))}</code>` : ''}`);
+  return sendPanel(ctx, panel({ heading: '<b>LIST MEDIA</b>', body: lines.join('\n\n'), footer: `Menampilkan ${recent.length} media terakhir.` }), homeButton());
+});
+
+bot.action('media_delete', async (ctx) => { await ctx.answerCbQuery(); await sendPrompt(ctx, 'Delete Media', '🗑️ <b>Kirim URL media</b> yang sebelumnya dibuat lewat Media ke URL.', { type: 'media_delete', step: 'url' }); });
 
 bot.action('photo_url', async (ctx) => {
   await ctx.answerCbQuery();
@@ -2612,13 +2635,15 @@ bot.action('help_info', async (ctx) => {
     heading: '<b>ℹ️ TENTANG BOT INI</b>',
     body:
       '<b>DevTools Raven V3</b> menyediakan utilitas deployment, pengelolaan project, media, source, dan otomasi bot dengan API resmi.\n\n<b>Ringkasan fitur:</b>\n' +
-      '🚀 Deploy Vercel/Netlify — upload HTML/ZIP, langsung online\n' +
+      '🚀 Deploy Vercel/Netlify/GitHub Pages — upload HTML/ZIP, langsung online\n' +
       '⚙️ Tambah .env — isi environment variable sebelum deploy (Vercel ZIP)\n' +
       '📱 Web ke APK — build APK Android dari HTML/ZIP menggunakan GitHub Actions\n' +
       '🌐 Get Source — repository GitHub diambil sebagai ZIP asli; website publik hanya mengambil byte source/assets yang benar-benar tersedia\n' +
-      '🛡️ Encrypt HTML — enkripsi reversible (Base64 + XOR + Shuffle), tanpa password\n' +
+      '🛡️ Encrypt HTML — enkripsi reversible tanpa placeholder Decrypting dan tanpa flash UI awal\n' +
       '🖼️🎵🎬 Foto/Audio/Video ke URL — upload file asli, dapat link langsung\n' +
       '📸 Screenshot URL — ambil gambar tampilan website manapun\n' +
+      '📥 Download Media — TikTok, Instagram, dan YouTube\n' +
+      '📋 List Media / 🗑️ Delete Media — kelola media yang sudah dipublikasikan\n' +
       '📦 Get Repo ZIP — ambil ZIP repo GitHub public\n' +
       '🔎 Cari Repo GitHub — cari repo publik berdasar kata kunci\n' +
       '🤖 Generate Bot — deploy project bot lain (Node.js webhook) otomatis\n' +
@@ -2671,7 +2696,7 @@ bot.action('delete_web', async (ctx) => {
   await sendPrompt(
     ctx,
     'Delete Web',
-    '🗑️ <b>Kirim Link Website</b>\n\nKirim link website hasil deploy DevTools Raven yang ingin dihapus.\nContoh: <code>https://nama-web.vercel.app</code> atau <code>https://nama-web.netlify.app</code>\n\nBot otomatis mengenali platform dari link dan menghapus website beserta repository GitHub yang cocok bila ditemukan.',
+    '🗑️ <b>Kirim Link Website</b>\n\nKirim link website hasil deploy DevTools Raven yang ingin dihapus.\nContoh: <code>https://nama-web.vercel.app</code>, <code>https://nama-web.netlify.app</code>, atau <code>https://${String(ENV.GH_OWNER).toLowerCase()}.github.io/nama-web</code>\n\nBot otomatis mengenali platform dari link dan menghapus website beserta repository GitHub yang cocok bila ditemukan.',
     { type: 'delete', step: 'link' }
   );
 });
@@ -2837,6 +2862,24 @@ bot.on('text', async (ctx) => {
     return;
   }
 
+  if (session.type === 'download' && session.step === 'url') {
+    const platform = session.platform; sessions.delete(id); const status = await sendPanel(ctx, panel({ heading: '📥 <b>DOWNLOAD MEDIA</b>', body: '⏳ Memproses link…' }));
+    try { await runExternalDownload(ctx, status, normalizeDownloadUrl(text), platform); } catch (error) { await editPanel(ctx, status.message_id, panel({ heading: '<b>DOWNLOAD GAGAL ❌</b>', body: `<code>${escapeHtml(errorMessage(error))}</code>` }), homeButton()); }
+    return;
+  }
+
+  if (session.type === 'media_delete' && session.step === 'url') {
+    sessions.delete(id); const status = await sendPanel(ctx, panel({ heading: '<b>DELETE MEDIA</b>', body: '⏳ Mencari media…' }));
+    try {
+      const url = normalizeDownloadUrl(text); const records = await loadMediaRecords(); const record = records.find((x) => x.url === url && (isOwner(ctx) || Number(x.ownerId) === id));
+      if (!record) throw new Error('Media tidak ditemukan atau bukan milik akun ini.');
+      if (record.url.includes('.vercel.app')) await deleteVercelProject(await resolveVercelProjectFromUrl(record.url));
+      await removeMediaRecord(record.projectName, record.ownerId);
+      await editPanel(ctx, status.message_id, panel({ heading: '<b>MEDIA DIHAPUS ✅</b>', body: `📁 File: <code>${escapeHtml(record.fileName)}</code>\n🔗 URL: <code>${escapeHtml(record.url)}</code>` }), homeButton());
+    } catch (error) { await editPanel(ctx, status.message_id, panel({ heading: '<b>DELETE MEDIA GAGAL ❌</b>', body: `<code>${escapeHtml(errorMessage(error))}</code>` }), homeButton()); }
+    return;
+  }
+
   if (session.type === 'delete' && session.step === 'link') {
     sessions.delete(id);
     const status = await sendPanel(ctx, panel({ heading: '<b>DELETE WEB</b>', body: '⏳ Mencari project dari link…' }));
@@ -2990,6 +3033,20 @@ bot.on('text', async (ctx) => {
   }
 });
 
+bot.on('audio', async (ctx) => {
+  const id = uid(ctx); const session = sessions.get(id);
+  if (!session || session.type !== 'audio_url' || session.step !== 'file') return;
+  if (session.controlMessageId) await safeDeleteMessage(ctx, ctx.chat.id, session.controlMessageId);
+  const audio = ctx.message.audio; const mimeType = String(audio.mime_type || '').toLowerCase(); const rawName = String(audio.file_name || '').trim();
+  const ext = rawName.match(/\.([a-z0-9]{2,5})$/i)?.[1]?.toLowerCase() || AUDIO_MIME_EXT[mimeType] || 'mp3';
+  if (!mimeType.startsWith('audio/') && !/\.(mp3|wav|ogg|m4a|aac|flac)$/i.test(rawName)) { await sendPrompt(ctx, 'Audio ke URL', '❌ <b>Format tidak didukung.</b>', { type: 'audio_url', step: 'file' }); return; }
+  try {
+    const buffer = await downloadTelegramFile(ctx, audio.file_id); const safeName = sanitizeImageFileName(rawName || `audio-${Date.now()}.${ext}`, ext, 'audio'); sessions.delete(id);
+    const status = await sendPanel(ctx, panel({ heading: '📊 <b>PROSES</b>', box: infoBox([['📡 Server', '🔵 <b>PROCESSING</b>'], ['🔧 Mode', 'Audio ke URL'], ['🎵 File', `<code>${escapeHtml(safeName)}</code>`], ['🔄 Progress', `<code>${progressBar(0)}</code> 0%`], ['📝 Activity', 'Memulai proses…']]) }));
+    await runFileToUrl(ctx, [{ path: safeName, buffer }], status, 'audio');
+  } catch (error) { sessions.delete(id); await sendPrompt(ctx, 'Audio ke URL', `<b>Gagal mengambil audio.</b>\n<code>${escapeHtml(errorMessage(error))}</code>`, { type: 'audio_url', step: 'file' }); }
+});
+
 bot.on('video', async (ctx) => {
   const id = uid(ctx);
   const session = sessions.get(id);
@@ -3027,9 +3084,6 @@ bot.on('photo', async (ctx) => {
   if (session.controlMessageId) await safeDeleteMessage(ctx, ctx.chat.id, session.controlMessageId);
 
   try {
-    // Ambil resolusi terbesar yang dikirim Telegram (foto biasa otomatis
-    // dikompres Telegram jadi JPEG — untuk kualitas asli, sarankan user
-    // kirim sebagai File/Dokumen, sudah dijelaskan di prompt sebelumnya).
     const sizes = ctx.message.photo;
     const largest = sizes[sizes.length - 1];
     const buffer = await downloadTelegramFile(ctx, largest.file_id);
@@ -3310,9 +3364,6 @@ bot.catch((error) => {
 
 (async () => {
   await loadUsers();
-  // Sengaja HANYA mendaftarkan /start dan /cancel di daftar perintah "/".
-  // Navigasi utama tetap lewat inline button pada pesan bot, bukan lewat
-  // Reply Keyboard, supaya tidak ada dua menu yang tampil berbarengan.
   try {
     await bot.telegram.setMyCommands([
       { command: 'start', description: 'Buka menu utama' },
