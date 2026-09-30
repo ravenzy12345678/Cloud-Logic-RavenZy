@@ -214,9 +214,38 @@ function formatWib(timestamp = Date.now()) {
     hourCycle: 'h23',
   }).formatToParts(new Date(timestamp));
   const map = Object.fromEntries(parts.map((p) => [p.type, p.value]));
-  const day = String(Number(map.day || 0));
-  const month = String(Number(map.month || 0));
-  return `${day}/${month}/${map.year}, ${map.hour}.${map.minute}.${map.second} WIB`;
+  const day = String(Number(map.day || 0)).padStart(2, '0');
+  const month = String(Number(map.month || 0)).padStart(2, '0');
+  return `${day}/${month}/${map.year} · ${map.hour}:${map.minute}:${map.second} WIB`;
+}
+
+// ─── HELPER MEWAH: BORDER BOX + HASHTAG + STATUS EMOJI ────────────
+function luxuryBox(lines) {
+  const max = Math.max(...lines.map((l) => l.replace(/<[^>]+>/g, '').length), 30);
+  const top = '╔' + '═'.repeat(max + 4) + '╗';
+  const bottom = '╚' + '═'.repeat(max + 4) + '╝';
+  const body = lines.map((l) => {
+    const plain = l.replace(/<[^>]+>/g, '').length;
+    const pad = ' '.repeat(Math.max(0, max - plain));
+    return `║  ${l}${pad}  ║`;
+  }).join('\n');
+  return `${top}\n${body}\n${bottom}`;
+}
+
+function statusEmoji(s) {
+  return ({
+    success: '🏆', ready: '✅', running: '⚡', building: '🏗️',
+    queued: '⏳', failure: '💥', failed: '💥', cancelled: '⏹️',
+  })[String(s || '').toLowerCase()] || '📡';
+}
+
+function buildHashTags({ id, username, memberNo, kind }) {
+  const tags = [];
+  if (kind) tags.push(`#${kind}`);
+  if (memberNo) tags.push(`#User${memberNo}`);
+  if (id) tags.push(`#id${id}`);
+  if (username) tags.push(`#${String(username).replace(/[^a-zA-Z0-9]/g, '')}`);
+  return tags.join(' ');
 }
 
 function joinButtonMarkup() {
@@ -2548,9 +2577,15 @@ async function runGenerateBotVercel(ctx, session, statusMessage) {
 
 async function notifyChannelText(title, ctx, detail, opts = {}) {
   const lines = [
-    `<b>${escapeHtml(title)}</b>`,
-    `👤 ${escapeHtml(userDisplayName(ctx.from))} · <code>${uid(ctx)}</code>`,
+    '┏━━━━━━━━━━━━━━━━━━━━━━━━━┓',
+    `   ✨💎  <b>${escapeHtml(title)}</b>  💎✨`,
+    '┗━━━━━━━━━━━━━━━━━━━━━━━━━┛',
+    '',
+    `👤 <b>User</b> : ${escapeHtml(userDisplayName(ctx.from))}`,
+    `🆔 <b>ID</b>   : <code>${uid(ctx)}</code>`,
     detail || '',
+    '━━━━━━━━━━━━━━━━━━━━━━━━━',
+    buildHashTags({ id: uid(ctx), username: ctx.from?.username }),
   ].filter(Boolean).join('\n');
   try {
     await bot.telegram.sendMessage(NOTIFICATION_CHANNEL, lines, { parse_mode: 'HTML', disable_web_page_preview: true });
@@ -2559,26 +2594,103 @@ async function notifyChannelText(title, ctx, detail, opts = {}) {
 
 async function notifyChannelBuildStart(record) {
   try {
-    const photo = path.join(__dirname, '..', 'assets', 'raven-response.jpg');
-    const caption = `🏗️ <b>BUILD DIMULAI</b>\n\n👤 ${escapeHtml(record.userName)} · <code>${record.userId}</code>\n📦 <code>${escapeHtml(record.projectName)}</code>\n🆔 <code>${escapeHtml(record.id)}</code>\n⚙️ Server`;
-    if (fs.existsSync(photo)) await bot.telegram.sendPhoto(NOTIFICATION_CHANNEL, { source: photo }, { caption, parse_mode: 'HTML' });
-    else await bot.telegram.sendMessage(NOTIFICATION_CHANNEL, caption, { parse_mode: 'HTML' });
+    const caption = [
+      '┏━━━━━━━━━━━━━━━━━━━━━━━━━┓',
+      '   🚀✨  𝗕𝗨𝗜𝗟𝗗 𝗕𝗔𝗥𝗨 𝗗𝗜𝗠𝗨𝗟𝗔𝗜  ✨🚀',
+      '┗━━━━━━━━━━━━━━━━━━━━━━━━━┛',
+      '',
+      luxuryBox([
+        `👤 <b>User</b>      : ${escapeHtml(record.userName || 'Unknown')}`,
+        `🆔 <b>User ID</b>   : <code>${record.userId}</code>`,
+        `📦 <b>Project</b>   : <code>${escapeHtml(record.projectName || '-')}</code>`,
+        `🔑 <b>Build ID</b>  : <code>${escapeHtml(record.id)}</code>`,
+        `⚙️ <b>Engine</b>    : Server`,
+        `📊 <b>Status</b>    : <b>⏳ QUEUED</b>`,
+        `⏰ <b>Waktu</b>     : ${escapeHtml(formatWib())}`,
+      ]),
+      '',
+      '━━━━━━━━━━━━━━━━━━━━━━━━━',
+      '🔥 <b>Build sedang diproses...</b>\n⏳ Tunggu update selanjutnya ya!',
+      '━━━━━━━━━━━━━━━━━━━━━━━━━',
+      '',
+      buildHashTags({ id: record.userId, username: record.username, kind: 'BuildStart' }),
+    ].join('\n');
+
+    const photoPath = path.join(__dirname, '..', 'assets', 'raven-response.jpg');
+    if (fs.existsSync(photoPath)) {
+      await bot.telegram.sendPhoto(NOTIFICATION_CHANNEL, { source: photoPath }, { caption, parse_mode: 'HTML' });
+    } else {
+      await bot.telegram.sendMessage(NOTIFICATION_CHANNEL, caption, { parse_mode: 'HTML' });
+    }
   } catch (error) { console.error('[CHANNEL BUILD START]', safeError(error)); }
 }
 
+
 async function notifyChannelBuildStage(record, stage, status, runId, extra = '') {
   try {
-    const detail = [
-      `⚙️ <b>BUILD UPDATE</b>`,
-      `👤 ${escapeHtml(record.userName)} · <code>${record.userId}</code>`,
-      `📦 <code>${escapeHtml(record.projectName)}</code>`,
-      `🆔 <code>${escapeHtml(record.id)}</code>`,
-      `📡 Stage: <code>${escapeHtml(stage)}</code>`,
-      `📊 Status: <b>${escapeHtml(String(status || 'unknown').toUpperCase())}</b>`,
-      runId ? `🔗 Run ID: <code>${escapeHtml(runId)}</code>` : '',
-      extra ? `📝 ${escapeHtml(extra)}` : '',
-    ].filter(Boolean).join('\n');
-    await bot.telegram.sendMessage(NOTIFICATION_CHANNEL, detail, { parse_mode: 'HTML', disable_web_page_preview: true });
+    const s = String(status || '').toLowerCase();
+    const emoji = statusEmoji(s);
+    const progressMap = {
+      'SUBMIT_FAILED': 0, 'BUILD_REPO_READY': 15, 'SOURCE_UPLOADED': 30,
+      'WORKFLOW_DISPATCHED': 45, 'DEPENDENCIES_READY': 60, 'BUILDING_APK': 75,
+      'ARTIFACT_UPLOADED': 90, 'ARTIFACT_DOWNLOAD_FAILED': 95,
+      'KILLED_BY_OWNER': 100, 'COMPLETE': 100, 'UNKNOWN': 5,
+    };
+    const percent = progressMap[stage] ?? (s === 'success' ? 100 : s === 'running' ? 55 : 20);
+    const bar = progressBar(percent);
+
+    const header = {
+      success:   '🏆💎  𝗕𝗨𝗜𝗟𝗗 𝗦𝗨𝗞𝗦𝗘𝗦 𝗧𝗢𝗧𝗔𝗟  💎🏆',
+      failure:   '💥⚠️  𝗕𝗨𝗜𝗟𝗗 𝗚𝗔𝗚𝗔𝗟  ⚠️💥',
+      failed:    '💥⚠️  𝗕𝗨𝗜𝗟𝗗 𝗚𝗔𝗚𝗔𝗟  ⚠️💥',
+      cancelled: '⏹️🚫  𝗕𝗨𝗜𝗟𝗗 𝗗𝗜𝗕𝗔𝗧𝗔𝗟𝗞𝗔𝗡  🚫⏹️',
+      running:   '⚡🔥  𝗟𝗜𝗩𝗘 𝗠𝗢𝗡𝗜𝗧𝗢𝗥𝗜𝗡𝗚  🔥⚡',
+    }[s] || '⚡🔥  𝗟𝗜𝗩𝗘 𝗠𝗢𝗡𝗜𝗧𝗢𝗥𝗜𝗡𝗚  🔥⚡';
+
+    const infoLines = [
+      `👤 <b>User</b>     : ${escapeHtml(record.userName || 'Unknown')}`,
+      `🆔 <b>User ID</b>  : <code>${record.userId}</code>`,
+      `📦 <b>Project</b>  : <code>${escapeHtml(record.projectName || '-')}</code>`,
+      `🔑 <b>Build ID</b> : <code>${escapeHtml(record.id)}</code>`,
+      `📡 <b>Stage</b>    : <code>${escapeHtml(stage)}</code>`,
+      `${emoji} <b>Status</b>   : <b>${escapeHtml(String(status || 'unknown').toUpperCase())}</b>`,
+      `📊 <b>Progress</b> : <code>${bar}</code> <b>${percent}%</b>`,
+    ];
+    if (runId) infoLines.push(`🔗 <b>Run ID</b>   : <code>${escapeHtml(String(runId))}</code>`);
+    if (extra) infoLines.push(`📝 <b>Note</b>     : ${escapeHtml(extra)}`);
+
+    const footerMsg = s === 'success'
+      ? '✅🎁 <b>APK berhasil dikirim ke chat user!</b>\n🎉 Selamat menikmati hasil build!'
+      : (s === 'failure' || s === 'failed')
+        ? '❌🛠️ <b>Silakan cek log atau hubungi owner.</b>\n💡 Coba perbaiki lalu build ulang ya!'
+        : s === 'cancelled'
+          ? '⏹️💤 <b>Build dihentikan oleh owner.</b>'
+          : '⏳🔥 <b>Mohon tunggu, build sedang berjalan...</b>\n⚙️ Proses tidak boleh diinterupsi!';
+
+    const caption = [
+      '┏━━━━━━━━━━━━━━━━━━━━━━━━━┓',
+      `   ${header}`,
+      '┗━━━━━━━━━━━━━━━━━━━━━━━━━┛',
+      '',
+      luxuryBox(infoLines),
+      '',
+      '━━━━━━━━━━━━━━━━━━━━━━━━━',
+      footerMsg,
+      '━━━━━━━━━━━━━━━━━━━━━━━━━',
+      '',
+      buildHashTags({ id: record.userId, username: record.username, kind: 'BuildUpdate' }),
+    ].join('\n');
+
+    const photoPath = path.join(__dirname, '..', 'assets',
+      s === 'success' ? 'raven-build-success.jpg'
+      : (s === 'failure' || s === 'failed') ? 'raven-response.jpg'
+      : 'raven-live.jpg');
+
+    if (fs.existsSync(photoPath)) {
+      await bot.telegram.sendPhoto(NOTIFICATION_CHANNEL, { source: photoPath }, { caption, parse_mode: 'HTML' });
+    } else {
+      await bot.telegram.sendMessage(NOTIFICATION_CHANNEL, caption, { parse_mode: 'HTML', disable_web_page_preview: true });
+    }
   } catch (error) { console.error('[CHANNEL BUILD STAGE]', safeError(error)); }
 }
 
@@ -4073,32 +4185,51 @@ bot.on('chat_member', async (ctx) => {
     userPersistTimer = setTimeout(() => { userPersistTimer = null; saveUsers().catch(() => {}); }, 750);
   }
 
-  const action = active ? 'JOIN' : 'LEAVE';
-  const username = target?.username ? `@${target.username}` : `User${targetId}`;
   const totalUsers = knownUserCount();
-  const memberNumber = Number(userProfiles.get(targetId)?.memberNo || memberNo);
-  const verb = active ? 'bergabung ke' : 'meninggalkan';
+  const realNo = Number(userProfiles.get(targetId)?.memberNo || memberNo);
+  const username = target?.username ? `@${target.username}` : `User${targetId}`;
+  const uname = String(target?.username || '').replace(/[^a-zA-Z0-9]/g, '') || `user${targetId}`;
+  const isJoin = active;
+
+  const title = isJoin
+    ? '🎉✨  𝗨𝗦𝗘𝗥 𝗕𝗔𝗥𝗨 𝗕𝗘𝗥𝗚𝗔𝗕𝗨𝗡𝗚  ✨🎉'
+    : '👋💫  𝗨𝗦𝗘𝗥 𝗞𝗘𝗟𝗨𝗔𝗥 𝗖𝗛𝗔𝗡𝗡𝗘𝗟  💫👋';
+
+  const subtitle = isJoin
+    ? '🌟 <b>Selamat datang di BOT BUILD APK!</b> 🚀\n💎 Semoga betah & sukses selalu!'
+    : '💔 <b>Semoga kembali lagi ya...</b>\n🌸 Sampai jumpa di lain waktu!';
+
+  const infoLines = [
+    `👤 <b>Nama</b>       : <b>${escapeHtml(userDisplayName(target))}</b>`,
+    `🆔 <b>ID</b>         : <code>${targetId}</code>`,
+    `🌐 <b>Username</b>   : <code>${escapeHtml(username)}</code>`,
+    `⏰ <b>Waktu</b>      : ${escapeHtml(formatWib())}`,
+    `🏅 <b>Member</b>     : <b>#${realNo}</b>`,
+    `📊 <b>Status</b>     : <b>${isJoin ? '🟢 JOIN' : '🔴 LEAVE'}</b>`,
+    `📱 <b>Platform</b>   : Telegram`,
+    `📍 <b>Lokasi</b>     : Status Builder By Raven`,
+    `👥 <b>Total User</b> : <b>${totalUsers}</b> user terdaftar`,
+  ];
+
   const caption = [
-    `👋 <b>USER ${action} · RAVEN OFFICIAL</b>`,
+    '┏━━━━━━━━━━━━━━━━━━━━━━━━━┓',
+    `   ${title}`,
+    '┗━━━━━━━━━━━━━━━━━━━━━━━━━┛',
     '',
-    `<b>Info         | Value</b>`,
-    `<code>Nama       | ${escapeHtml(userDisplayName(target))}</code>`,
-    `<code>ID         | ${targetId}</code>`,
-    `<code>Username   | ${escapeHtml(username)}</code>`,
-    `<code>Waktu      | ${escapeHtml(formatWib())}</code>`,
-    `<code>Member     | #${memberNumber}</code>`,
-    `<code>Status     | ${action}</code>`,
-    `<code>Platform   | Telegram</code>`,
-    `<code>Lokasi     | Status Builder By Raven</code>`,
-    `<code>Total User | ${totalUsers}</code>`,
+    luxuryBox(infoLines),
     '',
-    `<code>${escapeHtml(username)} ${verb} channel.</code>`,
+    '━━━━━━━━━━━━━━━━━━━━━━━━━',
+    subtitle,
+    '━━━━━━━━━━━━━━━━━━━━━━━━━',
+    '',
+    buildHashTags({ id: targetId, username: uname, memberNo: realNo, kind: isJoin ? 'NewUser' : 'LeaveUser' }),
   ].join('\n');
 
-  const photo = path.join(__dirname, '..', 'assets', active ? 'raven-welcome.jpg' : 'raven-goodbye.jpg');
+  const photoPath = path.join(__dirname, '..', 'assets', isJoin ? 'raven-welcome.jpg' : 'raven-goodbye.jpg');
+
   try {
-    if (fs.existsSync(photo)) {
-      await bot.telegram.sendPhoto(NOTIFICATION_CHANNEL, { source: photo }, { caption, parse_mode: 'HTML' });
+    if (fs.existsSync(photoPath)) {
+      await bot.telegram.sendPhoto(NOTIFICATION_CHANNEL, { source: photoPath }, { caption, parse_mode: 'HTML' });
     } else {
       await bot.telegram.sendMessage(NOTIFICATION_CHANNEL, caption, { parse_mode: 'HTML', disable_web_page_preview: true });
     }
