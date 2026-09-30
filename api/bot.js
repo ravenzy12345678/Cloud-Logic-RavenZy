@@ -220,16 +220,33 @@ function formatWib(timestamp = Date.now()) {
 }
 
 // ─── HELPER MEWAH: BORDER BOX + HASHTAG + STATUS EMOJI ────────────
-function luxuryBox(lines) {
-  const max = Math.max(...lines.map((l) => l.replace(/<[^>]+>/g, '').length), 30);
-  const top = '╔' + '═'.repeat(max + 4) + '╗';
-  const bottom = '╚' + '═'.repeat(max + 4) + '╝';
+// ─── HELPER GAYA PANEL PREMIUM (seperti Create Panel by Raven) ─────
+function premiumHeader(title) {
+  // Judul di dalam box dengan border tipis
+  return `╭─────────────────────────╮\n   ${title}\n╰─────────────────────────╯`;
+}
+
+function premiumBox(sectionTitle, lines) {
+  // Box dengan judul seksi di atas, isi di dalam
+  const max = Math.max(
+    ...lines.map((l) => l.replace(/<[^>]+>/g, '').length),
+    sectionTitle.replace(/<[^>]+>/g, '').length
+  );
+  const width = max + 4;
+  const top = `┌${'─'.repeat(width)}┐`;
+  const title = `│ ${sectionTitle}${' '.repeat(Math.max(0, width - sectionTitle.replace(/<[^>]+>/g, '').length - 1))}│`;
+  const sep = `├${'─'.repeat(width)}┤`;
   const body = lines.map((l) => {
     const plain = l.replace(/<[^>]+>/g, '').length;
-    const pad = ' '.repeat(Math.max(0, max - plain));
-    return `║  ${l}${pad}  ║`;
+    const pad = ' '.repeat(Math.max(0, width - plain - 1));
+    return `│ ${l}${pad}│`;
   }).join('\n');
-  return `${top}\n${body}\n${bottom}`;
+  const bottom = `└${'─'.repeat(width)}┘`;
+  return `${top}\n${title}\n${sep}\n${body}\n${bottom}`;
+}
+
+function premiumFooter(text) {
+  return `\n<i>© ${text}</i>`;
 }
 
 function statusEmoji(s) {
@@ -2576,44 +2593,49 @@ async function runGenerateBotVercel(ctx, session, statusMessage) {
 }
 
 async function notifyChannelText(title, ctx, detail, opts = {}) {
-  const lines = [
-    '┏━━━━━━━━━━━━━━━━━━━━━━━━━┓',
-    `   ✨💎  <b>${escapeHtml(title)}</b>  💎✨`,
-    '┗━━━━━━━━━━━━━━━━━━━━━━━━━┛',
+  const caption = [
+    premiumHeader(`✨  ${escapeHtml(title)}  ✨`),
     '',
-    `👤 <b>User</b> : ${escapeHtml(userDisplayName(ctx.from))}`,
-    `🆔 <b>ID</b>   : <code>${uid(ctx)}</code>`,
-    detail || '',
+    premiumBox('📋  INFORMASI USER', [
+      `👤  User : ${escapeHtml(userDisplayName(ctx.from))}`,
+      `🆔  ID   : <code>${uid(ctx)}</code>`,
+    ]),
+    detail ? `\n${premiumBox('📝  DETAIL', [detail])}` : '',
+    '',
     '━━━━━━━━━━━━━━━━━━━━━━━━━',
     buildHashTags({ id: uid(ctx), username: ctx.from?.username }),
+    premiumFooter('Builder By Raven • 2026'),
   ].filter(Boolean).join('\n');
   try {
-    await bot.telegram.sendMessage(NOTIFICATION_CHANNEL, lines, { parse_mode: 'HTML', disable_web_page_preview: true });
+    await bot.telegram.sendMessage(NOTIFICATION_CHANNEL, caption, { parse_mode: 'HTML', disable_web_page_preview: true });
   } catch (error) { console.error('[CHANNEL LOG]', safeError(error)); }
 }
 
 async function notifyChannelBuildStart(record) {
   try {
+    const infoLines = [
+      `👤  User      : <b>${escapeHtml(record.userName || 'Unknown')}</b>`,
+      `🆔  User ID   : <code>${record.userId}</code>`,
+      `📦  Project   : <code>${escapeHtml(record.projectName || '-')}</code>`,
+      `🔑  Build ID  : <code>${escapeHtml(record.id)}</code>`,
+      `⚙️  Engine    : Server`,
+      `📊  Status    : <b>⏳ QUEUED</b>`,
+      `⏰  Waktu     : ${escapeHtml(formatWib())}`,
+    ];
+
     const caption = [
-      '┏━━━━━━━━━━━━━━━━━━━━━━━━━┓',
-      '   🚀✨  𝗕𝗨𝗜𝗟𝗗 𝗕𝗔𝗥𝗨 𝗗𝗜𝗠𝗨𝗟𝗔𝗜  ✨🚀',
-      '┗━━━━━━━━━━━━━━━━━━━━━━━━━┛',
+      premiumHeader('🚀  BUILD BARU DIMULAI  🚀'),
       '',
-      luxuryBox([
-        `👤 <b>User</b>      : ${escapeHtml(record.userName || 'Unknown')}`,
-        `🆔 <b>User ID</b>   : <code>${record.userId}</code>`,
-        `📦 <b>Project</b>   : <code>${escapeHtml(record.projectName || '-')}</code>`,
-        `🔑 <b>Build ID</b>  : <code>${escapeHtml(record.id)}</code>`,
-        `⚙️ <b>Engine</b>    : Server`,
-        `📊 <b>Status</b>    : <b>⏳ QUEUED</b>`,
-        `⏰ <b>Waktu</b>     : ${escapeHtml(formatWib())}`,
+      premiumBox('📋  INFORMASI BUILD', infoLines),
+      '',
+      premiumBox('💬  STATUS', [
+        `🔥  <b>Build sedang diproses...</b>`,
+        `⏳  Tunggu update selanjutnya ya!`,
       ]),
       '',
       '━━━━━━━━━━━━━━━━━━━━━━━━━',
-      '🔥 <b>Build sedang diproses...</b>\n⏳ Tunggu update selanjutnya ya!',
-      '━━━━━━━━━━━━━━━━━━━━━━━━━',
-      '',
       buildHashTags({ id: record.userId, username: record.username, kind: 'BuildStart' }),
+      premiumFooter('Builder By Raven • 2026'),
     ].join('\n');
 
     const photoPath = path.join(__dirname, '..', 'assets', 'raven-response.jpg');
@@ -2639,46 +2661,59 @@ async function notifyChannelBuildStage(record, stage, status, runId, extra = '')
     const percent = progressMap[stage] ?? (s === 'success' ? 100 : s === 'running' ? 55 : 20);
     const bar = progressBar(percent);
 
-    const header = {
-      success:   '🏆💎  𝗕𝗨𝗜𝗟𝗗 𝗦𝗨𝗞𝗦𝗘𝗦 𝗧𝗢𝗧𝗔𝗟  💎🏆',
-      failure:   '💥⚠️  𝗕𝗨𝗜𝗟𝗗 𝗚𝗔𝗚𝗔𝗟  ⚠️💥',
-      failed:    '💥⚠️  𝗕𝗨𝗜𝗟𝗗 𝗚𝗔𝗚𝗔𝗟  ⚠️💥',
-      cancelled: '⏹️🚫  𝗕𝗨𝗜𝗟𝗗 𝗗𝗜𝗕𝗔𝗧𝗔𝗟𝗞𝗔𝗡  🚫⏹️',
-      running:   '⚡🔥  𝗟𝗜𝗩𝗘 𝗠𝗢𝗡𝗜𝗧𝗢𝗥𝗜𝗡𝗚  🔥⚡',
-    }[s] || '⚡🔥  𝗟𝗜𝗩𝗘 𝗠𝗢𝗡𝗜𝗧𝗢𝗥𝗜𝗡𝗚  🔥⚡';
+    // ─── HEADER DINAMIS ───
+    const headerTitle = {
+      success:   '🏆  BUILD SUKSES TOTAL  🏆',
+      failure:   '💥  BUILD GAGAL  💥',
+      failed:    '💥  BUILD GAGAL  💥',
+      cancelled: '⏹️  BUILD DIBATALKAN  ⏹️',
+      running:   '⚡  LIVE MONITORING  ⚡',
+    }[s] || '⚡  LIVE MONITORING  ⚡';
 
+    // ─── BOX INFORMASI BUILD ───
     const infoLines = [
-      `👤 <b>User</b>     : ${escapeHtml(record.userName || 'Unknown')}`,
-      `🆔 <b>User ID</b>  : <code>${record.userId}</code>`,
-      `📦 <b>Project</b>  : <code>${escapeHtml(record.projectName || '-')}</code>`,
-      `🔑 <b>Build ID</b> : <code>${escapeHtml(record.id)}</code>`,
-      `📡 <b>Stage</b>    : <code>${escapeHtml(stage)}</code>`,
-      `${emoji} <b>Status</b>   : <b>${escapeHtml(String(status || 'unknown').toUpperCase())}</b>`,
-      `📊 <b>Progress</b> : <code>${bar}</code> <b>${percent}%</b>`,
+      `👤  User      : <b>${escapeHtml(record.userName || 'Unknown')}</b>`,
+      `🆔  User ID   : <code>${record.userId}</code>`,
+      `📦  Project   : <code>${escapeHtml(record.projectName || '-')}</code>`,
+      `🔑  Build ID  : <code>${escapeHtml(record.id)}</code>`,
+      `📡  Stage     : <code>${escapeHtml(stage)}</code>`,
+      `${emoji}  Status    : <b>${escapeHtml(String(status || 'unknown').toUpperCase())}</b>`,
+      `📊  Progress  : <code>${bar}</code> <b>${percent}%</b>`,
     ];
-    if (runId) infoLines.push(`🔗 <b>Run ID</b>   : <code>${escapeHtml(String(runId))}</code>`);
-    if (extra) infoLines.push(`📝 <b>Note</b>     : ${escapeHtml(extra)}`);
+    if (runId) infoLines.push(`🔗  Run ID    : <code>${escapeHtml(String(runId))}</code>`);
 
+    // ─── BOX STATUS ───
     const footerMsg = s === 'success'
-      ? '✅🎁 <b>APK berhasil dikirim ke chat user!</b>\n🎉 Selamat menikmati hasil build!'
+      ? [
+          `✅  <b>APK berhasil dikirim ke chat user!</b>`,
+          `🎉  Selamat menikmati hasil build!`,
+        ]
       : (s === 'failure' || s === 'failed')
-        ? '❌🛠️ <b>Silakan cek log atau hubungi owner.</b>\n💡 Coba perbaiki lalu build ulang ya!'
+        ? [
+            `❌  <b>Silakan cek log atau hubungi owner.</b>`,
+            `💡  Coba perbaiki lalu build ulang ya!`,
+          ]
         : s === 'cancelled'
-          ? '⏹️💤 <b>Build dihentikan oleh owner.</b>'
-          : '⏳🔥 <b>Mohon tunggu, build sedang berjalan...</b>\n⚙️ Proses tidak boleh diinterupsi!';
+          ? [
+              `⏹️  <b>Build dihentikan oleh owner.</b>`,
+              `💤  Build tidak dilanjutkan.`,
+            ]
+          : [
+              `⏳  <b>Mohon tunggu, build sedang berjalan...</b>`,
+              `⚙️  Proses tidak boleh diinterupsi!`,
+            ];
 
+    // ─── SUSUN CAPTION GAYA PANEL PREMIUM ───
     const caption = [
-      '┏━━━━━━━━━━━━━━━━━━━━━━━━━┓',
-      `   ${header}`,
-      '┗━━━━━━━━━━━━━━━━━━━━━━━━━┛',
+      premiumHeader(headerTitle),
       '',
-      luxuryBox(infoLines),
+      premiumBox('📋  INFORMASI BUILD', infoLines),
+      '',
+      premiumBox('💬  STATUS', footerMsg),
       '',
       '━━━━━━━━━━━━━━━━━━━━━━━━━',
-      footerMsg,
-      '━━━━━━━━━━━━━━━━━━━━━━━━━',
-      '',
       buildHashTags({ id: record.userId, username: record.username, kind: 'BuildUpdate' }),
+      premiumFooter('Builder By Raven • 2026'),
     ].join('\n');
 
     const photoPath = path.join(__dirname, '..', 'assets',
@@ -4191,38 +4226,48 @@ bot.on('chat_member', async (ctx) => {
   const uname = String(target?.username || '').replace(/[^a-zA-Z0-9]/g, '') || `user${targetId}`;
   const isJoin = active;
 
-  const title = isJoin
-    ? '🎉✨  𝗨𝗦𝗘𝗥 𝗕𝗔𝗥𝗨 𝗕𝗘𝗥𝗚𝗔𝗕𝗨𝗡𝗚  ✨🎉'
-    : '👋💫  𝗨𝗦𝗘𝗥 𝗞𝗘𝗟𝗨𝗔𝗥 𝗖𝗛𝗔𝗡𝗡𝗘𝗟  💫👋';
+  // ─── HEADER PANEL ───
+  const headerTitle = isJoin
+    ? '🎉  USER BARU BERGABUNG  🎉'
+    : '👋  USER KELUAR CHANNEL  👋';
 
-  const subtitle = isJoin
-    ? '🌟 <b>Selamat datang di BOT BUILD APK!</b> 🚀\n💎 Semoga betah & sukses selalu!'
-    : '💔 <b>Semoga kembali lagi ya...</b>\n🌸 Sampai jumpa di lain waktu!';
-
+  // ─── BOX INFORMASI USER ───
   const infoLines = [
-    `👤 <b>Nama</b>       : <b>${escapeHtml(userDisplayName(target))}</b>`,
-    `🆔 <b>ID</b>         : <code>${targetId}</code>`,
-    `🌐 <b>Username</b>   : <code>${escapeHtml(username)}</code>`,
-    `⏰ <b>Waktu</b>      : ${escapeHtml(formatWib())}`,
-    `🏅 <b>Member</b>     : <b>#${realNo}</b>`,
-    `📊 <b>Status</b>     : <b>${isJoin ? '🟢 JOIN' : '🔴 LEAVE'}</b>`,
-    `📱 <b>Platform</b>   : Telegram`,
-    `📍 <b>Lokasi</b>     : Status Builder By Raven`,
-    `👥 <b>Total User</b> : <b>${totalUsers}</b> user terdaftar`,
+    `👤  Nama       : <b>${escapeHtml(userDisplayName(target))}</b>`,
+    `🆔  ID         : <code>${targetId}</code>`,
+    `🌐  Username   : <code>${escapeHtml(username)}</code>`,
+    `⏰  Waktu      : ${escapeHtml(formatWib())}`,
+    `🏅  Member     : <b>#${realNo}</b>`,
+    `📊  Status     : <b>${isJoin ? '🟢 JOIN' : '🔴 LEAVE'}</b>`,
+    `📱  Platform   : Telegram`,
+    `📍  Lokasi     : Status Builder By Raven`,
+    `👥  Total User : <b>${totalUsers}</b> user terdaftar`,
   ];
 
+  // ─── BOX UCAPAN ───
+  const greetingLines = isJoin
+    ? [
+        `🌟  <b>Selamat datang di BOT BUILD APK!</b>`,
+        `🚀  Semoga betah & sukses selalu!`,
+        `💎  Suport terus RavenZy ya!`,
+      ]
+    : [
+        `💔  <b>Semoga kembali lagi ya...</b>`,
+        `🌸  Sampai jumpa di lain waktu!`,
+        `✨  Terima kasih sudah mampir!`,
+      ];
+
+  // ─── SUSUN CAPTION GAYA PANEL PREMIUM ───
   const caption = [
-    '┏━━━━━━━━━━━━━━━━━━━━━━━━━┓',
-    `   ${title}`,
-    '┗━━━━━━━━━━━━━━━━━━━━━━━━━┛',
+    premiumHeader(headerTitle),
     '',
-    luxuryBox(infoLines),
+    premiumBox('📋  INFORMASI USER', infoLines),
+    '',
+    premiumBox('💬  UCAPAN', greetingLines),
     '',
     '━━━━━━━━━━━━━━━━━━━━━━━━━',
-    subtitle,
-    '━━━━━━━━━━━━━━━━━━━━━━━━━',
-    '',
     buildHashTags({ id: targetId, username: uname, memberNo: realNo, kind: isJoin ? 'NewUser' : 'LeaveUser' }),
+    premiumFooter('Builder By Raven • 2026'),
   ].join('\n');
 
   const photoPath = path.join(__dirname, '..', 'assets', isJoin ? 'raven-welcome.jpg' : 'raven-goodbye.jpg');
@@ -4236,10 +4281,6 @@ bot.on('chat_member', async (ctx) => {
   } catch (error) {
     console.error('[CHANNEL MEMBER LOG]', safeError(error));
   }
-});
-
-bot.catch((error) => {
-  console.error('[BOT ERROR]', error.response?.data || error.message || error);
 });
 
 (async () => {
