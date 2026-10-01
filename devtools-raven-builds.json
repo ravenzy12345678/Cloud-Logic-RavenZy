@@ -234,11 +234,11 @@
     "transport": "telegram-mtproto",
     "serverLabel": "Server #1",
     "priority": "OWNER",
-    "status": "running",
-    "stage": "WORKFLOW_DISPATCHED",
-    "progress": 2,
+    "status": "failed",
+    "stage": "SUBMIT_FAILED",
+    "progress": 0,
     "createdAt": 1790891000161,
-    "updatedAt": 1790891002473,
+    "updatedAt": 1790891003474,
     "callbackSecretHash": "30257703b46729ed94c79ec9890706a8ec2389f0e8750dc289433b1be970f39a",
     "callbackUrl": "https://cloud-logic-raven-zy.vercel.app/api/build-callback",
     "sourceFilename": "Base-Holow-Exekution (1).zip",
@@ -256,6 +256,8 @@
     "renameAppName": null,
     "renameDomain": null,
     "channelMessageId": 85,
-    "channelPhotoName": "raven-response.jpg"
+    "channelPhotoName": "raven-response.jpg",
+    "error": "Invalid request.\n\nNo more than 10 properties are allowed; 13 were supplied.",
+    "completedAt": 1790891003370
   }
 ]
