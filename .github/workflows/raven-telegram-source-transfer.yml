@@ -1,0 +1,101 @@
+name: Raven Telegram Large Source Transfer
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        required: false
+        type: string
+        default: release
+      job_id:
+        required: true
+        type: string
+      callback_url:
+        required: false
+        type: string
+        default: ''
+      callback_secret:
+        required: false
+        type: string
+        default: ''
+      source_storage_owner:
+        required: true
+        type: string
+      source_storage_repo:
+        required: true
+        type: string
+      source_release_tag:
+        required: true
+        type: string
+      source_filename:
+        required: true
+        type: string
+      target_chat_id:
+        required: true
+        type: string
+      project_name:
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  transfer:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
+      TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
+      TOKEN_BOT: ${{ secrets.TOKEN_BOT }}
+      TOKEN_GITHUB: ${{ secrets.TOKEN_GITHUB }}
+      CALLBACK_URL: ${{ inputs.callback_url }}
+      CALLBACK_SECRET: ${{ inputs.callback_secret }}
+      JOB_ID: ${{ inputs.job_id }}
+      TARGET_CHAT_ID: ${{ inputs.target_chat_id }}
+      SOURCE_OWNER: ${{ inputs.source_storage_owner }}
+      SOURCE_REPO: ${{ inputs.source_storage_repo }}
+      SOURCE_TAG: ${{ inputs.source_release_tag }}
+      SOURCE_FILENAME: ${{ inputs.source_filename }}
+      PROJECT_NAME: ${{ inputs.project_name }}
+      SOURCE_DIR: ${{ runner.temp }}/raven-source-transfer
+
+    steps:
+      - name: Checkout Builder
+        uses: actions/checkout@v5
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install MTProto worker
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install Telethon==1.45.0
+
+      - name: Download source release asset
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$SOURCE_DIR"
+          export GH_TOKEN="$TOKEN_GITHUB"
+          gh release download "$SOURCE_TAG" --repo "$SOURCE_OWNER/$SOURCE_REPO" --dir "$SOURCE_DIR" --clobber
+          FILE="$(find "$SOURCE_DIR" -maxdepth 1 -type f | head -n1)"
+          test -n "$FILE"
+          SIZE="$(stat -c '%s' "$FILE")"
+          test "$SIZE" -le 2000000000
+          echo "APK_PATH=$FILE" >> "$GITHUB_ENV"
+
+      - name: Send source to owner via Telegram
+        env:
+          APK_CAPTION: |
+            📦 <b>GET ZIP BUILD — RAVEN</b>
+
+            Project: <code>${{ inputs.project_name }}</code>
+            Source: <b>${{ inputs.source_filename }}</b>
+            ✅ Source ZIP siap dikirim.
+
+            <i>Transferred via Telegram MTProto • Builder By Raven</i>
+        run: python scripts/raven-telegram-mtproto.py send-file
