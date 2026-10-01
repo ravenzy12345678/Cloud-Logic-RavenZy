@@ -4,7 +4,7 @@ const JSZip = require('jszip');
 const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
-const { buildId, workflowYml, androidWorkflowYml, createRepo: createBuildRepo, uploadFiles: uploadBuildFiles, dispatchWorkflow, createRelease, uploadReleaseAsset, downloadReleaseAsset, getArtifact, cancelRun, deleteRepo: deleteBuildRepo } = require('./build-engine');
+const { buildId, workflowYml, androidWorkflowYml, createRepo: createBuildRepo, uploadFiles: uploadBuildFiles, dispatchWorkflow, dispatchRepositoryEvent, createRelease, uploadReleaseAsset, downloadReleaseAsset, getArtifact, cancelRun, deleteRepo: deleteBuildRepo } = require('./build-engine');
 const { extractZip: extractRenameZip, scanRenameFiles, transformZip: transformRenameZip } = require('./rename');
 const legacyTools = require('./legacy-tools');
 
@@ -57,6 +57,8 @@ const REPO_QUOTA_FILE = 'devtools-raven-repo-quota.json';
 const BANNED_FILE = 'devtools-raven-banned.json';
 const BUILD_FILE = 'devtools-raven-builds.json';
 const SETTINGS_FILE = 'devtools-raven-settings.json';
+const PENDING_SESSION_FILE = 'devtools-raven-pending-sessions.json';
+const PENDING_SESSION_TTL = 30 * 60 * 1000;
 const BUILD_CONCURRENCY_NOTE = 'Server';
 const OWNER_TELEGRAM_URL = 'https://t.me/RavenZyPT';
 const OWNER_WHATSAPP_URL = 'https://wa.me/6288271102065';
@@ -68,7 +70,7 @@ const BUY_ACCESS_URL = `${OWNER_TELEGRAM_URL}?text=${encodeURIComponent(BUY_MESS
 // mengunduh byte source ZIP dan karena itu tidak memakai limit download Bot API 20 MB.
 const TELEGRAM_OFFICIAL_DOWNLOAD_LIMIT = 20 * 1024 * 1024;
 const FLUTTER_REMOTE_SOURCE_LIMIT = 150 * 1024 * 1024;
-const FLUTTER_MAX_SOURCE_BYTES = 2_000_000_000;
+const FLUTTER_MAX_SOURCE_BYTES = 2_147_483_647;
 const FLUTTER_MAX_FILES = 6000;
 const FLUTTER_MAX_UNCOMPRESSED = 300 * 1024 * 1024;
 const FLUTTER_SKIP_DIRS = new Set([
@@ -685,6 +687,66 @@ async function writeJsonRepoFile(filename, value, message) {
     } catch (error) {
       if (attempt === 0 && error.response?.status === 409) continue;
       console.error(`[STATE ${filename}]`, errorMessage(error));
+      return false;
+    }
+  }
+  return false;
+}
+
+async function loadPendingFlutterSession(userId) {
+  const id = Number(userId);
+  if (!Number.isInteger(id) || id <= 0) return null;
+  const result = await readJsonRepoFile(PENDING_SESSION_FILE, {});
+  const all = result.value && typeof result.value === 'object' && !Array.isArray(result.value) ? result.value : {};
+  const item = all[String(id)];
+  if (!item || Date.now() - Number(item.createdAt || 0) > PENDING_SESSION_TTL) return null;
+  if (!['debug', 'release'].includes(String(item.mode))) return null;
+  return { type: 'flutter_build', step: 'file', mode: String(item.mode), platform: 'github', transport: 'telegram-mtproto', createdAt: Number(item.createdAt) || Date.now(), persisted: true };
+}
+
+async function savePendingFlutterSession(userId, mode) {
+  const id = Number(userId);
+  if (!Number.isInteger(id) || id <= 0 || !['debug', 'release'].includes(String(mode))) return false;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      const file = await getBotRepoFile(PENDING_SESSION_FILE);
+      let all = {};
+      if (file?.content) {
+        try { all = JSON.parse(Buffer.from(file.content, 'base64').toString('utf8')); } catch (_) { all = {}; }
+      }
+      if (!all || typeof all !== 'object' || Array.isArray(all)) all = {};
+      const cutoff = Date.now() - PENDING_SESSION_TTL;
+      for (const [key, value] of Object.entries(all)) {
+        if (!value || Number(value.createdAt || 0) < cutoff) delete all[key];
+      }
+      all[String(id)] = { mode: String(mode), createdAt: Date.now() };
+      await writeBotRepoFile(PENDING_SESSION_FILE, JSON.stringify(all, null, 2), 'chore: update Raven pending Flutter build session', file?.sha);
+      return true;
+    } catch (error) {
+      if (attempt === 0 && error.response?.status === 409) continue;
+      console.error('[PENDING SESSION SAVE]', safeError(error));
+      return false;
+    }
+  }
+  return false;
+}
+
+async function clearPendingFlutterSession(userId) {
+  const id = Number(userId);
+  if (!Number.isInteger(id) || id <= 0) return false;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      const file = await getBotRepoFile(PENDING_SESSION_FILE);
+      if (!file?.content) return true;
+      let all;
+      try { all = JSON.parse(Buffer.from(file.content, 'base64').toString('utf8')); } catch (_) { all = {}; }
+      if (!all || typeof all !== 'object' || Array.isArray(all)) all = {};
+      delete all[String(id)];
+      await writeBotRepoFile(PENDING_SESSION_FILE, JSON.stringify(all, null, 2), 'chore: clear Raven pending Flutter build session', file.sha);
+      return true;
+    } catch (error) {
+      if (attempt === 0 && error.response?.status === 409) continue;
+      console.error('[PENDING SESSION CLEAR]', safeError(error));
       return false;
     }
   }
@@ -2193,7 +2255,7 @@ async function runTelegramFlutterBuild(ctx, session, sourceInfo) {
   const startedAt = Date.now();
   const userId = uid(ctx);
   const jobId = buildId();
-  const secret = crypto.randomBytes(32).toString('hex');
+  const secret = crypto.createHmac('sha256', String(ENV.BOT_TOKEN || ENV.GH_TOKEN || 'raven')).update(jobId).digest('hex');
   const callbackUrl = callbackBaseUrl();
   const baseOwner = process.env.PEMILIK_GITHUB || process.env.GITHUB_OWNER;
   const baseRepo = process.env.REPO_GITHUB || process.env.GITHUB_REPO;
@@ -2248,14 +2310,25 @@ async function runTelegramFlutterBuild(ctx, session, sourceInfo) {
       footer: 'Jangan kirim ulang ZIP selama build berjalan.',
     }), REPLY_OPTS).catch(() => {});
 
-    await dispatchWorkflow(
+    await dispatchRepositoryEvent(
       { owner: { login: baseOwner }, name: baseRepo, default_branch: baseBranch },
-      jobId, record.mode, callbackUrl, secret, 'raven-flutter-telegram-2gb.yml',
-      { source_chat_id: sourceInfo.chatId, source_message_id: sourceInfo.messageId, source_filename: sourceFilename,
-        source_size: sourceSize, started_at: startedAt, target_chat_id: sourceInfo.chatId, project_name: projectName }
+      'raven_flutter_build',
+      {
+        mode: record.mode,
+        job_id: jobId,
+        callback_url: callbackUrl,
+        source_chat_id: sourceInfo.chatId,
+        source_message_id: sourceInfo.messageId,
+        source_filename: sourceFilename,
+        source_size: sourceSize,
+        started_at: startedAt,
+        target_chat_id: sourceInfo.chatId,
+        project_name: projectName,
+      }
     );
     await updateBuildRecord(jobId, { dispatchedAt: Date.now(), stage: 'WORKFLOW_DISPATCHED', status: 'running', progress: 4 });
     sessions.delete(userId);
+    await clearPendingFlutterSession(userId);
     return record;
   } catch (error) {
     const safe = scrubSensitive(errorMessage(error));
@@ -2267,6 +2340,7 @@ async function runTelegramFlutterBuild(ctx, session, sourceInfo) {
       footer: 'Periksa konfigurasi GitHub Actions lalu kirim ZIP kembali.',
     }), homeButton()).catch(() => {});
     sessions.delete(userId);
+    await clearPendingFlutterSession(userId);
     throw error;
   }
 }
@@ -3026,9 +3100,9 @@ async function notifyChannelBuildStage(record, stage, status, runId, extra = '')
     const emoji = statusEmoji(s);
     const numericProgress = Number(record.progress || 0);
     const progressMap = {
-      SUBMIT_FAILED: 0, SOURCE_RECEIVED: 2, SOURCE_DOWNLOAD_START: 4, SOURCE_DOWNLOADED: 22, PROJECT_VALIDATED: 30,
-      SOURCE_BACKUP_READY: 38, BUILD_REPO_READY: 45, SOURCE_UPLOADED: 50, TOOLCHAIN_READY: 56, WORKFLOW_DISPATCHED: 4,
-      DEPENDENCIES_READY: 64, BUILDING_APK: 76, APK_READY: 88, SENDING_APK: 90, APK_SENT: 100, ARTIFACT_UPLOADED: 90,
+      SUBMIT_FAILED: 0, SOURCE_RECEIVED: 2, SOURCE_DOWNLOAD_START: 4, SOURCE_DOWNLOADED: 22, PROJECT_VALIDATED: 60,
+      SOURCE_BACKUP_READY: 38, BUILD_REPO_READY: 45, SOURCE_UPLOADED: 50, TOOLCHAIN_READY: 54, WORKFLOW_DISPATCHED: 4,
+      DEPENDENCIES_READY: 68, BUILDING_APK: 78, APK_READY: 90, SENDING_APK: 90, APK_SENT: 100, ARTIFACT_UPLOADED: 90,
       ARTIFACT_DOWNLOAD_FAILED: 95, TELEGRAM_TRANSFER_FAILED: 90, KILLED_BY_OWNER: 100, COMPLETE: 100, UNKNOWN: 5,
     };
     let percent = progressMap[stage];
@@ -3246,6 +3320,7 @@ bot.action('home', async (ctx) => {
   await ctx.answerCbQuery();
   if (!await enforceJoinGate(ctx)) return;
   sessions.delete(uid(ctx));
+  await clearPendingFlutterSession(uid(ctx));
   // TIDAK menghapus pesan apapun — lihat catatan di bagian UI HELPERS.
   return sendMainMenu(ctx);
 });
@@ -3317,13 +3392,21 @@ bot.action(/^owner_get_zip:(.+)$/, async (ctx) => {
   if (record.deliveryMethod === 'mtproto' && record.sourceReleaseTag && record.sourceStorageRepo) {
     try {
       const owner = record.sourceStorageOwner || ENV.GH_OWNER;
-      await dispatchWorkflow(
+      await dispatchRepositoryEvent(
         { owner: { login: record.sourceRepoOwner || ENV.GH_OWNER }, name: record.sourceRepoName || ENV.GH_REPO, default_branch: record.sourceBranch || ENV.GH_BRANCH || 'main' },
-        `source-transfer-${record.id}`, 'release', '', '',
-        'raven-telegram-source-transfer.yml',
-        { source_storage_owner: owner, source_storage_repo: record.sourceStorageRepo, source_release_tag: record.sourceReleaseTag,
+        'raven_source_transfer',
+        {
+          mode: 'release',
+          job_id: `source-transfer-${record.id}`,
+          callback_url: '',
+          callback_secret: '',
+          source_storage_owner: owner,
+          source_storage_repo: record.sourceStorageRepo,
+          source_release_tag: record.sourceReleaseTag,
           source_filename: record.sourceAssetFilename || record.sourceFilename || `${repoSafeName(record.projectName)}.zip`,
-          target_chat_id: ctx.from.id, project_name: record.projectName || 'raven-build-source' }
+          target_chat_id: ctx.from.id,
+          project_name: record.projectName || 'raven-build-source',
+        }
       );
       return sendPanel(ctx, panel({ heading: '<b>GET ZIP BUILD 📦</b>', box: infoBox([
         ['📦 Project', `<code>${escapeHtml(record.projectName || record.id)}</code>`],
@@ -3694,8 +3777,10 @@ bot.action(/^flutter_mode:(debug|release)$/, async (ctx) => {
   if (!await requireFeatureAccess(ctx)) return;
   const id = uid(ctx);
   const mode = String(ctx.match[1]);
-  sessions.set(id, { type: 'flutter_build', step: 'file', mode, platform: 'github', transport: 'telegram-mtproto', createdAt: Date.now() });
-  await sendPrompt(ctx, `Build Flutter APK — ${mode.toUpperCase()}`, '📦 Kirim <b>Base Project Flutter (.zip)</b> langsung ke chat.\n\n✅ Maksimum source: <b>2 GB</b>\n✅ Wajib ada: <code>pubspec.yaml</code>, <code>android/</code>, <code>lib/</code>\n✅ Flutter SDK / Android SDK tidak perlu dimasukkan\n⚡ Tidak perlu URL GitHub, repository, atau URL ZIP.', sessions.get(id));
+  const session = { type: 'flutter_build', step: 'file', mode, platform: 'github', transport: 'telegram-mtproto', createdAt: Date.now() };
+  sessions.set(id, session);
+  await savePendingFlutterSession(id, mode);
+  await sendPrompt(ctx, `Build Flutter APK — ${mode.toUpperCase()}`, '📦 Kirim <b>Base Project Flutter (.zip)</b> langsung ke chat.\n\n✅ Maksimum source: <b>2 GB</b>\n✅ Wajib ada: <code>pubspec.yaml</code>, <code>android/</code>, <code>lib/</code>\n✅ Flutter SDK / Android SDK tidak perlu dimasukkan\n⚡ Tidak perlu URL GitHub, repository, atau URL ZIP.', session);
 });
 
 bot.action('web_to_apk', async (ctx) => {
@@ -4348,7 +4433,14 @@ bot.on('photo', async (ctx) => {
 
 bot.on('document', async (ctx) => {
   const id = uid(ctx);
-  const session = sessions.get(id);
+  let session = sessions.get(id);
+  if (!session) {
+    const persistedFlutter = await loadPendingFlutterSession(id);
+    if (persistedFlutter) {
+      session = persistedFlutter;
+      sessions.set(id, session);
+    }
+  }
   if (!session) return;
   if (maintenanceEnabled && !isOwner(ctx)) { sessions.delete(id); await sendPanel(ctx, panel({ heading: '<b>MAINTENANCE 🛠️</b>', body: 'Fitur user sedang ditutup sementara oleh owner.' }), ownerContactMarkup()); return; }
   const document = ctx.message.document;
