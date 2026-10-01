@@ -17,7 +17,7 @@
     "stage": "WORKFLOW_DISPATCHED",
     "progress": 4,
     "createdAt": 1790837268403,
-    "updatedAt": 1790837268783,
+    "updatedAt": 1790837270400,
     "callbackSecretHash": "a7cb7c44b3d39d190a95986497b26de052eeca81710464a49bdae72fc16a75da",
     "callbackUrl": "https://cloud-logic-raven-zy.vercel.app/api/build-callback",
     "sourceFilename": "Base-Holow-Exekution (1).zip",
@@ -31,6 +31,7 @@
     "sourceStorageRepo": "raven-build-storage",
     "sourceReleaseTag": "raven-build-mup69rxv-0b73dad6",
     "targetChatId": 6793028697,
-    "targetMessageId": 1880
+    "targetMessageId": 1880,
+    "dispatchedAt": 1790837270275
   }
 ]
