@@ -39,7 +39,7 @@ function androidWorkflowYml() {
 async function createRepo(name) {
   const e = env();
   const r = await gh('POST', '/user/repos', { name, description: `Raven Flutter build ${name}`, private: true, auto_init: true });
-  if (String(r.data?.owner?.login || '').toLowerCase() !== String(e.owner || '').toLowerCase()) throw new Error('GitHub token owner mismatch.');
+  if (String(r.data?.owner?.login || '').toLowerCase() !== String(e.owner || '').toLowerCase()) throw new Error('Server token owner mismatch.');
   return r.data;
 }
 
@@ -76,12 +76,16 @@ async function uploadFiles(repo, files) {
   return { branch, commitSha: commit.data.sha };
 }
 
-async function dispatchWorkflow(repo, jobId, mode, callbackUrl, callbackSecret, workflowFile = 'raven-flutter-build.yml') {
+async function dispatchWorkflow(repo, jobId, mode, callbackUrl, callbackSecret, workflowFile = 'raven-flutter-build.yml', extraInputs = {}) {
   const owner = repo.owner.login;
   const safeWorkflowFile = String(workflowFile || 'raven-flutter-build.yml').replace(/[^a-zA-Z0-9._-]/g, '');
+  const inputs = { mode, job_id: jobId, callback_url: callbackUrl, callback_secret: callbackSecret };
+  for (const [key, value] of Object.entries(extraInputs || {})) {
+    if (value !== undefined && value !== null) inputs[key] = String(value);
+  }
   await gh('POST', `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo.name)}/actions/workflows/${encodeURIComponent(safeWorkflowFile)}/dispatches`, {
     ref: repo.default_branch || 'main',
-    inputs: { mode, job_id: jobId, callback_url: callbackUrl, callback_secret: callbackSecret },
+    inputs,
   }, { timeout: 30000 });
   return { dispatched: true };
 }
@@ -94,9 +98,9 @@ async function createRelease(owner, repo, jobId, name) {
 
 async function uploadReleaseAsset(release, filename, buffer) {
   const uploadUrl = String(release.upload_url || '').replace(/\{\?.*\}$/, '');
-  if (!uploadUrl) throw new Error('GitHub release upload URL tidak tersedia.');
+  if (!uploadUrl) throw new Error('Server release upload URL tidak tersedia.');
   const response = await axios.post(`${uploadUrl}?name=${encodeURIComponent(filename)}`, buffer, { headers: { ...headers(), 'Content-Type': 'application/zip' }, timeout: 120000, maxContentLength: Infinity, maxBodyLength: Infinity, validateStatus: () => true });
-  if (response.status < 200 || response.status >= 300) throw new Error(`GitHub release asset HTTP ${response.status}`);
+  if (response.status < 200 || response.status >= 300) throw new Error(`Server release asset HTTP ${response.status}`);
   return response.data;
 }
 
