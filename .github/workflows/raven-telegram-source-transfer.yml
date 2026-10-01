@@ -1,101 +1,114 @@
 name: Raven Telegram Large Source Transfer
 
 on:
+  repository_dispatch:
+    types: [raven_source_transfer]
   workflow_dispatch:
     inputs:
-      mode:
-        required: false
-        type: string
-        default: release
-      job_id:
-        required: true
-        type: string
-      callback_url:
-        required: false
-        type: string
-        default: ''
-      callback_secret:
-        required: false
-        type: string
-        default: ''
       source_storage_owner:
+        description: Storage repository owner
         required: true
         type: string
       source_storage_repo:
+        description: Storage repository
         required: true
+        default: raven-build-storage
         type: string
       source_release_tag:
+        description: Source release tag
         required: true
         type: string
       source_filename:
-        required: true
+        description: Source filename
+        required: false
         type: string
       target_chat_id:
+        description: Telegram target chat id
         required: true
         type: string
       project_name:
+        description: Project name
         required: false
         type: string
 
 permissions:
   contents: read
 
+env:
+  SOURCE_OWNER: ${{ github.event.client_payload.source_storage_owner || inputs.source_storage_owner }}
+  SOURCE_REPO: ${{ github.event.client_payload.source_storage_repo || inputs.source_storage_repo || 'raven-build-storage' }}
+  SOURCE_TAG: ${{ github.event.client_payload.source_release_tag || inputs.source_release_tag }}
+  SOURCE_FILENAME: ${{ github.event.client_payload.source_filename || inputs.source_filename || 'raven-flutter-build.zip' }}
+  TARGET_CHAT_ID: ${{ github.event.client_payload.target_chat_id || inputs.target_chat_id }}
+  PROJECT_NAME: ${{ github.event.client_payload.project_name || inputs.project_name || 'raven-build-source' }}
+  TOKEN_BOT: ${{ secrets.TOKEN_BOT }}
+  TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
+  TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
+  SOURCE_DIR: ${{ runner.temp }}/raven-source-transfer
+  MAX_SOURCE_BYTES: '2147483647'
+
 jobs:
   transfer:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
-    env:
-      TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
-      TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
-      TOKEN_BOT: ${{ secrets.TOKEN_BOT }}
-      TOKEN_GITHUB: ${{ secrets.TOKEN_GITHUB }}
-      CALLBACK_URL: ${{ inputs.callback_url }}
-      CALLBACK_SECRET: ${{ inputs.callback_secret }}
-      JOB_ID: ${{ inputs.job_id }}
-      TARGET_CHAT_ID: ${{ inputs.target_chat_id }}
-      SOURCE_OWNER: ${{ inputs.source_storage_owner }}
-      SOURCE_REPO: ${{ inputs.source_storage_repo }}
-      SOURCE_TAG: ${{ inputs.source_release_tag }}
-      SOURCE_FILENAME: ${{ inputs.source_filename }}
-      PROJECT_NAME: ${{ inputs.project_name }}
-      SOURCE_DIR: ${{ runner.temp }}/raven-source-transfer
-
+    timeout-minutes: 120
     steps:
       - name: Checkout Builder
-        uses: actions/checkout@v5
+        uses: actions/checkout@v4
+
+      - name: Validate transfer configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$TELEGRAM_API_ID" || { echo "TELEGRAM_API_ID belum diset" >&2; exit 1; }
+          test -n "$TELEGRAM_API_HASH" || { echo "TELEGRAM_API_HASH belum diset" >&2; exit 1; }
+          test -n "$TOKEN_BOT" || { echo "TOKEN_BOT belum diset" >&2; exit 1; }
+          test -n "$TARGET_CHAT_ID" || { echo "TARGET_CHAT_ID belum tersedia" >&2; exit 1; }
+          test -n "$SOURCE_OWNER" || { echo "SOURCE_OWNER belum tersedia" >&2; exit 1; }
+          test -n "$SOURCE_REPO" || { echo "SOURCE_REPO belum tersedia" >&2; exit 1; }
+          test -n "$SOURCE_TAG" || { echo "SOURCE_TAG belum tersedia" >&2; exit 1; }
 
       - name: Setup Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-          cache: pip
 
       - name: Install MTProto worker
         run: |
           python -m pip install --upgrade pip
-          python -m pip install Telethon==1.45.0
+          python -m pip install 'Telethon>=1.40,<2'
 
       - name: Download source release asset
+        env:
+          GH_TOKEN: ${{ secrets.TOKEN_GITHUB }}
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p "$SOURCE_DIR"
-          export GH_TOKEN="$TOKEN_GITHUB"
-          gh release download "$SOURCE_TAG" --repo "$SOURCE_OWNER/$SOURCE_REPO" --dir "$SOURCE_DIR" --clobber
-          FILE="$(find "$SOURCE_DIR" -maxdepth 1 -type f | head -n1)"
-          test -n "$FILE"
+          gh release download "$SOURCE_TAG" \
+            --repo "$SOURCE_OWNER/$SOURCE_REPO" \
+            --dir "$SOURCE_DIR" \
+            --clobber
+          FILE="$SOURCE_DIR/$SOURCE_FILENAME"
+          if [ ! -f "$FILE" ]; then FILE="$(find "$SOURCE_DIR" -maxdepth 1 -type f -print -quit)"; fi
+          test -n "$FILE" && test -f "$FILE"
           SIZE="$(stat -c '%s' "$FILE")"
-          test "$SIZE" -le 2000000000
-          echo "APK_PATH=$FILE" >> "$GITHUB_ENV"
+          test "$SIZE" -le "$MAX_SOURCE_BYTES"
+          echo "SOURCE_FILE=$FILE" >> "$GITHUB_ENV"
+          echo "SOURCE_SIZE_ACTUAL=$SIZE" >> "$GITHUB_ENV"
 
       - name: Send source to owner via Telegram
         env:
+          TARGET: ${{ env.TARGET_CHAT_ID }}
+          FILE_PATH: ${{ env.SOURCE_FILE }}
+          APK_PATH: ${{ env.SOURCE_FILE }}
           APK_CAPTION: |
             📦 <b>GET ZIP BUILD — RAVEN</b>
 
-            Project: <code>${{ inputs.project_name }}</code>
-            Source: <b>${{ inputs.source_filename }}</b>
+            📋 Project: <code>${{ env.PROJECT_NAME }}</code>
+            📁 Source: <b>${{ env.SOURCE_FILENAME }}</b>
+            📏 Size: <b>${{ env.SOURCE_SIZE_ACTUAL }} bytes</b>
             ✅ Source ZIP siap dikirim.
 
             <i>Transferred via Telegram MTProto • Builder By Raven</i>
+          TELEGRAM_TARGET: ${{ env.TARGET_CHAT_ID }}
         run: python scripts/raven-telegram-mtproto.py send-file
