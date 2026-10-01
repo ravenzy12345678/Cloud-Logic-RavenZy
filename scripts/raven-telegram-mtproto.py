@@ -141,30 +141,42 @@ async def download_source(callback: Callback) -> Path:
 
 async def send_file(callback: Callback) -> Path:
     target_chat = int(env_required("TARGET_CHAT_ID"))
-    file_path = Path(env_required("APK_PATH")).resolve()
+    kind = os.environ.get("OUTPUT_KIND", "apk").strip().lower()
+    if kind == "zip":
+        raw_path = os.environ.get("OUTPUT_PATH", "").strip()
+    else:
+        raw_path = os.environ.get("APK_PATH", "").strip()
+    if not raw_path:
+        raise RuntimeError("Path output belum diset.")
+    file_path = Path(raw_path).resolve()
     if not file_path.is_file():
-        raise RuntimeError(f"File not found: {file_path}")
+        raise RuntimeError(f"File output tidak ditemukan: {file_path}")
     size = file_path.stat().st_size
     if size <= 0 or size > MAX_BYTES:
         raise RuntimeError("Output file tidak valid atau melebihi 2 GB.")
 
-    caption = os.environ.get("APK_CAPTION", "✅ APK BUILD SELESAI")[:1000]
-    callback.send("running", "TELEGRAM_CONNECTING", 93, apk_size=size, apk_filename=file_path.name)
+    success_stage = "OUTPUT_SENT" if kind == "zip" else "APK_SENT"
+    upload_stage = "OUTPUT_UPLOAD_PROGRESS" if kind == "zip" else "APK_UPLOAD_PROGRESS"
+    size_key = "output_size" if kind == "zip" else "apk_size"
+    filename_key = "output_filename" if kind == "zip" else "apk_filename"
+    caption = os.environ.get("OUTPUT_CAPTION", "").strip() or os.environ.get("APK_CAPTION", "✅ APK BUILD SELESAI")
+    caption = caption[:1000]
+
+    callback.send("running", "TELEGRAM_CONNECTING", 93, **{size_key: size, filename_key: file_path.name})
     client = await build_client()
     started = time.time()
     try:
-        callback.send("running", "SENDING_APK", 95, apk_size=size, apk_filename=file_path.name)
+        callback.send("running", "SENDING_APK", 95, **{size_key: size, filename_key: file_path.name})
 
         def progress(current: int, total: int) -> None:
             pct = int((current * 100) / total) if total else 0
             callback.send(
                 "running",
-                "APK_UPLOAD_PROGRESS",
+                upload_stage,
                 pct,
                 bytes_current=int(current),
                 bytes_total=int(total or size),
-                apk_size=size,
-                apk_filename=file_path.name,
+                **{size_key: size, filename_key: file_path.name},
             )
 
         await client.send_file(
@@ -179,16 +191,13 @@ async def send_file(callback: Callback) -> Path:
         elapsed = int(time.time() - started)
         callback.send(
             "success",
-            "APK_SENT",
+            success_stage,
             100,
-            apk_size=size,
-            apk_filename=file_path.name,
-            elapsed_seconds=elapsed,
+            **{size_key: size, filename_key: file_path.name, "elapsed_seconds": elapsed},
         )
         return file_path
     finally:
         await client.disconnect()
-
 
 def sha256(path: Path) -> str:
     digest = hashlib.sha256()
