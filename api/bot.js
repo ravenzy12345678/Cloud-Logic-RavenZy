@@ -577,8 +577,8 @@ function buildStageLabel(stage) {
     WORKER_READY: 'Worker siap menjalankan proses',
     TELEGRAM_CONNECTING: 'Menghubungkan ke Telegram',
     TELEGRAM_SESSION_READY: 'Koneksi Telegram siap',
-    SOURCE_DOWNLOAD_START: 'Mengambil source ZIP dari Telegram',
-    SOURCE_DOWNLOADED: 'Source ZIP berhasil diterima',
+    SOURCE_DOWNLOAD_START: 'Memeriksa source ZIP dari Telegram',
+    SOURCE_DOWNLOADED: 'Source ZIP berhasil periksa',
     SOURCE_VALIDATED: 'Validasi struktur project selesai',
     SOURCE_BACKUP_READY: 'Source tersimpan dengan aman',
     TOOLCHAIN_READY: 'Flutter, Java, dan Android SDK siap',
@@ -2414,7 +2414,6 @@ async function runTelegramFlutterBuild(ctx, session, sourceInfo) {
         source_message_id: sourceInfo.messageId,
         source_filename: sourceFilename,
         source_size: sourceSize,
-        started_at: startedAt,
         target_chat_id: sourceInfo.chatId,
         project_name: projectName,
       }
@@ -3157,7 +3156,8 @@ async function notifyChannelBuildStart(record) {
       progress: 2,
       detail: 'Source diterima. Menunggu worker GitHub Actions memulai pipeline.',
     });
-    const photoPath = resolveLocalAsset('raven-response.jpg');
+    const photoName = 'raven-response.jpg';
+    const photoPath = resolveLocalAsset(photoName);
     let sent = null;
     if (photoPath) {
       try {
@@ -3167,7 +3167,8 @@ async function notifyChannelBuildStart(record) {
     if (!sent) sent = await bot.telegram.sendMessage(NOTIFICATION_CHANNEL, caption, { parse_mode: 'HTML', disable_web_page_preview: true });
     if (sent?.message_id) {
       record.channelMessageId = sent.message_id;
-      await updateBuildRecord(record.id, { channelMessageId: sent.message_id });
+      record.channelPhotoName = sent.photo ? photoName : null;
+      await updateBuildRecord(record.id, { channelMessageId: sent.message_id, channelPhotoName: record.channelPhotoName });
     }
   } catch (error) { console.error('[CHANNEL BUILD START]', safeError(error)); }
 }
@@ -3226,9 +3227,25 @@ async function notifyChannelBuildStage(record, stage, status, runId, extra = '')
     });
 
     const photoName = s === 'success' ? 'raven-build-success.jpg' : (s === 'cancelled' ? 'raven-goodbye.jpg' : 'raven-response.jpg');
-    const photoPath = resolveLocalAsset(photoName);
+    const photoPath = resolveLocalAsset(photoName) || resolveLocalAsset('raven-response.jpg');
+    const photoChanged = photoName !== record.channelPhotoName;
     let edited = false;
-    if (record.channelMessageId) {
+
+    // Final stages must swap the banner photo (e.g. in-progress → success/failed/cancelled),
+    // a plain caption edit never changes the attached photo on Telegram.
+    if (record.channelMessageId && photoChanged && photoPath) {
+      try {
+        await bot.telegram.editMessageMedia(NOTIFICATION_CHANNEL, record.channelMessageId, undefined, {
+          type: 'photo',
+          media: { source: fs.readFileSync(photoPath) },
+          caption,
+          parse_mode: 'HTML',
+        });
+        edited = true;
+        record.channelPhotoName = photoName;
+      } catch (_) {}
+    }
+    if (!edited && record.channelMessageId) {
       try {
         await bot.telegram.editMessageCaption(NOTIFICATION_CHANNEL, record.channelMessageId, undefined, caption, { parse_mode: 'HTML' });
         edited = true;
@@ -3244,9 +3261,10 @@ async function notifyChannelBuildStage(record, stage, status, runId, extra = '')
       if (!sent) sent = await bot.telegram.sendMessage(NOTIFICATION_CHANNEL, caption, { parse_mode: 'HTML', disable_web_page_preview: true });
       if (sent?.message_id) {
         record.channelMessageId = sent.message_id;
-        await updateBuildRecord(record.id, { channelMessageId: sent.message_id });
+        record.channelPhotoName = sent.photo ? photoName : null;
       }
     }
+    await updateBuildRecord(record.id, { channelMessageId: record.channelMessageId, channelPhotoName: record.channelPhotoName || null });
   } catch (error) { console.error('[CHANNEL BUILD STAGE]', safeError(error)); }
 }
 
