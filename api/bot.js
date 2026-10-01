@@ -247,7 +247,7 @@ function formatWib(timestamp = Date.now()) {
 // ─── HELPER GAYA PANEL PREMIUM (seperti Create Panel by Raven) ─────
 function premiumHeader(title) {
   // Judul di dalam box dengan border tipis
-  return `╭─────────────────────────╮\n   ${title}\n╰─────────────────────────╯`;
+  return `╭─────────────────────────╮\n   ${title}\n╰────────────────────────╯`;
 }
 
 function premiumBox(sectionTitle, lines) {
@@ -416,22 +416,6 @@ async function safeDeleteMessage(ctx, chatId, messageId) {
   try { await ctx.telegram.deleteMessage(chatId, messageId); } catch (_) {}
 }
 
-// ─────────────────────────────────────────────
-// TAMPILAN / UI HELPERS
-//
-// Aturan tampilan bot ini:
-// 1. Navigasi HANYA lewat inline button pada pesan bot (tidak ada Reply
-//    Keyboard, tidak ada daftar perintah "/" selain /start dan /cancel),
-//    supaya tidak ada dua menu berbeda yang membingungkan.
-// 2. Semua pesan mematikan link preview (disable_web_page_preview) supaya
-//    tidak ada kartu/gambar preview GitHub atau Vercel yang muncul —
-//    tampilan tetap murni teks & status.
-// 3. Tombol "Menu Utama" TIDAK PERNAH menghapus pesan yang ditempelinya,
-//    jadi hasil (link deploy, hasil delete, dsb) tidak pernah hilang saat
-//    pengguna menekan tombol itu atau /start ulang.
-// 4. Menu owner (Users, Broadcast, build controls) HANYA muncul untuk OWNER_ID.
-// ─────────────────────────────────────────────
-
 const BAR = '───── ✦ ───── ✦ ─────';
 const BRAND = 'BUILDER BY RAVEN · V3';
 
@@ -556,23 +540,12 @@ function progressBar(percent) {
   return '█'.repeat(filled) + '░'.repeat(total - filled);
 }
 
-// Previously these 4 photos were read from disk at request time via
-// path.join(__dirname, '..', 'assets', filename). On Vercel that folder was
-// never guaranteed to ship with the deployed function (the bundler cannot
-// always tell a dynamic fs path needs to be included), so every sendPhoto()
-// silently failed and the bot fell back to plain text — exactly what you
-// kept seeing. assets-embedded.js now bundles the same 4 original files
-// (nothing added, nothing swapped) as base64 directly inside the function's
-// own JS code, which always ships with the deployment no matter what.
 const ASSET_BUFFERS = require('./assets-embedded');
 
 function getAssetBuffer(filename) {
   return ASSET_BUFFERS[filename] || null;
 }
 
-// One-line startup proof in the Vercel function logs that the channel photos
-// are actually present in this deployment (check logs for "[ASSETS]" if a
-// photo ever goes missing again).
 console.log('[ASSETS] loaded:', Object.entries(ASSET_BUFFERS).map(([name, buf]) => `${name}=${buf ? buf.length + 'b' : 'MISSING'}`).join(', '));
 
 // Kept for any legacy caller that still wants a filesystem path instead of a
@@ -660,10 +633,10 @@ function buildNotificationCaption(record, { title, status, stage, progress, deta
     : (record.createdAt ? Math.round((Date.now() - record.createdAt) / 1000) : null);
 
   const lines = [
-    '╭━━━━━━━━━━━━━━━━━━━━╮',
-    `┃ 💎 <b>RAVEN BUILD CENTER</b>`,
-    `┃ ${title || 'LIVE BUILD MONITOR'}`,
-    '╰━━━━━━━━━━━━━━━━━━━━╯',
+    '╭━━━━━━━━━━━━━━━━━━━━━━╮',
+    `┃💎 <b>RAVEN BUILD CENTER</b>`,
+    `┃ ${title || 'LIVE BUILD'}`,
+    '╰━━━━━━━━━━━━━━━━━━━━━━╯',
     '',
     `👤 <b>Developer</b> : ${escapeHtml(displayValue(record.userName || 'Unknown', 36))}`,
     `🆔 <b>User ID</b>   : <code>${escapeHtml(record.userId)}</code>`,
@@ -681,7 +654,7 @@ function buildNotificationCaption(record, { title, status, stage, progress, deta
     finishedAt ? `📅 <b>Selesai</b> : <b>${escapeHtml(finishedAt)}</b>` : null,
     '',
     `🔑 <code>${escapeHtml(record.id)}</code>`,
-    '━━━━━━━━━━━━━━━━━━━━━━━━',
+    '━━━━━━━━━━━━━━━━━━━━━━━━━',
     '<i>Builder By Raven • 2026</i>',
   ].filter(Boolean);
   return lines.join('\n');
@@ -2423,6 +2396,14 @@ async function runTelegramWorkflowTask(ctx, session, sourceInfo, operation = 'fl
   try {
     await upsertBuildRecord(record);
     await notifyChannelBuildStart(record);
+    // GitHub repository_dispatch client_payload is limited to 10 properties.
+    // We encode rename_app_name and rename_domain into project_name using the
+    // "|||" delimiter when operation is rename_project, so the workflow can
+    // parse them back out.  target_chat_id always equals source_chat_id, so
+    // the workflow derives it from SOURCE_CHAT_ID instead of a separate field.
+    const projectNameField = operation === 'rename_project'
+      ? `${projectName}|||${record.renameAppName || ''}|||${record.renameDomain || ''}`
+      : projectName;
     await dispatchRepositoryEvent(
       { owner: { login: baseOwner }, name: baseRepo, default_branch: baseBranch },
       'raven_flutter_build',
@@ -2436,12 +2417,12 @@ async function runTelegramWorkflowTask(ctx, session, sourceInfo, operation = 'fl
         source_message_id: sourceInfo.messageId,
         source_filename: sourceFilename,
         source_size: sourceSize,
-        target_chat_id: sourceInfo.chatId,
-        project_name: projectName,
-        rename_app_name: record.renameAppName || '',
-        rename_domain: record.renameDomain || '',
+        project_name: projectNameField,
       }
     );
+    // property count: operation, mode, job_id, callback_url, callback_secret,
+    // source_chat_id, source_message_id, source_filename, source_size,
+    // project_name = 10 properties (GitHub limit).
     await updateBuildRecord(jobId, { dispatchedAt: Date.now(), stage: 'WORKFLOW_DISPATCHED', status: 'running', progress: 2 });
     sessions.delete(userId);
     if (operation === 'flutter_build') await clearPendingFlutterSession(userId);
