@@ -45,20 +45,8 @@ on:
         description: Source size in bytes
         required: false
         type: string
-      target_chat_id:
-        description: Telegram target chat id
-        required: false
-        type: string
       project_name:
-        description: Project name hint
-        required: false
-        type: string
-      rename_app_name:
-        description: New app name
-        required: false
-        type: string
-      rename_domain:
-        description: New domain, optional
+        description: "Project name hint. For rename_project: 'basename|||new_app_name|||new_domain'"
         required: false
         type: string
 
@@ -79,10 +67,9 @@ env:
   SOURCE_MESSAGE_ID: ${{ github.event.client_payload.source_message_id || inputs.source_message_id || '' }}
   SOURCE_SIZE: ${{ github.event.client_payload.source_size || inputs.source_size || '0' }}
   SOURCE_FILENAME: ${{ github.event.client_payload.source_filename || inputs.source_filename || 'raven-source.zip' }}
-  TARGET_CHAT_ID: ${{ github.event.client_payload.target_chat_id || inputs.target_chat_id || '' }}
   PROJECT_NAME_HINT: ${{ github.event.client_payload.project_name || inputs.project_name || '' }}
-  RENAME_APP_NAME: ${{ github.event.client_payload.rename_app_name || inputs.rename_app_name || '' }}
-  RENAME_DOMAIN: ${{ github.event.client_payload.rename_domain || inputs.rename_domain || '' }}
+  # TARGET_CHAT_ID and RENAME_APP_NAME/RENAME_DOMAIN are derived at runtime
+  # in the "Parse project name and derive fields" step below.
   TOKEN_BOT: ${{ secrets.TOKEN_BOT }}
   TOKEN_GITHUB: ${{ secrets.TOKEN_GITHUB }}
   TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
@@ -121,6 +108,36 @@ jobs:
           fi
           test -n "${CALLBACK_SECRET:-}"
           printf '[%s] worker=%s operation=%s mode=%s job=%s\n' "$(date -Is)" "${GITHUB_RUN_ID}" "$OPERATION" "$MODE" "$JOB_ID" >> "$WORKER_LOG"
+
+      - name: Parse project name and derive fields
+        shell: bash
+        run: |
+          set -euo pipefail
+          # TARGET_CHAT_ID always equals SOURCE_CHAT_ID (same user chat).
+          echo "TARGET_CHAT_ID=${SOURCE_CHAT_ID}" >> "$GITHUB_ENV"
+          # For rename_project, PROJECT_NAME_HINT is encoded as:
+          #   "basename|||new_app_name|||new_domain"
+          # For flutter_build it is just the plain project name.
+          # Use Python to split on the literal "|||" delimiter safely.
+          python - <<'PY'
+          import os
+          raw = os.environ.get('PROJECT_NAME_HINT', '')
+          sep = '|||'
+          env_file = os.environ['GITHUB_ENV']
+          if sep in raw:
+              parts = raw.split(sep, 2)
+              base_name = parts[0] if len(parts) > 0 else ''
+              rename_app = parts[1] if len(parts) > 1 else ''
+              rename_domain = parts[2] if len(parts) > 2 else ''
+          else:
+              base_name = raw
+              rename_app = ''
+              rename_domain = ''
+          with open(env_file, 'a') as f:
+              f.write(f'PROJECT_NAME_HINT={base_name}\n')
+              f.write(f'RENAME_APP_NAME={rename_app}\n')
+              f.write(f'RENAME_DOMAIN={rename_domain}\n')
+          PY
 
       - name: Prepare callback helper
         shell: bash
