@@ -1,40 +1,50 @@
 name: Raven Flutter Telegram 2GB Build
 
 on:
+  repository_dispatch:
+    types: [raven_flutter_build]
   workflow_dispatch:
     inputs:
       mode:
-        required: true
+        description: Build mode
+        required: false
+        default: release
         type: choice
         options: [debug, release]
       job_id:
-        required: true
-        type: string
-      callback_url:
-        required: true
-        type: string
-      callback_secret:
-        required: true
-        type: string
-      source_chat_id:
-        required: true
-        type: string
-      source_message_id:
-        required: true
-        type: string
-      source_filename:
-        required: true
-        type: string
-      source_size:
+        description: Raven build id
         required: false
         type: string
-      started_at:
+      callback_url:
+        description: Raven callback URL
+        required: false
+        type: string
+      callback_secret:
+        description: Per-build callback secret
+        required: false
+        type: string
+      source_chat_id:
+        description: Telegram source chat id
+        required: false
+        type: string
+      source_message_id:
+        description: Telegram source message id
+        required: false
+        type: string
+      source_filename:
+        description: Source filename
+        required: false
+        type: string
+      source_size:
+        description: Source size in bytes
         required: false
         type: string
       target_chat_id:
-        required: true
+        description: Telegram target chat id
+        required: false
         type: string
       project_name:
+        description: Project name hint
         required: false
         type: string
 
@@ -42,58 +52,90 @@ permissions:
   contents: read
 
 concurrency:
-  group: raven-flutter-${{ inputs.job_id }}
+  group: raven-flutter-${{ github.event.client_payload.job_id || inputs.job_id || github.run_id }}
   cancel-in-progress: true
+
+env:
+  MODE: ${{ github.event.client_payload.mode || inputs.mode || 'release' }}
+  JOB_ID: ${{ github.event.client_payload.job_id || inputs.job_id || github.run_id }}
+  CALLBACK_URL: ${{ github.event.client_payload.callback_url || inputs.callback_url || '' }}
+  CALLBACK_SECRET: ${{ github.event.client_payload.callback_secret || inputs.callback_secret || '' }}
+  SOURCE_CHAT_ID: ${{ github.event.client_payload.source_chat_id || inputs.source_chat_id || '' }}
+  SOURCE_MESSAGE_ID: ${{ github.event.client_payload.source_message_id || inputs.source_message_id || '' }}
+  SOURCE_SIZE: ${{ github.event.client_payload.source_size || inputs.source_size || '0' }}
+  SOURCE_FILENAME: ${{ github.event.client_payload.source_filename || inputs.source_filename || 'raven-flutter-build.zip' }}
+  TARGET_CHAT_ID: ${{ github.event.client_payload.target_chat_id || inputs.target_chat_id || '' }}
+  PROJECT_NAME_HINT: ${{ github.event.client_payload.project_name || inputs.project_name || '' }}
+  TOKEN_BOT: ${{ secrets.TOKEN_BOT }}
+  TOKEN_GITHUB: ${{ secrets.TOKEN_GITHUB }}
+  TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
+  TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
+  STORAGE_REPO: raven-build-storage
+  RELEASE_TAG: raven-build-${{ github.event.client_payload.job_id || inputs.job_id || github.run_id }}
+  SOURCE_PATH: ${{ runner.temp }}/raven-source.zip
+  PROJECT_PATH: ${{ runner.temp }}/raven-flutter-project
+  MAX_SOURCE_BYTES: '2147483647'
 
 jobs:
   build:
+    name: Flutter ${{ github.event.client_payload.mode || inputs.mode || 'release' }} • ${{ github.event.client_payload.job_id || inputs.job_id || github.run_id }}
     runs-on: ubuntu-latest
-    timeout-minutes: 120
-    env:
-      TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
-      TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
-      TOKEN_BOT: ${{ secrets.TOKEN_BOT }}
-      TOKEN_GITHUB: ${{ secrets.TOKEN_GITHUB }}
-      CALLBACK_URL: ${{ inputs.callback_url }}
-      CALLBACK_SECRET: ${{ inputs.callback_secret }}
-      JOB_ID: ${{ inputs.job_id }}
-      SOURCE_CHAT_ID: ${{ inputs.source_chat_id }}
-      SOURCE_MESSAGE_ID: ${{ inputs.source_message_id }}
-      SOURCE_SIZE: ${{ inputs.source_size }}
-      TARGET_CHAT_ID: ${{ inputs.target_chat_id }}
-      SOURCE_FILENAME: ${{ inputs.source_filename }}
-      PROJECT_NAME: ${{ inputs.project_name }}
-      STORAGE_REPO: raven-build-storage
-      RELEASE_TAG: raven-build-${{ inputs.job_id }}
-      SOURCE_PATH: ${{ runner.temp }}/raven-source.zip
-      PROJECT_PATH: ${{ runner.temp }}/raven-flutter-project
+    timeout-minutes: 360
 
     steps:
       - name: Checkout Builder
-        uses: actions/checkout@v5
+        uses: actions/checkout@v4
 
-      - name: Validate secrets
+      - name: Prepare secure callback secret
+        env:
+          TOKEN_BOT: ${{ secrets.TOKEN_BOT }}
         shell: bash
         run: |
           set -euo pipefail
-          test -n "$TELEGRAM_API_ID" || { echo "TELEGRAM_API_ID belum diset"; exit 1; }
-          test -n "$TELEGRAM_API_HASH" || { echo "TELEGRAM_API_HASH belum diset"; exit 1; }
-          test -n "$TOKEN_BOT" || { echo "TOKEN_BOT belum diset"; exit 1; }
-          test -n "$TOKEN_GITHUB" || { echo "TOKEN_GITHUB belum diset"; exit 1; }
+          if [ -z "${CALLBACK_SECRET:-}" ]; then
+            CALLBACK_SECRET="$(python - <<'PY'
+          import hashlib, hmac, os
+          key=os.environ.get('TOKEN_BOT','').encode()
+          msg=os.environ['JOB_ID'].encode()
+          print(hmac.new(key, msg, hashlib.sha256).hexdigest())
+          PY
+            )"
+            echo "CALLBACK_SECRET=$CALLBACK_SECRET" >> "$GITHUB_ENV"
+          fi
+          test -n "${CALLBACK_SECRET:-}"
+
+      - name: Validate invocation
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "${MODE,,}" in
+            debug|release) ;;
+            *) echo "Mode build tidak valid: $MODE" >&2; exit 1 ;;
+          esac
+          test -n "$TELEGRAM_API_ID" || { echo "TELEGRAM_API_ID belum diset" >&2; exit 1; }
+          test -n "$TELEGRAM_API_HASH" || { echo "TELEGRAM_API_HASH belum diset" >&2; exit 1; }
+          test -n "$TOKEN_BOT" || { echo "TOKEN_BOT belum diset" >&2; exit 1; }
+          test -n "$TOKEN_GITHUB" || { echo "TOKEN_GITHUB belum diset" >&2; exit 1; }
+          test -n "$CALLBACK_URL" || { echo "CALLBACK_URL belum tersedia" >&2; exit 1; }
+          test -n "$CALLBACK_SECRET" || { echo "CALLBACK_SECRET belum tersedia" >&2; exit 1; }
+          test -n "$SOURCE_CHAT_ID" || { echo "SOURCE_CHAT_ID belum tersedia" >&2; exit 1; }
+          test -n "$SOURCE_MESSAGE_ID" || { echo "SOURCE_MESSAGE_ID belum tersedia" >&2; exit 1; }
+          test -n "$TARGET_CHAT_ID" || { echo "TARGET_CHAT_ID belum tersedia" >&2; exit 1; }
+          echo "✅ Invocation valid: $MODE / $JOB_ID"
 
       - name: Setup Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-          cache: pip
 
       - name: Install MTProto worker
         shell: bash
         run: |
           python -m pip install --upgrade pip
-          python -m pip install Telethon==1.45.0
+          python -m pip install 'Telethon>=1.40,<2'
 
       - name: Telegram → runner source transfer
+        shell: bash
         run: |
           python scripts/raven-telegram-mtproto.py download-source
 
@@ -101,40 +143,48 @@ jobs:
         shell: bash
         run: |
           python - <<'PY'
-          import os, zipfile
+          import os
+          import zipfile
           from pathlib import PurePosixPath
-          src=os.environ['SOURCE_PATH']
-          max_entries=20000
-          max_uncompressed=6_000_000_000
+
+          src = os.environ['SOURCE_PATH']
+          max_source = int(os.environ['MAX_SOURCE_BYTES'])
+          size = os.path.getsize(src)
+          if size <= 0:
+              raise SystemExit('Source ZIP kosong.')
+          if size > max_source:
+              raise SystemExit(f'Source ZIP melebihi batas {max_source} bytes.')
+
+          max_entries = 30000
+          max_uncompressed = 6_000_000_000
+          total = 0
           with zipfile.ZipFile(src) as z:
-              infos=z.infolist()
+              infos = z.infolist()
               if len(infos) > max_entries:
                   raise SystemExit(f'Terlalu banyak entry ZIP: {len(infos)}')
-              total=0
               for info in infos:
-                  name=info.filename.replace('\\','/').lstrip('./')
-                  p=PurePosixPath(name)
+                  name = info.filename.replace('\\', '/').lstrip('./')
+                  p = PurePosixPath(name)
                   if p.is_absolute() or '..' in p.parts:
                       raise SystemExit(f'Path ZIP tidak aman: {info.filename}')
                   total += int(info.file_size or 0)
                   if total > max_uncompressed:
-                      raise SystemExit('Isi ZIP terkompresi terlalu besar (>6 GB).')
-              print(f'entries={len(infos)} uncompressed={total}')
+                      raise SystemExit('Isi ZIP terkompresi terlalu besar (>8 GB).')
+          print(f'✅ ZIP valid: compressed={size} bytes, entries={len(infos)}, uncompressed={total} bytes')
           PY
 
       - name: Backup source to private GitHub storage
         shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.TOKEN_GITHUB }}
         run: |
           set -euo pipefail
-          export GH_TOKEN="$TOKEN_GITHUB"
           OWNER="$(gh api user --jq .login)"
           TARGET="$OWNER/$STORAGE_REPO"
+
           if gh api "repos/$TARGET" >/dev/null 2>&1; then
             PRIVATE="$(gh api "repos/$TARGET" --jq .private)"
-            if [ "$PRIVATE" != "true" ]; then
-              echo "Repository $TARGET harus PRIVATE" >&2
-              exit 1
-            fi
+            [ "$PRIVATE" = "true" ] || { echo "Repository storage harus PRIVATE: $TARGET" >&2; exit 1; }
           else
             gh api --method POST /user/repos \
               -H 'Accept: application/vnd.github+json' \
@@ -143,39 +193,68 @@ jobs:
               -F private=true \
               -F has_issues=false \
               -F has_projects=false \
-              -F has_wiki=false >/dev/null
+              -F has_wiki=false \
+              -F auto_init=true >/dev/null
           fi
-          gh release create "$RELEASE_TAG" "$SOURCE_PATH" \
+
+          # Releases need a repository ref/commit. Older manually-created
+          # storage repos can be empty, so bootstrap a tiny private commit
+          # when the configured default branch does not exist yet.
+          STORAGE_BRANCH="$(gh api "repos/$TARGET" --jq .default_branch)"
+          [ -n "$STORAGE_BRANCH" ] || STORAGE_BRANCH="main"
+          if ! gh api "repos/$TARGET/git/ref/heads/$STORAGE_BRANCH" >/dev/null 2>&1; then
+            CONTENT_B64="$(printf 'Raven private build storage\n' | base64 -w0)"
+            gh api --method PUT "repos/$TARGET/contents/.raven-storage" \
+              -H 'Accept: application/vnd.github+json' \
+              -f message='chore: initialize Raven build storage' \
+              -f branch="$STORAGE_BRANCH" \
+              -f content="$CONTENT_B64" >/dev/null
+          fi
+
+          if gh release view "$RELEASE_TAG" --repo "$TARGET" >/dev/null 2>&1; then
+            echo "ℹ️ Release $RELEASE_TAG sudah ada — asset akan di-refresh."
+          else
+            gh release create "$RELEASE_TAG" \
+              --repo "$TARGET" \
+              --title "Raven Source $JOB_ID" \
+              --notes "Private source backup for Raven Flutter build $JOB_ID" \
+              --prerelease >/dev/null
+          fi
+
+          gh release upload "$RELEASE_TAG" "$SOURCE_PATH" \
             --repo "$TARGET" \
-            --title "Raven Source $JOB_ID" \
-            --notes "Private source backup for Raven Flutter build $JOB_ID" \
-            --prerelease
+            --clobber
+
           ASSET_JSON="$(gh release view "$RELEASE_TAG" --repo "$TARGET" --json assets)"
-          ASSET_ID="$(printf '%s' "$ASSET_JSON" | python -c 'import json,sys; a=json.load(sys.stdin)["assets"]; print(a[0]["id"] if a else "")')"
-          ASSET_NAME="$(printf '%s' "$ASSET_JSON" | python -c 'import json,sys; a=json.load(sys.stdin)["assets"]; print(a[0]["name"] if a else "")')"
+          ASSET_ID="$(printf '%s' "$ASSET_JSON" | python -c 'import json,sys; a=json.load(sys.stdin)["assets"]; print(a[-1]["id"] if a else "")')"
+          ASSET_NAME="$(printf '%s' "$ASSET_JSON" | python -c 'import json,sys,os; a=json.load(sys.stdin)["assets"]; print(next((x["name"] for x in reversed(a) if x.get("name") == os.environ.get("SOURCE_FILENAME")), a[-1]["name"] if a else ""))')"
           test -n "$ASSET_ID" && test -n "$ASSET_NAME"
-          echo "STORAGE_OWNER=$OWNER" >> "$GITHUB_ENV"
-          echo "STORAGE_ASSET_ID=$ASSET_ID" >> "$GITHUB_ENV"
-          echo "STORAGE_ASSET_NAME=$ASSET_NAME" >> "$GITHUB_ENV"
-          python - <<'PY'
-          import os, urllib.request, json
-          url=os.environ['CALLBACK_URL']
-          payload={
-            'jobId':os.environ['JOB_ID'],'secret':os.environ['CALLBACK_SECRET'],'status':'running',
-            'stage':'SOURCE_BACKUP_READY','progress':38,
-            'source_release_tag':os.environ['RELEASE_TAG'],
-            'source_asset_id':os.environ['STORAGE_ASSET_ID'],
-            'source_storage_owner':os.environ['STORAGE_OWNER'],
-            'source_storage_repo':os.environ['STORAGE_REPO'],
-            'source_asset_filename':os.environ['STORAGE_ASSET_NAME'],
-            'source_size':int(os.path.getsize(os.environ['SOURCE_PATH'])),
+          echo "SOURCE_STORAGE_OWNER=$OWNER" >> "$GITHUB_ENV"
+          echo "SOURCE_ASSET_ID=$ASSET_ID" >> "$GITHUB_ENV"
+          echo "SOURCE_ASSET_NAME=$ASSET_NAME" >> "$GITHUB_ENV"
+
+          python - <<'PY' || true
+          import os, json, urllib.request
+          payload = {
+              'jobId': os.environ['JOB_ID'],
+              'secret': os.environ['CALLBACK_SECRET'],
+              'status': 'running',
+              'stage': 'SOURCE_BACKUP_READY',
+              'progress': 38,
+              'runId': os.environ.get('GITHUB_RUN_ID'),
+              'source_release_tag': os.environ['RELEASE_TAG'],
+              'source_asset_id': os.environ.get('SOURCE_ASSET_ID'),
+              'source_storage_owner': os.environ.get('SOURCE_STORAGE_OWNER'),
+              'source_storage_repo': os.environ['STORAGE_REPO'],
+              'source_asset_filename': os.environ.get('SOURCE_ASSET_NAME'),
+              'source_size': os.path.getsize(os.environ['SOURCE_PATH']),
           }
-          req=urllib.request.Request(url,data=json.dumps(payload).encode(),headers={'Content-Type':'application/json'},method='POST')
-          with urllib.request.urlopen(req,timeout=15) as r: r.read()
+          req = urllib.request.Request(os.environ['CALLBACK_URL'], data=json.dumps(payload).encode(), headers={'Content-Type':'application/json'}, method='POST')
+          with urllib.request.urlopen(req, timeout=15) as r: r.read()
           PY
 
       - name: Setup Java 17
-        uses: actions/setup-java@v5
+        uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
@@ -190,30 +269,40 @@ jobs:
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
 
-      - name: Install Android platform
+      - name: Install Android SDK packages
         shell: bash
         run: |
-          yes | sdkmanager --licenses >/dev/null || true
-          sdkmanager "platform-tools" "platforms;android-35" "build-tools;35.0.0"
+          yes | sdkmanager --licenses >/dev/null 2>&1 || true
+          sdkmanager \
+            "platform-tools" \
+            "platforms;android-34" \
+            "platforms;android-35" \
+            "build-tools;34.0.0" \
+            "build-tools;35.0.0"
 
       - name: Toolchain ready callback
+        shell: bash
         run: |
-          python - <<'PY'
-          import os, urllib.request, json
-          payload={'jobId':os.environ['JOB_ID'],'secret':os.environ['CALLBACK_SECRET'],'status':'running','stage':'TOOLCHAIN_READY','progress':56}
+          python - <<'PY' || true
+          import os, json, urllib.request
+          payload={'jobId':os.environ['JOB_ID'],'secret':os.environ['CALLBACK_SECRET'],'status':'running','stage':'TOOLCHAIN_READY','progress':54,'runId':os.environ.get('GITHUB_RUN_ID')}
           req=urllib.request.Request(os.environ['CALLBACK_URL'],data=json.dumps(payload).encode(),headers={'Content-Type':'application/json'},method='POST')
           with urllib.request.urlopen(req,timeout=15) as r: r.read()
           PY
 
       - name: Extract and validate Flutter project
+        id: project
         shell: bash
         run: |
           python - <<'PY'
           import os, re, shutil, zipfile
           from pathlib import Path, PurePosixPath
-          src=Path(os.environ['SOURCE_PATH']); dst=Path(os.environ['PROJECT_PATH'])
+
+          src = Path(os.environ['SOURCE_PATH'])
+          dst = Path(os.environ['PROJECT_PATH'])
           if dst.exists(): shutil.rmtree(dst)
           dst.mkdir(parents=True)
+
           with zipfile.ZipFile(src) as z:
               names=[]
               for info in z.infolist():
@@ -223,67 +312,89 @@ jobs:
               candidates=['']
               top=sorted({n.split('/')[0] for n in names if '/' in n})
               if len(top)==1: candidates.append(top[0]+'/')
+
               root=None
               for prefix in candidates:
                   has_pub=(prefix+'pubspec.yaml').lower() in lower
                   has_android=any(n.lower().startswith((prefix+'android/').lower()) for n in names)
                   has_lib=any(n.lower().startswith((prefix+'lib/').lower()) for n in names)
                   if has_pub and has_android and has_lib:
-                      root=prefix; break
+                      root=prefix
+                      break
+
               if root is None:
                   raise SystemExit('Project Flutter tidak lengkap. Wajib pubspec.yaml + android/ + lib/.')
+
               for info in z.infolist():
                   raw=info.filename.replace('\\','/').lstrip('./')
                   if root and not raw.startswith(root): continue
                   rel=raw[len(root):] if root else raw
                   if not rel or rel.endswith('/'): continue
                   p=PurePosixPath(rel)
-                  if p.is_absolute() or '..' in p.parts: raise SystemExit('Path ZIP tidak aman')
+                  if p.is_absolute() or '..' in p.parts:
+                      raise SystemExit('Path ZIP tidak aman.')
                   out=dst.joinpath(*p.parts)
                   out.parent.mkdir(parents=True,exist_ok=True)
-                  with z.open(info) as r, out.open('wb') as w: shutil.copyfileobj(r,w,16*1024*1024)
+                  with z.open(info) as r, out.open('wb') as w:
+                      shutil.copyfileobj(r,w,16*1024*1024)
+
           pub=dst/'pubspec.yaml'
           text=pub.read_text(encoding='utf-8',errors='ignore')
           m=re.search(r'^name:\s*([A-Za-z0-9_]+)\s*$',text,re.M)
-          name=m.group(1) if m else os.environ.get('PROJECT_NAME') or 'raven_flutter_app'
-          print(f'project_name={name}')
-          with open(os.environ['GITHUB_OUTPUT'],'a',encoding='utf-8') as f: f.write(f'name={name}\n')
-          (dst/'.git').exists() and shutil.rmtree(dst/'.git')
-          for d in ['.dart_tool','build','.gradle','.idea','.vscode','coverage','node_modules']:
+          name=m.group(1) if m else os.environ.get('PROJECT_NAME_HINT') or 'raven_flutter_app'
+          with open(os.environ['GITHUB_OUTPUT'],'a',encoding='utf-8') as f:
+              f.write(f'name={name}\n')
+
+          for d in ['.git','.dart_tool','build','.gradle','.idea','.vscode','coverage','node_modules']:
               q=dst/d
-              if q.exists(): shutil.rmtree(q,ignore_errors=True)
+              if q.exists():
+                  shutil.rmtree(q,ignore_errors=True)
+
           try: src.unlink()
           except FileNotFoundError: pass
+          print(f'✅ Flutter project detected: {name}')
           PY
-        id: project
 
       - name: Project validated callback
         env:
           PROJECT_NAME_OUT: ${{ steps.project.outputs.name }}
+        shell: bash
         run: |
-          python - <<'PY'
-          import os, urllib.request, json
-          payload={'jobId':os.environ['JOB_ID'],'secret':os.environ['CALLBACK_SECRET'],'status':'running','stage':'PROJECT_VALIDATED','progress':30,'project_name':os.environ['PROJECT_NAME_OUT']}
+          python - <<'PY' || true
+          import os, json, urllib.request
+          payload={'jobId':os.environ['JOB_ID'],'secret':os.environ['CALLBACK_SECRET'],'status':'running','stage':'PROJECT_VALIDATED','progress':60,'project_name':os.environ['PROJECT_NAME_OUT'],'runId':os.environ.get('GITHUB_RUN_ID')}
           req=urllib.request.Request(os.environ['CALLBACK_URL'],data=json.dumps(payload).encode(),headers={'Content-Type':'application/json'},method='POST')
           with urllib.request.urlopen(req,timeout=15) as r: r.read()
           PY
 
       - name: Flutter pub get
         working-directory: ${{ env.PROJECT_PATH }}
-        run: flutter pub get
+        shell: bash
+        run: |
+          flutter --version
+          flutter pub get
 
       - name: Dependencies ready callback
+        shell: bash
         run: |
-          python - <<'PY'
-          import os, urllib.request, json
-          payload={'jobId':os.environ['JOB_ID'],'secret':os.environ['CALLBACK_SECRET'],'status':'running','stage':'DEPENDENCIES_READY','progress':64}
+          python - <<'PY' || true
+          import os, json, urllib.request
+          payload={'jobId':os.environ['JOB_ID'],'secret':os.environ['CALLBACK_SECRET'],'status':'running','stage':'DEPENDENCIES_READY','progress':68,'runId':os.environ.get('GITHUB_RUN_ID')}
           req=urllib.request.Request(os.environ['CALLBACK_URL'],data=json.dumps(payload).encode(),headers={'Content-Type':'application/json'},method='POST')
           with urllib.request.urlopen(req,timeout=15) as r: r.read()
           PY
 
       - name: Build Flutter APK
         working-directory: ${{ env.PROJECT_PATH }}
-        run: flutter build apk --${{ inputs.mode }} --no-pub
+        shell: bash
+        run: |
+          python - <<'PY' || true
+          import os, json, urllib.request
+          payload={'jobId':os.environ['JOB_ID'],'secret':os.environ['CALLBACK_SECRET'],'status':'running','stage':'BUILDING_APK','progress':78,'runId':os.environ.get('GITHUB_RUN_ID')}
+          req=urllib.request.Request(os.environ['CALLBACK_URL'],data=json.dumps(payload).encode(),headers={'Content-Type':'application/json'},method='POST')
+          with urllib.request.urlopen(req,timeout=15) as r: r.read()
+          PY
+          flutter build apk --${MODE} --no-pub
 
       - name: Locate APK
         id: apk
@@ -294,31 +405,24 @@ jobs:
           test -n "$APK"
           SIZE="$(stat -c '%s' "$APK")"
           test "$SIZE" -gt 0
-          test "$SIZE" -le 2000000000
+          test "$SIZE" -lt 2147483648
           echo "path=$APK" >> "$GITHUB_OUTPUT"
           echo "name=$(basename "$APK")" >> "$GITHUB_OUTPUT"
           echo "size=$SIZE" >> "$GITHUB_OUTPUT"
 
       - name: APK ready callback
         env:
-          APK_PATH_OUT: ${{ steps.apk.outputs.path }}
           APK_NAME_OUT: ${{ steps.apk.outputs.name }}
           APK_SIZE_OUT: ${{ steps.apk.outputs.size }}
+          PROJECT_NAME_OUT: ${{ steps.project.outputs.name }}
+        shell: bash
         run: |
-          python - <<'PY'
-          import os, urllib.request, json
-          payload={'jobId':os.environ['JOB_ID'],'secret':os.environ['CALLBACK_SECRET'],'status':'running','stage':'APK_READY','progress':88,'apk_size':int(os.environ['APK_SIZE_OUT']),'apk_filename':os.environ['APK_NAME_OUT'],'project_name':os.environ.get('PROJECT_NAME','raven_flutter_app')}
+          python - <<'PY' || true
+          import os, json, urllib.request
+          payload={'jobId':os.environ['JOB_ID'],'secret':os.environ['CALLBACK_SECRET'],'status':'running','stage':'APK_READY','progress':90,'apk_size':int(os.environ['APK_SIZE_OUT']),'apk_filename':os.environ['APK_NAME_OUT'],'project_name':os.environ['PROJECT_NAME_OUT'],'runId':os.environ.get('GITHUB_RUN_ID')}
           req=urllib.request.Request(os.environ['CALLBACK_URL'],data=json.dumps(payload).encode(),headers={'Content-Type':'application/json'},method='POST')
           with urllib.request.urlopen(req,timeout=15) as r: r.read()
           PY
-
-      - name: Upload APK artifact backup
-        uses: actions/upload-artifact@v4
-        with:
-          name: raven-apk-${{ inputs.job_id }}
-          path: ${{ steps.apk.outputs.path }}
-          if-no-files-found: error
-          retention-days: 7
 
       - name: Send APK directly to Telegram
         env:
@@ -327,7 +431,7 @@ jobs:
             🎉 <b>APK BUILD SELESAI!</b>
 
             📦 Project: <code>${{ steps.project.outputs.name }}</code>
-            🚀 Mode: <b>${{ inputs.mode }}</b>
+            🚀 Mode: <b>${{ env.MODE }}</b>
             ✅ Build: <b>BERHASIL</b>
 
             <i>Builder By Raven • GitHub Actions</i>
@@ -338,8 +442,8 @@ jobs:
         shell: bash
         run: |
           python - <<'PY' || true
-          import os, urllib.request, json
-          payload={'jobId':os.environ['JOB_ID'],'secret':os.environ['CALLBACK_SECRET'],'status':'failure','stage':'BUILD_FAILED','progress':90,'error':'GitHub Actions gagal pada salah satu tahap build. Buka log workflow untuk detail.'}
+          import os, json, urllib.request
+          payload={'jobId':os.environ['JOB_ID'],'secret':os.environ['CALLBACK_SECRET'],'status':'failure','stage':'BUILD_FAILED','progress':90,'error':'GitHub Actions berhenti pada tahap build atau pengiriman APK. Buka log workflow untuk detail.','runId':os.environ.get('GITHUB_RUN_ID')}
           req=urllib.request.Request(os.environ['CALLBACK_URL'],data=json.dumps(payload).encode(),headers={'Content-Type':'application/json'},method='POST')
           with urllib.request.urlopen(req,timeout=10) as r: r.read()
           PY
