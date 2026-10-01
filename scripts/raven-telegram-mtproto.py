@@ -13,7 +13,7 @@ from pathlib import Path
 from telethon import TelegramClient
 from telethon.sessions import StringSession
 
-MAX_BYTES = 2_000_000_000
+MAX_BYTES = 2_147_483_647
 
 
 def env_required(name: str) -> str:
@@ -160,6 +160,7 @@ async def send_file(callback: Callback) -> Path:
             str(file_path),
             caption=caption,
             force_document=True,
+            parse_mode="html",
             progress_callback=progress,
         )
         elapsed = int(time.time() - started)
