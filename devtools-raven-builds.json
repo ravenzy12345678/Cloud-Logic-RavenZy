@@ -88,7 +88,7 @@
     "stage": "SUBMIT_FAILED",
     "progress": 0,
     "createdAt": 1790849804301,
-    "updatedAt": 1790849807074,
+    "updatedAt": 1790849808303,
     "callbackSecretHash": "72766f7b42394b4ccce434c7c75f78403f8d20db236642857bca0d3a941adc07",
     "callbackUrl": "https://cloud-logic-raven-zy.vercel.app/api/build-callback",
     "sourceFilename": "Base-Holow-Exekution (1).zip",
@@ -103,7 +103,7 @@
     "sourceReleaseTag": "raven-build-mupdqgp9-4f9d5160",
     "targetChatId": 6793028697,
     "targetMessageId": 1923,
-    "channelMessageId": 79,
+    "channelMessageId": 80,
     "error": "Invalid request.\n\nNo more than 10 properties are allowed; 11 were supplied."
   }
 ]
