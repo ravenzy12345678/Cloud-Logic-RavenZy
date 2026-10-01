@@ -552,28 +552,24 @@ function progressBar(percent) {
   return '█'.repeat(filled) + '░'.repeat(total - filled);
 }
 
-// NOTE: Vercel's serverless bundler (@vercel/nft) only bundles files it can
-// statically trace from literal fs/path arguments. A dynamic
-// `path.join(__dirname, '..', 'assets', someVariable)` call is invisible to
-// that tracer, so the assets/*.jpg files were silently missing from the
-// deployed function and every sendPhoto() was failing and falling back to a
-// plain text message. Reading each file ONCE at module load, with the
-// filename written as a literal string, makes the dependency traceable and
-// guarantees the asset ships with the deployment. Buffers are cached in
-// memory so there is no repeated disk I/O per request either.
-function tryReadAsset(assetPath) {
-  try { return fs.readFileSync(assetPath); } catch (_) { return null; }
-}
-const ASSET_BUFFERS = {
-  'raven-response.jpg': tryReadAsset(path.join(__dirname, '..', 'assets', 'raven-response.jpg')),
-  'raven-build-success.jpg': tryReadAsset(path.join(__dirname, '..', 'assets', 'raven-build-success.jpg')),
-  'raven-goodbye.jpg': tryReadAsset(path.join(__dirname, '..', 'assets', 'raven-goodbye.jpg')),
-  'raven-welcome.jpg': tryReadAsset(path.join(__dirname, '..', 'assets', 'raven-welcome.jpg')),
-};
+// Previously these 4 photos were read from disk at request time via
+// path.join(__dirname, '..', 'assets', filename). On Vercel that folder was
+// never guaranteed to ship with the deployed function (the bundler cannot
+// always tell a dynamic fs path needs to be included), so every sendPhoto()
+// silently failed and the bot fell back to plain text — exactly what you
+// kept seeing. assets-embedded.js now bundles the same 4 original files
+// (nothing added, nothing swapped) as base64 directly inside the function's
+// own JS code, which always ships with the deployment no matter what.
+const ASSET_BUFFERS = require('./assets-embedded');
 
 function getAssetBuffer(filename) {
   return ASSET_BUFFERS[filename] || null;
 }
+
+// One-line startup proof in the Vercel function logs that the channel photos
+// are actually present in this deployment (check logs for "[ASSETS]" if a
+// photo ever goes missing again).
+console.log('[ASSETS] loaded:', Object.entries(ASSET_BUFFERS).map(([name, buf]) => `${name}=${buf ? buf.length + 'b' : 'MISSING'}`).join(', '));
 
 // Kept for any legacy caller that still wants a filesystem path instead of a
 // buffer; no longer relied upon for anything sent to Telegram.
