@@ -552,6 +552,31 @@ function progressBar(percent) {
   return '█'.repeat(filled) + '░'.repeat(total - filled);
 }
 
+// NOTE: Vercel's serverless bundler (@vercel/nft) only bundles files it can
+// statically trace from literal fs/path arguments. A dynamic
+// `path.join(__dirname, '..', 'assets', someVariable)` call is invisible to
+// that tracer, so the assets/*.jpg files were silently missing from the
+// deployed function and every sendPhoto() was failing and falling back to a
+// plain text message. Reading each file ONCE at module load, with the
+// filename written as a literal string, makes the dependency traceable and
+// guarantees the asset ships with the deployment. Buffers are cached in
+// memory so there is no repeated disk I/O per request either.
+function tryReadAsset(assetPath) {
+  try { return fs.readFileSync(assetPath); } catch (_) { return null; }
+}
+const ASSET_BUFFERS = {
+  'raven-response.jpg': tryReadAsset(path.join(__dirname, '..', 'assets', 'raven-response.jpg')),
+  'raven-build-success.jpg': tryReadAsset(path.join(__dirname, '..', 'assets', 'raven-build-success.jpg')),
+  'raven-goodbye.jpg': tryReadAsset(path.join(__dirname, '..', 'assets', 'raven-goodbye.jpg')),
+  'raven-welcome.jpg': tryReadAsset(path.join(__dirname, '..', 'assets', 'raven-welcome.jpg')),
+};
+
+function getAssetBuffer(filename) {
+  return ASSET_BUFFERS[filename] || null;
+}
+
+// Kept for any legacy caller that still wants a filesystem path instead of a
+// buffer; no longer relied upon for anything sent to Telegram.
 function resolveLocalAsset(filename) {
   const candidates = [
     path.join(__dirname, '..', 'assets', filename),
@@ -577,8 +602,8 @@ function buildStageLabel(stage) {
     WORKER_READY: 'Worker siap menjalankan proses',
     TELEGRAM_CONNECTING: 'Menghubungkan ke Telegram',
     TELEGRAM_SESSION_READY: 'Koneksi Telegram siap',
-    SOURCE_DOWNLOAD_START: 'Memeriksa source ZIP dari Telegram',
-    SOURCE_DOWNLOADED: 'Source ZIP berhasil periksa',
+    SOURCE_DOWNLOAD_START: 'Mengambil source ZIP dari Telegram',
+    SOURCE_DOWNLOADED: 'Source ZIP berhasil diterima',
     SOURCE_VALIDATED: 'Validasi struktur project selesai',
     SOURCE_BACKUP_READY: 'Source tersimpan dengan aman',
     TOOLCHAIN_READY: 'Flutter, Java, dan Android SDK siap',
@@ -602,40 +627,55 @@ function displayValue(value, max = 42) {
   return raw.length > max ? `${raw.slice(0, Math.max(1, max - 1))}…` : raw;
 }
 
+function formatDurationShort(totalSeconds) {
+  const s = Math.max(0, Math.round(Number(totalSeconds) || 0));
+  if (s < 60) return `${s}d`;
+  const m = Math.floor(s / 60);
+  const rem = s % 60;
+  if (m < 60) return rem ? `${m}m ${rem}d` : `${m}m`;
+  const h = Math.floor(m / 60);
+  const remM = m % 60;
+  return remM ? `${h}j ${remM}m` : `${h}j`;
+}
+
 function buildNotificationCaption(record, { title, status, stage, progress, detail, finishedAt } = {}) {
   const safeStatus = String(status || record.status || 'running').toLowerCase();
   const percent = Math.max(0, Math.min(100, Number(progress ?? record.progress ?? 0)));
-  const statusLabel = safeStatus === 'success' ? 'SELESAI' :
+  const statusLabel = safeStatus === 'success' ? 'SUKSES' :
     (safeStatus === 'failure' || safeStatus === 'failed') ? 'GAGAL' :
-    safeStatus === 'cancelled' ? 'DIBATALKAN' : 'BERJALAN';
-  const statusIcon = safeStatus === 'success' ? '✅' :
+    safeStatus === 'cancelled' ? 'DIBATALKAN' : buildStageLabel(stage || record.stage).toUpperCase();
+  const statusIcon = safeStatus === 'success' ? '🏆' :
     (safeStatus === 'failure' || safeStatus === 'failed') ? '❌' :
     safeStatus === 'cancelled' ? '⏹️' : '⚡';
+  // "Project" and "Source" used to show the same filename twice (just slugified
+  // differently) — collapsed into one line that shows the real source filename.
+  const projectDisplay = record.sourceFilename || record.projectName || record.sourceLabel || '-';
+  const serverLabel = record.deliveryMethod === 'mtproto' ? 'GitHub Actions Worker' : (record.serverLabel || 'Server');
+  const elapsedSeconds = record.elapsedSeconds != null && record.elapsedSeconds !== ''
+    ? Math.max(0, Math.round(Number(record.elapsedSeconds)))
+    : (record.createdAt ? Math.round((Date.now() - record.createdAt) / 1000) : null);
+
   const lines = [
     '╭━━━━━━━━━━━━━━━━━━━━╮',
     `┃ 💎 <b>RAVEN BUILD CENTER</b>`,
-    `┃ ${title || 'LIVE BUILD MONITORING'}`,
+    `┃ ${title || 'LIVE BUILD MONITOR'}`,
     '╰━━━━━━━━━━━━━━━━━━━━╯',
     '',
-    '📋 <b>INFORMASI BUILD</b>',
-    `👤 <b>User</b> · ${escapeHtml(displayValue(record.userName || 'Unknown', 36))}`,
-    `🆔 <b>User ID</b> · <code>${escapeHtml(record.userId)}</code>`,
-    `📦 <b>Project</b> · <code>${escapeHtml(displayValue(record.projectName || '-', 42))}</code>`,
-    `🚀 <b>Mode</b> · <b>${escapeHtml(String(record.mode || '-').toUpperCase())}</b>`,
-    `📥 <b>Source</b> · <code>${escapeHtml(displayValue(record.sourceFilename || record.sourceLabel || '-', 42))}</code>`,
-    record.sourceSize ? `📏 <b>Source Size</b> · <b>${escapeHtml(formatBytes(record.sourceSize))}</b>` : null,
-    record.apkSize ? `📤 <b>APK Size</b> · <b>${escapeHtml(formatBytes(record.apkSize))}</b>` : null,
-    `🔑 <b>Build ID</b> · <code>${escapeHtml(record.id)}</code>`,
+    `👤 <b>Developer</b> : ${escapeHtml(displayValue(record.userName || 'Unknown', 36))}`,
+    `🆔 <b>User ID</b>   : <code>${escapeHtml(record.userId)}</code>`,
+    `📦 <b>Project</b>   : <code>${escapeHtml(displayValue(projectDisplay, 42))}</code>`,
+    `🔧 <b>Mode</b>      : ${escapeHtml(String(record.mode || '-').toUpperCase())}`,
+    `🖥️ <b>Server</b>    : ${escapeHtml(serverLabel)}`,
+    record.sourceSize ? `📏 <b>Ukuran</b>    : ${escapeHtml(formatBytes(record.sourceSize))}` : null,
+    record.apkSize ? `📤 <b>APK</b>       : ${escapeHtml(formatBytes(record.apkSize))}` : null,
     '',
-    '📊 <b>MONITORING</b>',
-    `${statusIcon} <b>Status</b> · ${statusLabel}`,
-    `🧩 <b>Stage</b> · ${escapeHtml(buildStageLabel(stage || record.stage))}`,
-    `📈 <b>Progress</b> · ${buildProgressLine(percent)}`,
-    detail ? `📝 <b>Activity</b> · ${escapeHtml(String(detail).slice(0, 220))}` : null,
-    (record.elapsedSeconds != null && record.elapsedSeconds !== '')
-      ? `⏱️ <b>Durasi</b> · <b>${Math.max(0, Math.round(Number(record.elapsedSeconds)))} detik</b>` : null,
-    finishedAt ? `📅 <b>Selesai</b> · <b>${escapeHtml(finishedAt)}</b>` : null,
+    `${statusIcon} <b>STATUS</b> : ${statusLabel} (${percent}%)`,
+    `${buildProgressLine(percent)}`,
+    detail ? `💬 <b>DETAIL</b>  : ${escapeHtml(String(detail).slice(0, 220))}` : null,
+    elapsedSeconds != null ? `⏱️ <b>WAKTU</b>   : ${escapeHtml(formatDurationShort(elapsedSeconds))}` : null,
+    finishedAt ? `📅 <b>Selesai</b> : <b>${escapeHtml(finishedAt)}</b>` : null,
     '',
+    `🔑 <code>${escapeHtml(record.id)}</code>`,
     '━━━━━━━━━━━━━━━━━━━━━━━━',
     '<i>Builder By Raven • 2026</i>',
   ].filter(Boolean);
@@ -707,8 +747,7 @@ async function sendMainMenu(ctx) {
     `╰━──────────────────────━❏`,
     `( 🍃 ) 𝗣𝗶𝗹𝗶𝗵 𝗠𝗲𝗻𝘂 𝗗𝗶 𝗕𝗮𝘄𝗮𝗵...ᝄ`,
   ].join('\n');
-  const mainMenuAsset = resolveLocalAsset('raven-build-success.jpg');
-  const photoBuffer = mainMenuAsset ? fs.readFileSync(mainMenuAsset) : null;
+  const photoBuffer = getAssetBuffer('raven-build-success.jpg');
   const keyboard = mainMenuMarkup(ctx);
   if (photoBuffer) {
     try {
@@ -3157,12 +3196,12 @@ async function notifyChannelBuildStart(record) {
       detail: 'Source diterima. Menunggu worker GitHub Actions memulai pipeline.',
     });
     const photoName = 'raven-response.jpg';
-    const photoPath = resolveLocalAsset(photoName);
+    const photoBuffer = getAssetBuffer(photoName);
     let sent = null;
-    if (photoPath) {
+    if (photoBuffer) {
       try {
-        sent = await bot.telegram.sendPhoto(NOTIFICATION_CHANNEL, { source: fs.readFileSync(photoPath) }, { caption, parse_mode: 'HTML' });
-      } catch (_) {}
+        sent = await bot.telegram.sendPhoto(NOTIFICATION_CHANNEL, { source: photoBuffer }, { caption, parse_mode: 'HTML' });
+      } catch (error) { console.error('[CHANNEL BUILD START] sendPhoto failed', safeError(error)); }
     }
     if (!sent) sent = await bot.telegram.sendMessage(NOTIFICATION_CHANNEL, caption, { parse_mode: 'HTML', disable_web_page_preview: true });
     if (sent?.message_id) {
@@ -3227,36 +3266,36 @@ async function notifyChannelBuildStage(record, stage, status, runId, extra = '')
     });
 
     const photoName = s === 'success' ? 'raven-build-success.jpg' : (s === 'cancelled' ? 'raven-goodbye.jpg' : 'raven-response.jpg');
-    const photoPath = resolveLocalAsset(photoName) || resolveLocalAsset('raven-response.jpg');
+    const photoBuffer = getAssetBuffer(photoName) || getAssetBuffer('raven-response.jpg');
     const photoChanged = photoName !== record.channelPhotoName;
     let edited = false;
 
     // Final stages must swap the banner photo (e.g. in-progress → success/failed/cancelled),
     // a plain caption edit never changes the attached photo on Telegram.
-    if (record.channelMessageId && photoChanged && photoPath) {
+    if (record.channelMessageId && photoChanged && photoBuffer) {
       try {
         await bot.telegram.editMessageMedia(NOTIFICATION_CHANNEL, record.channelMessageId, undefined, {
           type: 'photo',
-          media: { source: fs.readFileSync(photoPath) },
+          media: { source: photoBuffer },
           caption,
           parse_mode: 'HTML',
         });
         edited = true;
         record.channelPhotoName = photoName;
-      } catch (_) {}
+      } catch (error) { console.error('[CHANNEL BUILD STAGE] editMessageMedia failed', safeError(error)); }
     }
     if (!edited && record.channelMessageId) {
       try {
         await bot.telegram.editMessageCaption(NOTIFICATION_CHANNEL, record.channelMessageId, undefined, caption, { parse_mode: 'HTML' });
         edited = true;
-      } catch (_) {}
+      } catch (error) { console.error('[CHANNEL BUILD STAGE] editMessageCaption failed', safeError(error)); }
     }
     if (!edited) {
       let sent = null;
-      if (photoPath) {
+      if (photoBuffer) {
         try {
-          sent = await bot.telegram.sendPhoto(NOTIFICATION_CHANNEL, { source: fs.readFileSync(photoPath) }, { caption, parse_mode: 'HTML' });
-        } catch (_) {}
+          sent = await bot.telegram.sendPhoto(NOTIFICATION_CHANNEL, { source: photoBuffer }, { caption, parse_mode: 'HTML' });
+        } catch (error) { console.error('[CHANNEL BUILD STAGE] sendPhoto failed', safeError(error)); }
       }
       if (!sent) sent = await bot.telegram.sendMessage(NOTIFICATION_CHANNEL, caption, { parse_mode: 'HTML', disable_web_page_preview: true });
       if (sent?.message_id) {
@@ -3893,16 +3932,18 @@ bot.action(/^flutter_mode:(debug|release)$/, async (ctx) => {
   sessions.set(id, session);
   await savePendingFlutterSession(id, mode);
   await sendPrompt(ctx, `Build Flutter APK · ${mode.toUpperCase()}`, [
-    '<b>Siapkan Base Project Flutter</b>',
+    '🔨 <b>SIAP BUILD FLUTTER APK!</b>',
+    '━━━━━━━━━━━━━━━━━━━━',
     '',
-    '📦 Kirim file <b>.zip</b> project Flutter langsung di chat.',
+    `📦 <b>Mode</b>    : ${mode === 'release' ? '🚀 RELEASE' : '🧪 DEBUG'}`,
+    '🖥️ <b>Server</b>  : GitHub Actions Worker',
+    '✅ <b>Format</b>  : <code>.zip</code>',
+    '✅ <b>Wajib</b>   : <code>pubspec.yaml</code>, <code>android/</code>, <code>lib/</code>',
+    '✅ <b>Maks</b>    : 2 GB',
     '',
-    '✅ Source maksimal <b>2 GB</b>',
-    '✅ Struktur minimal: <code>pubspec.yaml</code>, <code>android/</code>, <code>lib/</code>',
-    '✅ Folder <code>assets/</code> dan konfigurasi project tetap digunakan sebagaimana source asli',
-    '✅ Flutter SDK, Android SDK, dan cache build tidak perlu dimasukkan',
+    '📦 Kirim file <b>.zip</b> project Flutter kamu sekarang!',
     '',
-    '<i>Source akan diproses apa adanya tanpa mengubah konfigurasi project.</i>',
+    '<i>Folder assets/ dan konfigurasi project tetap dipakai apa adanya — tidak ada yang diubah.</i>',
   ].join('\n'), session);
 });
 
@@ -4898,14 +4939,14 @@ bot.on('chat_member', async (ctx) => {
     '<i>Builder By Raven • 2026</i>',
   ].join('\n');
 
-  const photoPath = resolveLocalAsset(isJoin ? 'raven-welcome.jpg' : 'raven-goodbye.jpg');
+  const photoBuffer = getAssetBuffer(isJoin ? 'raven-welcome.jpg' : 'raven-goodbye.jpg');
 
   try {
-    if (photoPath) {
+    if (photoBuffer) {
       try {
-        await bot.telegram.sendPhoto(NOTIFICATION_CHANNEL, { source: fs.readFileSync(photoPath) }, { caption, parse_mode: 'HTML' });
+        await bot.telegram.sendPhoto(NOTIFICATION_CHANNEL, { source: photoBuffer }, { caption, parse_mode: 'HTML' });
         return;
-      } catch (_) {}
+      } catch (error) { console.error('[CHANNEL MEMBER LOG] sendPhoto failed', safeError(error)); }
     }
     await bot.telegram.sendMessage(NOTIFICATION_CHANNEL, caption, { parse_mode: 'HTML', disable_web_page_preview: true });
   } catch (error) {
