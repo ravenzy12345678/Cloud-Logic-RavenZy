@@ -7,6 +7,22 @@ const path = require('path');
 const { buildId, workflowYml, androidWorkflowYml, createRepo: createBuildRepo, uploadFiles: uploadBuildFiles, dispatchWorkflow, dispatchRepositoryEvent, createRelease, uploadReleaseAsset, downloadReleaseAsset, getArtifact, cancelRun, deleteRepo: deleteBuildRepo } = require('./build-engine');
 const { extractZip: extractRenameZip, scanRenameFiles, transformZip: transformRenameZip } = require('./rename');
 const legacyTools = require('./legacy-tools');
+const { LocalBuildManager, buildJobId: localBuildJobId, formatBytes: localBuildFormatBytes } = require('./local-build-engine');
+
+const fsp = fs.promises;
+const LOCAL_BUILD_ROOT = path.resolve(process.env.BUILD_ROOT || path.join(process.cwd(), 'data', 'builds'));
+const LOCAL_PENDING_FILE = path.join(LOCAL_BUILD_ROOT, 'pending-sessions.json');
+const LOCAL_BUILD_RECORDS_FILE = path.join(LOCAL_BUILD_ROOT, 'records.json');
+const LOCAL_BUILD_TEMPLATE = path.join(__dirname, '..', 'server-build', 'android-template');
+const SERVER_NAME = String(process.env.BUILD_SERVER_NAME || process.env.SERVER_NAME || 'Server #1').trim() || 'Server #1';
+const localBuildManager = new LocalBuildManager({
+  rootDir: LOCAL_BUILD_ROOT,
+  templateDir: LOCAL_BUILD_TEMPLATE,
+  concurrency: Math.max(1, Number(process.env.BUILD_CONCURRENCY || 1)),
+});
+const buildRecordWriteQueue = { chain: Promise.resolve() };
+const buildRenderLocks = new Map();
+void localBuildManager.init().catch((error) => console.error('[BUILD SERVER INIT]', error));
 
 const ENV = {
   BOT_TOKEN: process.env.TOKEN_BOT || process.env.BOT_TOKEN,
@@ -24,10 +40,10 @@ const ENV = {
 };
 
 function requireConfig() {
-  const required = ['BOT_TOKEN', 'OWNER_ID', 'GH_TOKEN', 'GH_OWNER', 'GH_REPO', 'VERCEL_TOKEN'];
+  const required = ['BOT_TOKEN', 'OWNER_ID'];
   const missing = required.filter((k) => !ENV[k]);
   if (missing.length) console.error(`[CONFIG] Missing: ${missing.join(', ')}`);
-  if (ENV.TELEGRAM_API_ROOT) console.log(`[CONFIG] Custom Telegram API root enabled: ${ENV.TELEGRAM_API_ROOT}`);
+  if (ENV.TELEGRAM_API_ROOT) console.log(`[CONFIG] Custom Telegram API root enabled for large-file transfer.`);
 }
 requireConfig();
 
@@ -466,7 +482,7 @@ function ownerPanelMarkup() {
     [Markup.button.callback('📦 List Build', 'owner_builds'), Markup.button.callback('📥 Get ZIP Build', 'owner_build_picker')],
     [Markup.button.callback('⏹️ Kill Build', 'owner_kill_builds'), Markup.button.callback('🛠️ Maintenance', 'owner_maintenance')],
     [Markup.button.callback('👥 Users', 'users'), Markup.button.callback('🚫 Ban User', 'ban_user')],
-    [Markup.button.callback('📋 List Web', 'list_web'), Markup.button.callback('✅ Unban User', 'unban_user')],
+    [Markup.button.callback('✅ Unban User', 'unban_user')],
     [Markup.button.callback('📢 Broadcast', 'broadcast')],
     [Markup.button.callback('🏠 Menu Utama', 'home')],
   ]);
@@ -593,27 +609,26 @@ function buildProgressLine(percent) {
 
 function buildStageLabel(stage) {
   const labels = {
-    WORKFLOW_DISPATCHED: 'Menunggu worker build',
-    WORKER_STARTING: 'Worker build sedang dimulai',
-    WORKER_READY: 'Worker siap menjalankan proses',
-    TELEGRAM_CONNECTING: 'Menghubungkan ke Telegram',
-    TELEGRAM_SESSION_READY: 'Koneksi Telegram siap',
-    SOURCE_DOWNLOAD_START: 'Mengambil source ZIP dari Telegram',
-    SOURCE_DOWNLOADED: 'Source ZIP berhasil diterima',
-    SOURCE_VALIDATED: 'Validasi struktur project selesai',
-    SOURCE_BACKUP_READY: 'Source tersimpan dengan aman',
-    TOOLCHAIN_READY: 'Flutter, Java, dan Android SDK siap',
-    PROJECT_VALIDATED: 'Project Flutter terdeteksi',
+    QUEUED: 'Antrian Server',
+    SERVER_READY: 'Server siap menjalankan build',
+    SOURCE_DOWNLOAD_START: 'Mengunduh source ke Server',
+    SOURCE_DOWNLOAD_PROGRESS: 'Source sedang diunduh',
+    SOURCE_VALIDATED: 'Validasi ZIP selesai',
+    PROJECT_EXTRACTED: 'Project berhasil diekstrak',
+    PROJECT_VALIDATED: 'Struktur project tervalidasi',
+    TOOLCHAIN_READY: 'Toolchain Server siap',
+    DEPENDENCIES_START: 'Menyiapkan dependency project',
     DEPENDENCIES_READY: 'Dependency project siap',
     BUILDING_APK: 'Kompilasi APK sedang berjalan',
     APK_READY: 'APK berhasil dibuat',
     SENDING_APK: 'Mengirim APK ke chat',
-    APK_SENT: 'APK sudah diterima chat tujuan',
+    APK_SENT: 'APK sudah dikirim',
     COMPLETE: 'Build selesai',
-    BUILD_FAILED: 'Proses build berhenti karena error',
-    TELEGRAM_TRANSFER_FAILED: 'Transfer file Telegram gagal',
-    KILLED_BY_OWNER: 'Build dihentikan oleh owner',
-    SUBMIT_FAILED: 'Build gagal dijadwalkan',
+    BUILD_FAILED: 'Build gagal',
+    CANCELLED: 'Build dibatalkan',
+    KILLED_BY_OWNER: 'Build dihentikan owner',
+    DELIVERY_FAILED: 'APK selesai, tetapi pengiriman gagal',
+    SERVER_RESTARTED: 'Build terhenti karena Server restart',
   };
   return labels[String(stage || '').toUpperCase()] || String(stage || 'Menyiapkan build');
 }
@@ -637,45 +652,45 @@ function formatDurationShort(totalSeconds) {
 function buildNotificationCaption(record, { title, status, stage, progress, detail, finishedAt } = {}) {
   const safeStatus = String(status || record.status || 'running').toLowerCase();
   const percent = Math.max(0, Math.min(100, Number(progress ?? record.progress ?? 0)));
-  const statusLabel = safeStatus === 'success' ? 'SUKSES' :
-    (safeStatus === 'failure' || safeStatus === 'failed') ? 'GAGAL' :
-    safeStatus === 'cancelled' ? 'DIBATALKAN' : buildStageLabel(stage || record.stage).toUpperCase();
-  const statusIcon = safeStatus === 'success' ? '🏆' :
+  const normalizedStage = String(stage || record.stage || '').toUpperCase();
+  const statusLabel = safeStatus === 'success' ? 'SELESAI' :
+    (safeStatus === 'failure' || safeStatus === 'failed') ? 'ERROR' :
+    safeStatus === 'cancelled' ? 'DIBATALKAN' :
+    normalizedStage === 'APK_READY' ? 'APK SIAP' : buildStageLabel(normalizedStage).toUpperCase();
+  const statusIcon = safeStatus === 'success' ? '✅' :
     (safeStatus === 'failure' || safeStatus === 'failed') ? '❌' :
-    safeStatus === 'cancelled' ? '⏹️' : '⚡';
-  // "Project" and "Source" used to show the same filename twice (just slugified
-  // differently) — collapsed into one line that shows the real source filename.
-  const projectDisplay = record.sourceFilename || record.projectName || record.sourceLabel || '-';
-  const serverLabel = record.deliveryMethod === 'mtproto' ? 'GitHub Actions Worker' : (record.serverLabel || 'Server');
+    safeStatus === 'cancelled' ? '⏹️' : '📡';
   const elapsedSeconds = record.elapsedSeconds != null && record.elapsedSeconds !== ''
     ? Math.max(0, Math.round(Number(record.elapsedSeconds)))
     : (record.createdAt ? Math.round((Date.now() - record.createdAt) / 1000) : null);
-
+  const projectDisplay = record.sourceFilename || record.projectName || '-';
+  const serverLabel = record.serverLabel || SERVER_NAME;
+  const priority = isOwnerId(record.userId) ? 'OWNER' : 'USER (Lv.3)';
   const lines = [
-    '╭━━━━━━━━━━━━━━━━━━━━╮',
-    `┃ 💎 <b>RAVEN BUILD CENTER</b>`,
-    `┃ ${title || 'LIVE BUILD MONITOR'}`,
-    '╰━━━━━━━━━━━━━━━━━━━━╯',
-    '',
-    `👤 <b>Developer</b> : ${escapeHtml(displayValue(record.userName || 'Unknown', 36))}`,
+    `⚡ <b>${escapeHtml(title || (safeStatus === 'success' ? 'APK BUILD SELESAI' : safeStatus === 'failed' ? 'BUILD ERROR' : 'LIVE BUILD MONITOR'))}</b>`,
+    '━━━━━━━━━━━━━━━━━━━━',
+    `👤 <b>Developer</b> : ${escapeHtml(displayValue(record.userName || 'Unknown', 34))}`,
     `🆔 <b>User ID</b>   : <code>${escapeHtml(record.userId)}</code>`,
-    `📦 <b>Project</b>   : <code>${escapeHtml(displayValue(projectDisplay, 42))}</code>`,
-    `🔧 <b>Mode</b>      : ${escapeHtml(String(record.mode || '-').toUpperCase())}`,
+    `🎯 <b>Priority</b>  : ${escapeHtml(priority)}`,
+    `📦 <b>Project</b>   : <code>${escapeHtml(displayValue(projectDisplay, 38))}</code>`,
+    `🔧 <b>Mode</b>      : ${escapeHtml(String(record.mode || '-').toUpperCase())} Build`,
     `🖥️ <b>Server</b>    : ${escapeHtml(serverLabel)}`,
-    record.sourceSize ? `📏 <b>Ukuran</b>    : ${escapeHtml(formatBytes(record.sourceSize))}` : null,
-    record.apkSize ? `📤 <b>APK</b>       : ${escapeHtml(formatBytes(record.apkSize))}` : null,
+    record.sourceSize ? `📏 <b>Source</b>    : ${escapeHtml(formatBytes(record.sourceSize))}` : null,
     '',
-    `${statusIcon} <b>STATUS</b> : ${statusLabel} (${percent}%)`,
+    `${statusIcon} <b>STATUS</b> : ${escapeHtml(statusLabel)} (${percent}%)`,
     `${buildProgressLine(percent)}`,
     detail ? `💬 <b>DETAIL</b>  : ${escapeHtml(String(detail).slice(0, 220))}` : null,
     elapsedSeconds != null ? `⏱️ <b>WAKTU</b>   : ${escapeHtml(formatDurationShort(elapsedSeconds))}` : null,
-    finishedAt ? `📅 <b>Selesai</b> : <b>${escapeHtml(finishedAt)}</b>` : null,
+    record.apkSize ? `📦 <b>APK</b>       : ${escapeHtml(formatBytes(record.apkSize))}` : null,
+    finishedAt ? `🏁 <b>SELESAI</b>  : ${escapeHtml(finishedAt)}` : null,
     '',
-    `🔑 <code>${escapeHtml(record.id)}</code>`,
-    '━━━━━━━━━━━━━━━━━━━━━━━━',
-    '<i>Builder By Raven • 2026</i>',
+    '<i>BUILD APK NYATA • SERVER BUILD CENTER</i>',
   ].filter(Boolean);
   return lines.join('\n');
+}
+
+function isOwnerId(id) {
+  return Number(id) === OWNER_ID;
 }
 
 function formatElapsed(ms) {
@@ -819,64 +834,66 @@ async function writeJsonRepoFile(filename, value, message) {
   return false;
 }
 
+async function readLocalJson(file, fallback) {
+  try {
+    return JSON.parse(await fsp.readFile(file, 'utf8'));
+  } catch (_) {
+    return fallback;
+  }
+}
+
+async function writeLocalJsonAtomic(file, value) {
+  await fsp.mkdir(path.dirname(file), { recursive: true });
+  const tmp = `${file}.${process.pid}.${Date.now()}.tmp`;
+  await fsp.writeFile(tmp, JSON.stringify(value, null, 2), 'utf8');
+  await fsp.rename(tmp, file);
+}
+
 async function loadPendingFlutterSession(userId) {
   const id = Number(userId);
   if (!Number.isInteger(id) || id <= 0) return null;
-  const result = await readJsonRepoFile(PENDING_SESSION_FILE, {});
-  const all = result.value && typeof result.value === 'object' && !Array.isArray(result.value) ? result.value : {};
-  const item = all[String(id)];
+  const all = await readLocalJson(LOCAL_PENDING_FILE, {});
+  const item = all && typeof all === 'object' && !Array.isArray(all) ? all[String(id)] : null;
   if (!item || Date.now() - Number(item.createdAt || 0) > PENDING_SESSION_TTL) return null;
   if (!['debug', 'release'].includes(String(item.mode))) return null;
-  return { type: 'flutter_build', step: 'file', mode: String(item.mode), platform: 'github', transport: 'telegram-mtproto', createdAt: Number(item.createdAt) || Date.now(), persisted: true };
+  return {
+    type: 'flutter_build', step: 'file', mode: String(item.mode), platform: 'server',
+    transport: 'server-download', createdAt: Number(item.createdAt) || Date.now(), persisted: true,
+  };
 }
 
 async function savePendingFlutterSession(userId, mode) {
   const id = Number(userId);
   if (!Number.isInteger(id) || id <= 0 || !['debug', 'release'].includes(String(mode))) return false;
-  for (let attempt = 0; attempt < 2; attempt += 1) {
-    try {
-      const file = await getBotRepoFile(PENDING_SESSION_FILE);
-      let all = {};
-      if (file?.content) {
-        try { all = JSON.parse(Buffer.from(file.content, 'base64').toString('utf8')); } catch (_) { all = {}; }
-      }
-      if (!all || typeof all !== 'object' || Array.isArray(all)) all = {};
-      const cutoff = Date.now() - PENDING_SESSION_TTL;
-      for (const [key, value] of Object.entries(all)) {
-        if (!value || Number(value.createdAt || 0) < cutoff) delete all[key];
-      }
-      all[String(id)] = { mode: String(mode), createdAt: Date.now() };
-      await writeBotRepoFile(PENDING_SESSION_FILE, JSON.stringify(all, null, 2), 'chore: update Raven pending Flutter build session', file?.sha);
-      return true;
-    } catch (error) {
-      if (attempt === 0 && error.response?.status === 409) continue;
-      console.error('[PENDING SESSION SAVE]', safeError(error));
-      return false;
-    }
+  const all = await readLocalJson(LOCAL_PENDING_FILE, {});
+  const next = all && typeof all === 'object' && !Array.isArray(all) ? all : {};
+  const cutoff = Date.now() - PENDING_SESSION_TTL;
+  for (const [key, value] of Object.entries(next)) {
+    if (!value || Number(value.createdAt || 0) < cutoff) delete next[key];
   }
-  return false;
+  next[String(id)] = { mode: String(mode), createdAt: Date.now() };
+  try {
+    await writeLocalJsonAtomic(LOCAL_PENDING_FILE, next);
+    return true;
+  } catch (error) {
+    console.error('[PENDING SESSION SAVE]', safeError(error));
+    return false;
+  }
 }
 
 async function clearPendingFlutterSession(userId) {
   const id = Number(userId);
   if (!Number.isInteger(id) || id <= 0) return false;
-  for (let attempt = 0; attempt < 2; attempt += 1) {
-    try {
-      const file = await getBotRepoFile(PENDING_SESSION_FILE);
-      if (!file?.content) return true;
-      let all;
-      try { all = JSON.parse(Buffer.from(file.content, 'base64').toString('utf8')); } catch (_) { all = {}; }
-      if (!all || typeof all !== 'object' || Array.isArray(all)) all = {};
-      delete all[String(id)];
-      await writeBotRepoFile(PENDING_SESSION_FILE, JSON.stringify(all, null, 2), 'chore: clear Raven pending Flutter build session', file.sha);
-      return true;
-    } catch (error) {
-      if (attempt === 0 && error.response?.status === 409) continue;
-      console.error('[PENDING SESSION CLEAR]', safeError(error));
-      return false;
-    }
+  const all = await readLocalJson(LOCAL_PENDING_FILE, {});
+  if (!all || typeof all !== 'object' || Array.isArray(all)) return true;
+  delete all[String(id)];
+  try {
+    await writeLocalJsonAtomic(LOCAL_PENDING_FILE, all);
+    return true;
+  } catch (error) {
+    console.error('[PENDING SESSION CLEAR]', safeError(error));
+    return false;
   }
-  return false;
 }
 
 async function loadUsers() {
@@ -885,12 +902,12 @@ async function loadUsers() {
     const arr = Array.isArray(result.value) ? result.value : [];
     for (const value of arr) {
       const id = Number(value?.id ?? value);
-      if (Number.isInteger(id) && id > 0) {
+      if (Number.isInteger(id) && id > 0 && id !== OWNER_ID) {
         userProfiles.set(id, {
           id,
           name: value?.name || `User ${id}`,
           username: value?.username || null,
-          memberNo: id === OWNER_ID ? null : (Number.isInteger(Number(value?.memberNo)) ? Number(value.memberNo) : null),
+          memberNo: Number.isInteger(Number(value?.memberNo)) ? Number(value.memberNo) : null,
           updatedAt: value?.updatedAt || Date.now(),
         });
       }
@@ -899,7 +916,10 @@ async function loadUsers() {
 }
 
 async function saveUsers() {
-  const users = [...userProfiles.values()].sort((a, b) => a.id - b.id).slice(-5000);
+  const users = [...userProfiles.values()]
+    .filter((u) => Number(u.id) !== OWNER_ID)
+    .sort((a, b) => a.id - b.id)
+    .slice(-5000);
   return writeJsonRepoFile('devtools-raven-users.json', users, 'chore: update Builder By Raven users');
 }
 
@@ -1809,26 +1829,20 @@ async function startFlutterBuildFromFiles(ctx, session, files, sourceMeta = {}) 
 
   session.files = buildFiles;
   session.name = repoSafeName(sourceMeta.sourceName || session.name || 'raven-flutter-build');
-  session.sourceType = sourceMeta.sourceType || session.sourceType || 'telegram';
-  session.sourceLabel = sourceMeta.label || session.sourceLabel || 'Telegram ZIP';
+  session.sourceType = sourceMeta.sourceType || session.sourceType || 'server-source';
+  session.sourceLabel = sourceMeta.label || session.sourceLabel || 'Source Server';
   session.cleanedFiles = sanitized.removedCount;
   session.cleanedBytes = sanitized.removedBytes;
   session.step = 'deploying';
   sessions.set(id, session);
 
-  const status = await sendPanel(ctx, panel({
-    heading: '💎 <b>RAVEN FLUTTER BUILD</b>',
-    box: infoBox([
-      ['⚙️ Mode', session.mode.toUpperCase()],
-      ['📦 Project', `<code>${escapeHtml(session.name)}</code>`],
-      ['📥 Source', escapeHtml(session.sourceLabel)],
-      ['🧹 Cleanup', `<b>${sanitized.removedCount}</b> file cache/generated dibuang`],
-      ['🛰️ Engine', 'Raven Build Server'],
-      ['📝 Activity', 'Source siap dikirim ke build server…'],
-    ]),
-    footer: 'Build nyata • APK akan dikirim otomatis setelah selesai.',
-  }));
-  await runGithubActionsBuild(ctx, session, status);
+  const zipBuffer = await zipBuildFiles(buildFiles);
+  await startLocalBuild(ctx, session, {
+    kind: 'file',
+    buffer: zipBuffer,
+    fileName: `${repoSafeName(session.name)}.zip`,
+    declaredSize: zipBuffer.length,
+  });
 }
 
 async function tryGetVercelProject(idOrName) {
@@ -2320,61 +2334,360 @@ async function zipBuildFiles(files) {
   return zip.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE', compressionOptions: { level: 6 } });
 }
 
+async function withBuildRecordLock(task) {
+  const run = buildRecordWriteQueue.chain.then(task, task);
+  buildRecordWriteQueue.chain = run.catch(() => {});
+  return run;
+}
+
 async function loadBuildRecords() {
-  const result = await readJsonRepoFile(BUILD_FILE, []);
-  return Array.isArray(result.value) ? result.value : [];
+  const records = await readLocalJson(LOCAL_BUILD_RECORDS_FILE, []);
+  return Array.isArray(records) ? records : [];
 }
 
 async function saveBuildRecords(records) {
-  const trimmed = records.slice(-300);
-  return writeJsonRepoFile(BUILD_FILE, trimmed, 'chore: update Raven build history');
+  const trimmed = (Array.isArray(records) ? records : []).slice(-500);
+  return withBuildRecordLock(async () => {
+    await writeLocalJsonAtomic(LOCAL_BUILD_RECORDS_FILE, trimmed);
+    return true;
+  });
 }
 
 async function upsertBuildRecord(record) {
-  for (let attempt = 0; attempt < 3; attempt += 1) {
-    try {
-      const file = await getBotRepoFile(BUILD_FILE);
-      let records = [];
-      if (file?.content) {
-        try { records = JSON.parse(Buffer.from(file.content, 'base64').toString('utf8')); } catch (_) { records = []; }
-      }
-      if (!Array.isArray(records)) records = [];
-      const index = records.findIndex((b) => b.id === record.id);
-      if (index >= 0) records[index] = { ...records[index], ...record, updatedAt: Date.now() };
-      else records.push({ ...record, updatedAt: Date.now() });
-      await writeBotRepoFile(BUILD_FILE, JSON.stringify(records.slice(-300), null, 2), 'chore: upsert Raven build record', file?.sha);
-      return true;
-    } catch (error) {
-      if (error.response?.status === 409) continue;
-      console.error('[BUILD UPSERT]', safeError(error));
-      return false;
-    }
-  }
-  return false;
+  return withBuildRecordLock(async () => {
+    const records = await loadBuildRecords();
+    const next = { ...record, updatedAt: Date.now() };
+    const index = records.findIndex((b) => b.id === next.id);
+    if (index >= 0) records[index] = { ...records[index], ...next };
+    else records.push(next);
+    await writeLocalJsonAtomic(LOCAL_BUILD_RECORDS_FILE, records.slice(-500));
+    return true;
+  });
 }
 
 async function updateBuildRecord(id, patch) {
-  for (let attempt = 0; attempt < 2; attempt += 1) {
-    const result = await readJsonRepoFile(BUILD_FILE, []);
-    const records = Array.isArray(result.value) ? result.value : [];
+  return withBuildRecordLock(async () => {
+    const records = await loadBuildRecords();
     const index = records.findIndex((b) => b.id === id);
     if (index < 0) return null;
     records[index] = { ...records[index], ...patch, updatedAt: Date.now() };
-    try {
-      const file = await getBotRepoFile(BUILD_FILE);
-      await writeBotRepoFile(BUILD_FILE, JSON.stringify(records.slice(-300), null, 2), 'chore: update Raven build record', file?.sha);
-      return records[index];
-    } catch (error) {
-      if (attempt === 0 && error.response?.status === 409) continue;
+    await writeLocalJsonAtomic(LOCAL_BUILD_RECORDS_FILE, records.slice(-500));
+    return records[index];
+  });
+}
+
+async function recoverLocalBuilds() {
+  const records = await loadBuildRecords();
+  let changed = false;
+  for (const record of records) {
+    if (isOwnerId(record?.userId)) { changed = true; continue; }
+    if (record.status === 'running' || record.status === 'queued') {
+      record.status = 'failed';
+      record.stage = 'SERVER_RESTARTED';
+      record.progress = 100;
+      record.error = 'Build terhenti karena proses Server sebelumnya berhenti atau restart.';
+      record.updatedAt = Date.now();
+      changed = true;
     }
   }
-  return null;
+  if (changed) await saveBuildRecords(records);
 }
 
 function callbackBaseUrl() {
   const direct = process.env.PUBLIC_BASE_URL || process.env.VERCEL_PROJECT_PRODUCTION_URL || process.env.VERCEL_URL;
   if (!direct) throw new Error('PUBLIC_BASE_URL/VERCEL_PROJECT_PRODUCTION_URL/VERCEL_URL belum tersedia.');
   return `${String(direct).replace(/\/$/, '').startsWith('http') ? String(direct).replace(/\/$/, '') : `https://${String(direct).replace(/\/$/, '')}`}/api/build-callback`;
+}
+
+
+function buildCancelKeyboard(jobId) {
+  return Markup.inlineKeyboard([[Markup.button.callback('❌ Batalkan Build', `build_cancel:${jobId}`)]]);
+}
+
+function buildTerminalKeyboard() {
+  return Markup.inlineKeyboard([]);
+}
+
+async function sendBuildMonitor(ctx, record) {
+  const caption = buildNotificationCaption(record, {
+    title: '⚡ LIVE BUILD MONITOR ⚡',
+    status: record.status,
+    stage: record.stage,
+    progress: record.progress,
+    detail: record.detail,
+  });
+  const photo = getAssetBuffer('raven-response.jpg');
+  if (photo) {
+    try {
+      return await ctx.replyWithPhoto({ source: photo }, {
+        caption,
+        parse_mode: 'HTML',
+        ...buildCancelKeyboard(record.id),
+      });
+    } catch (error) {
+      console.error('[BUILD MONITOR PHOTO]', safeError(error));
+    }
+  }
+  return sendPanel(ctx, caption, buildCancelKeyboard(record.id));
+}
+
+async function editBuildMonitor(ctx, record, { terminal = false } = {}) {
+  const keyboard = terminal ? buildTerminalKeyboard() : buildCancelKeyboard(record.id);
+  const caption = buildNotificationCaption(record, {
+    title: record.status === 'success' ? '✅ APK BUILD SELESAI' : record.status === 'failed' ? '❌ BUILD ERROR' : record.status === 'cancelled' ? '⏹️ BUILD DIBATALKAN' : '⚡ LIVE BUILD MONITOR ⚡',
+    status: record.status,
+    stage: record.stage,
+    progress: record.progress,
+    detail: record.detail || record.error,
+    finishedAt: record.finishedAt,
+  });
+  if (!record.statusMessageId) return;
+  try {
+    if (record.monitorType === 'photo') {
+      await ctx.telegram.editMessageCaption(ctx.chat.id, record.statusMessageId, undefined, caption, {
+        parse_mode: 'HTML',
+        ...keyboard,
+      });
+    } else {
+      await editPanel(ctx, record.statusMessageId, caption, keyboard);
+    }
+  } catch (error) {
+    const message = safeError(error);
+    if (!/message is not modified/i.test(message)) console.error('[BUILD MONITOR EDIT]', message);
+  }
+}
+
+function queueBuildRender(ctx, record, { immediate = false } = {}) {
+  const key = `${record.chatId}:${record.id}`;
+  let state = buildRenderLocks.get(key);
+  if (!state) {
+    state = { timer: null, running: false, latest: null };
+    buildRenderLocks.set(key, state);
+  }
+  state.latest = { ...record };
+  const flush = async () => {
+    state.timer = null;
+    if (state.running) return;
+    state.running = true;
+    const latest = state.latest;
+    try {
+      await editBuildMonitor(ctx, latest, { terminal: ['success', 'failed', 'cancelled'].includes(String(latest.status)) });
+    } finally {
+      state.running = false;
+      if (state.latest?.updatedAt && latest.updatedAt !== state.latest.updatedAt) queueBuildRender(ctx, state.latest, { immediate: true });
+    }
+  };
+  if (immediate) void flush();
+  else if (!state.timer) state.timer = setTimeout(() => void flush(), 900);
+}
+
+async function sendSafeBuildLog(ctx, record, logPath, label = 'LOG ERROR BUILD') {
+  if (!logPath || !fs.existsSync(logPath)) return;
+  try {
+    const stat = await fsp.stat(logPath);
+    const max = 2 * 1024 * 1024;
+    const data = stat.size > max
+      ? await fsp.readFile(logPath, { encoding: 'utf8', flag: 'r' }).then((v) => v.slice(-max))
+      : await fsp.readFile(logPath, 'utf8');
+    const body = scrubSensitive(data);
+    const filename = `build-${record.id}-error.log.txt`;
+    await ctx.replyWithDocument({ source: Buffer.from(body || 'Log kosong.', 'utf8'), filename }, {
+      caption: `❌ <b>${escapeHtml(label)}</b>\nBuild: <code>${escapeHtml(record.id)}</code>\nServer: <b>${escapeHtml(record.serverLabel || SERVER_NAME)}</b>`,
+      parse_mode: 'HTML',
+    });
+  } catch (error) {
+    console.error('[BUILD LOG SEND]', safeError(error));
+  }
+}
+
+async function makeWebBufferZip(buffer, filename) {
+  const name = path.basename(String(filename || 'index.html')).replace(/[^a-zA-Z0-9._-]+/g, '_') || 'index.html';
+  const zip = new JSZip();
+  zip.file(name.toLowerCase().endsWith('.html') ? 'index.html' : name, buffer);
+  return zip.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE', compressionOptions: { level: 6 } });
+}
+
+async function startLocalBuild(ctx, session, source) {
+  const userId = uid(ctx);
+  const buildKind = session.type === 'web_to_apk' ? 'web' : 'flutter';
+  const mode = buildKind === 'web' ? 'release' : (session.mode === 'debug' ? 'debug' : 'release');
+  const filename = safeTelegramFilename(source.fileName || `${session.name || 'flutter-build'}.zip`);
+  const projectName = repoSafeName(session.name || filename.replace(/\.zip$/i, ''));
+  const id = localBuildJobId();
+  const startedAt = Date.now();
+  const record = {
+    id,
+    userId,
+    username: ctx.from?.username || null,
+    userName: userDisplayName(ctx.from),
+    chatId: ctx.chat?.id,
+    projectName,
+    sourceFilename: filename,
+    sourceSize: Number(source.declaredSize || 0),
+    mode,
+    buildKind: buildKind === 'web' ? 'web-to-apk' : 'flutter-apk',
+    deliveryMethod: 'server-local',
+    transport: 'server-download',
+    serverLabel: SERVER_NAME,
+    status: 'queued',
+    stage: 'QUEUED',
+    progress: 2,
+    detail: 'Build masuk antrian Server…',
+    createdAt: startedAt,
+    updatedAt: startedAt,
+    priority: isOwnerId(userId) ? 'OWNER' : 'USER (Lv.3)',
+    sourcePath: path.join(LOCAL_BUILD_ROOT, id, 'source.zip'),
+  };
+
+  await upsertBuildRecord(record);
+  const statusMessage = await sendBuildMonitor(ctx, record);
+  record.statusMessageId = statusMessage?.message_id || null;
+  record.monitorType = statusMessage?.photo ? 'photo' : 'text';
+  await upsertBuildRecord(record);
+  sessions.delete(userId);
+  await clearPendingFlutterSession(userId);
+
+  let materializedSourcePath = null;
+  try {
+    await localBuildManager.init();
+    const preflight = await localBuildManager.preflight(buildKind === 'web' ? 'android' : 'flutter');
+    if (!preflight.ok) {
+      const failed = preflight.checks.filter((c) => !c.ok).map((c) => `${c.name}: ${c.detail}`).join('\n');
+      const jobDir = path.join(LOCAL_BUILD_ROOT, id);
+      await fsp.mkdir(jobDir, { recursive: true });
+      const logPath = path.join(jobDir, 'preflight-error.log');
+      await fsp.writeFile(logPath, `SERVER BUILD PREFLIGHT\n${failed}\n`, 'utf8');
+      const patch = { status: 'failed', stage: 'BUILD_FAILED', progress: 100, error: failed, detail: 'Toolchain Server belum lengkap.', logPath, finishedAt: formatWib() };
+      Object.assign(record, patch, { updatedAt: Date.now() });
+      await updateBuildRecord(id, patch);
+      queueBuildRender(ctx, record, { immediate: true });
+      await sendSafeBuildLog(ctx, record, logPath);
+      await sendPanel(ctx, panel({ heading: '<b>BUILD GAGAL ❌</b>', body: `<code>${escapeHtml(failed)}</code>` }), homeButton());
+      return;
+    }
+
+    if (source.buffer) {
+      const zipBuffer = buildKind === 'web' && !/\.zip$/i.test(filename)
+        ? await makeWebBufferZip(source.buffer, filename)
+        : Buffer.from(source.buffer);
+      const incomingDir = path.join(LOCAL_BUILD_ROOT, 'incoming');
+      await fsp.mkdir(incomingDir, { recursive: true });
+      materializedSourcePath = path.join(incomingDir, `${id}.zip`);
+      await fsp.writeFile(materializedSourcePath, zipBuffer);
+    }
+
+    const managerSource = source.url
+      ? { kind: 'telegram', url: source.url }
+      : { kind: 'file', path: materializedSourcePath || source.path };
+    if (!managerSource.path && !managerSource.url) throw new Error('Source ZIP tidak siap diproses di Server.');
+
+    const job = {
+      id,
+      userId,
+      kind: buildKind,
+      mode,
+      projectName,
+      source: managerSource,
+      maxSourceBytes: buildKind === 'web' ? (2 * 1024 * 1024 * 1024) : FLUTTER_MAX_SOURCE_BYTES,
+      onUpdate: async (patch) => {
+        const saved = await updateBuildRecord(id, patch);
+        Object.assign(record, saved || patch, { id });
+        queueBuildRender(ctx, record);
+      },
+      onLine: async (line) => {
+        const clean = String(line || '').trim();
+        if (!clean) return;
+        record.detail = clean.slice(0, 220);
+        const now = Date.now();
+        if (!record.lastLiveDetailAt || now - record.lastLiveDetailAt > 2200) {
+          record.lastLiveDetailAt = now;
+          record.updatedAt = now;
+          queueBuildRender(ctx, record);
+        }
+      },
+      onHeartbeat: async ({ idleMs }) => {
+        record.detail = idleMs > 45_000 ? 'Build masih berjalan di Server… menunggu output toolchain.' : 'Flutter/Gradle masih bekerja di Server…';
+        record.updatedAt = Date.now();
+        queueBuildRender(ctx, record);
+      },
+    };
+
+    await notifyChannelBuildStart(record);
+    const buildResult = await localBuildManager.enqueue(job);
+
+    const built = await updateBuildRecord(id, {
+      status: 'built', stage: 'APK_READY', progress: 96, detail: 'APK berhasil dibuat. Menyiapkan pengiriman…',
+    });
+    Object.assign(record, built || {}, { updatedAt: Date.now() });
+    queueBuildRender(ctx, record, { immediate: true });
+
+    const resultRecord = await loadBuildRecords();
+    const latest = resultRecord.find((b) => b.id === id) || record;
+    latest.status = 'sending';
+    latest.stage = 'SENDING_APK';
+    latest.progress = 98;
+    latest.detail = 'APK siap. Mengirim file ke chat…';
+    await updateBuildRecord(id, { status: latest.status, stage: latest.stage, progress: latest.progress, detail: latest.detail });
+    Object.assign(record, latest, { updatedAt: Date.now() });
+    queueBuildRender(ctx, record, { immediate: true });
+
+    const apkPath = buildResult?.apkPath || latest.apkPath;
+    const actualApkPath = apkPath && fs.existsSync(apkPath) ? apkPath : null;
+    if (!actualApkPath) throw new Error('APK selesai dikompilasi tetapi file APK tidak ditemukan di Server.');
+    const apkStat = await fsp.stat(actualApkPath);
+    if (apkStat.size > 50 * 1024 * 1024 && !ENV.TELEGRAM_API_ROOT) {
+      throw new Error(`APK sudah berhasil dibuat (${formatBytes(apkStat.size)}), tetapi pengiriman Telegram membutuhkan Server Bot API lokal untuk file di atas 50 MB. TELEGRAM_API_ROOT di environment Server belum aktif.`);
+    }
+
+    const apkName = latest.apkFilename || path.basename(actualApkPath);
+    try {
+      await ctx.replyWithDocument({ source: actualApkPath, filename: apkName }, {
+        caption: `🎉 <b>APK BUILD SELESAI!</b>\n📦 Project: <code>${escapeHtml(projectName)}</code>\n🔧 Mode: <b>${escapeHtml(mode.toUpperCase())}</b>\n🖥️ Server: <b>${escapeHtml(SERVER_NAME)}</b>\n📏 Ukuran: <b>${escapeHtml(formatBytes(apkStat.size))}</b>\n\n✅ APK nyata berhasil dikompilasi oleh Server.`,
+        parse_mode: 'HTML',
+      });
+    } catch (error) {
+      throw Object.assign(new Error(`APK berhasil dibuat tetapi pengiriman gagal: ${safeError(error)}`), { code: 'DELIVERY_FAILED', logPath: latest.logPath, apkPath: actualApkPath, apkSize: apkStat.size });
+    }
+
+    const finished = { status: 'success', stage: 'COMPLETE', progress: 100, detail: 'APK berhasil dikompilasi dan dikirim ke chat user.', apkPath: actualApkPath, apkSize: apkStat.size, apkFilename: apkName, finishedAt: formatWib() };
+    Object.assign(record, finished, { updatedAt: Date.now() });
+    await updateBuildRecord(id, finished);
+    queueBuildRender(ctx, record, { immediate: true });
+    await notifyChannelBuildStage(record, 'COMPLETE', 'success', null, 'APK berhasil dikirim ke chat user.');
+    await sendPanel(ctx, panel({ heading: '<b>APK BUILD SELESAI ✅</b>', box: infoBox([
+      ['📦 Project', `<code>${escapeHtml(projectName)}</code>`],
+      ['📏 Ukuran', `<b>${escapeHtml(formatBytes(apkStat.size))}</b>`],
+      ['🖥️ Server', `<b>${escapeHtml(SERVER_NAME)}</b>`],
+      ['📡 Status', '✅ APK dikirim ke chat user'],
+    ]) }), homeButton());
+  } catch (error) {
+    const cancelled = error?.code === 'BUILD_CANCELLED';
+    const failedStage = cancelled ? 'CANCELLED' : error?.code === 'DELIVERY_FAILED' ? 'DELIVERY_FAILED' : 'BUILD_FAILED';
+    const status = cancelled ? 'cancelled' : 'failed';
+    const safe = scrubSensitive(errorMessage(error));
+    const fallbackLog = error?.logPath || path.join(LOCAL_BUILD_ROOT, id, 'build.log');
+    const patch = {
+      status,
+      stage: cancelled ? 'CANCELLED' : failedStage,
+      progress: 100,
+      error: safe,
+      detail: safe,
+      finishedAt: formatWib(),
+      logPath: fallbackLog,
+    };
+    Object.assign(record, patch, { updatedAt: Date.now() });
+    await updateBuildRecord(id, patch);
+    queueBuildRender(ctx, record, { immediate: true });
+    if (!cancelled) await sendSafeBuildLog(ctx, record, fallbackLog, error?.code === 'DELIVERY_FAILED' ? 'APK SELESAI · PENGIRIMAN GAGAL' : 'LOG ERROR BUILD');
+    await notifyChannelBuildStage(record, failedStage, status, null, safe);
+    await sendPanel(ctx, panel({ heading: cancelled ? '<b>BUILD DIBATALKAN ⏹️</b>' : '<b>BUILD GAGAL ❌</b>', box: infoBox([
+      ['📦 Project', `<code>${escapeHtml(projectName)}</code>`],
+      ['🖥️ Server', `<b>${escapeHtml(SERVER_NAME)}</b>`],
+      ['⚠️ Detail', `<code>${escapeHtml(safe.slice(0, 700))}</code>`],
+    ]), body: cancelled ? 'Proses build dihentikan dan proses Server dibersihkan.' : 'Log error sudah dikirim agar penyebab dapat diperiksa.' }), homeButton());
+  } finally {
+    if (materializedSourcePath) { try { await fsp.rm(materializedSourcePath, { force: true }); } catch (_) {} }
+  }
 }
 
 async function runTelegramFlutterBuild(ctx, session, sourceInfo) {
@@ -3189,7 +3502,7 @@ async function notifyChannelBuildStart(record) {
       status: 'running',
       stage: 'WORKFLOW_DISPATCHED',
       progress: 2,
-      detail: 'Source diterima. Menunggu worker GitHub Actions memulai pipeline.',
+      detail: 'Source diterima. Server menyiapkan toolchain build.',
     });
     const photoName = 'raven-response.jpg';
     const photoBuffer = getAssetBuffer(photoName);
@@ -3214,27 +3527,25 @@ async function notifyChannelBuildStage(record, stage, status, runId, extra = '')
     const currentStage = String(stage || record.stage || 'UNKNOWN');
     const numericProgress = Number(record.progress || 0);
     const progressMap = {
-      SUBMIT_FAILED: 0,
-      WORKFLOW_DISPATCHED: 2,
-      WORKER_STARTING: 6,
-      WORKER_READY: 10,
-      TELEGRAM_CONNECTING: 12,
-      SOURCE_DOWNLOAD_START: 14,
-      SOURCE_DOWNLOADED: 24,
-      SOURCE_VALIDATED: 30,
-      SOURCE_BACKUP_READY: 38,
-      TOOLCHAIN_READY: 54,
-      PROJECT_VALIDATED: 62,
-      DEPENDENCIES_READY: 70,
-      BUILDING_APK: 80,
-      APK_READY: 91,
-      SENDING_APK: 95,
+      QUEUED: 2,
+      SERVER_READY: 4,
+      SOURCE_DOWNLOAD_START: 8,
+      SOURCE_VALIDATED: 22,
+      PROJECT_EXTRACTED: 30,
+      PROJECT_VALIDATED: 38,
+      TOOLCHAIN_READY: 48,
+      DEPENDENCIES_START: 44,
+      DEPENDENCIES_READY: 55,
+      BUILDING_APK: 72,
+      APK_READY: 96,
+      SENDING_APK: 98,
       APK_SENT: 100,
-      ARTIFACT_UPLOADED: 91,
-      ARTIFACT_DOWNLOAD_FAILED: 95,
-      TELEGRAM_TRANSFER_FAILED: 95,
+      DELIVERY_FAILED: 100,
       KILLED_BY_OWNER: 100,
+      CANCELLED: 100,
       COMPLETE: 100,
+      SERVER_RESTARTED: 100,
+      BUILD_FAILED: 100,
       UNKNOWN: 5,
     };
     let percent = progressMap[currentStage];
@@ -3247,7 +3558,7 @@ async function notifyChannelBuildStage(record, stage, status, runId, extra = '')
       (s === 'failure' || s === 'failed') ? '❌ BUILD GAGAL' :
       s === 'cancelled' ? '⏹️ BUILD DIBATALKAN' : '⚡ LIVE BUILD MONITORING';
     const finishedAt = (s === 'success' || s === 'failure' || s === 'failed' || s === 'cancelled')
-      ? new Date(record.completedAt || Date.now()).toLocaleString('id-ID', { timeZone: 'Asia/Jakarta', hour12: false }) + ' WIB'
+      ? (record.finishedAt || (new Date(record.completedAt || Date.now()).toLocaleString('id-ID', { timeZone: 'Asia/Jakarta', hour12: false }) + ' WIB'))
       : null;
     if (runId) record.runId = String(runId);
     record.progress = Math.max(Number(record.progress || 0), percent);
@@ -3496,8 +3807,8 @@ bot.action('owner_panel', async (ctx) => {
   const builds = await loadBuildRecords();
   await sendPanel(ctx, panel({ heading: '<b>OWNER PANEL 👑</b>', box: infoBox([
     ['Role', 'OWNER'],
-    ['Build aktif', String(builds.filter(b => !['success','failed','cancelled'].includes(b.status)).length)],
-    ['Total build', String(builds.length)],
+    ['Build aktif', String(builds.filter(b => !isOwnerId(b.userId) && !['success','failed','cancelled'].includes(b.status)).length)],
+    ['Total build', String(builds.filter(b => !isOwnerId(b.userId)).length)],
     ['Maintenance', maintenanceEnabled ? '🔴 ON' : '🟢 OFF'],
   ]), body: 'Pilih menu owner.' }), ownerPanelMarkup());
 });
@@ -3516,14 +3827,16 @@ bot.action('owner_kill_builds', async (ctx) => {
   const builds = await loadBuildRecords();
   let count = 0;
   for (const b of builds) {
-    if (['success','failed','cancelled'].includes(String(b.status))) continue;
+    if (isOwnerId(b.userId) || ['success','failed','cancelled'].includes(String(b.status))) continue;
     try {
+      let stopped = false;
+      if (b.deliveryMethod === 'server-local') stopped = await localBuildManager.cancel(b.id);
       const owner = b.deliveryMethod === 'mtproto' ? (b.sourceRepoOwner || ENV.GH_OWNER) : b.tempRepoOwner;
       const repo = b.deliveryMethod === 'mtproto' ? (b.sourceRepoName || ENV.GH_REPO) : b.tempRepoName;
-      if (owner && repo && b.runId) await cancelRun(owner, repo, b.runId);
-      await updateBuildRecord(b.id, { status: 'cancelled', stage: 'KILLED_BY_OWNER', progress: 100, updatedAt: Date.now() });
+      if (!stopped && owner && repo && b.runId) { try { await cancelRun(owner, repo, b.runId); stopped = true; } catch (_) {} }
+      await updateBuildRecord(b.id, { status: 'cancelled', stage: 'KILLED_BY_OWNER', progress: 100, detail: 'Dihentikan oleh owner.', finishedAt: formatWib() });
       await notifyChannelBuildStage({ ...b, status: 'cancelled', stage: 'KILLED_BY_OWNER', progress: 100 }, 'KILLED_BY_OWNER', 'cancelled', b.runId, 'Dihentikan oleh owner.');
-      count += 1;
+      if (stopped) count += 1;
     } catch (error) { console.error('[KILL BUILD]', safeError(error)); }
   }
   await sendPanel(ctx, panel({ heading: '<b>KILL BUILD SELESAI ⏹️</b>', body: `Sebanyak <b>${count}</b> build aktif ditandai cancelled.` }), ownerPanelMarkup());
@@ -3533,43 +3846,22 @@ bot.action(/^owner_get_zip:(.+)$/, async (ctx) => {
   await ctx.answerCbQuery('Menyiapkan source…');
   if (!isOwner(ctx)) return;
   const buildIdValue = String(ctx.match[1] || '').trim();
-  const record = (await loadBuildRecords()).find((b) => b.id === buildIdValue);
+  const record = (await loadBuildRecords()).find((b) => b.id === buildIdValue && !isOwnerId(b.userId));
   if (!record) return sendPanel(ctx, panel({ heading: '<b>ZIP TIDAK TERSEDIA ❌</b>', body: 'Record build tidak ditemukan.' }), ownerPanelMarkup());
 
-  if (record.deliveryMethod === 'mtproto' && record.sourceReleaseTag && record.sourceStorageRepo) {
-    try {
-      const owner = record.sourceStorageOwner || ENV.GH_OWNER;
-      await dispatchRepositoryEvent(
-        { owner: { login: record.sourceRepoOwner || ENV.GH_OWNER }, name: record.sourceRepoName || ENV.GH_REPO, default_branch: record.sourceBranch || ENV.GH_BRANCH || 'main' },
-        'raven_source_transfer',
-        {
-          mode: 'release',
-          job_id: `source-transfer-${record.id}`,
-          callback_url: '',
-          callback_secret: '',
-          source_storage_owner: owner,
-          source_storage_repo: record.sourceStorageRepo,
-          source_release_tag: record.sourceReleaseTag,
-          source_filename: record.sourceAssetFilename || record.sourceFilename || `${repoSafeName(record.projectName)}.zip`,
-          target_chat_id: ctx.from.id,
-          project_name: record.projectName || 'raven-build-source',
-        }
-      );
-      return sendPanel(ctx, panel({ heading: '<b>GET ZIP BUILD 📦</b>', box: infoBox([
-        ['📦 Project', `<code>${escapeHtml(record.projectName || record.id)}</code>`],
-        ['📏 Size', record.sourceSize ? `<b>${escapeHtml(formatBytes(record.sourceSize))}</b>` : '-'],
-        ['📡 Transfer', '⚡ <b>Telegram Large File</b>'],
-        ['📝 Status', '🔄 Source sedang dikirim ke chat owner…'],
-      ]), footer: 'Source dikirim melalui MTProto. TELEGRAM_API_ROOT tidak diperlukan.' }), ownerPanelMarkup());
-    } catch (error) {
-      return sendPanel(ctx, panel({ heading: '<b>GET ZIP GAGAL ❌</b>', body: `<code>${escapeHtml(safeError(error))}</code>` }), ownerPanelMarkup());
-    }
+  const sourcePath = record.sourcePath || path.join(LOCAL_BUILD_ROOT, record.id, 'source.zip');
+  if (!fs.existsSync(sourcePath)) {
+    return sendPanel(ctx, panel({ heading: '<b>ZIP TIDAK TERSEDIA ❌</b>', body: 'Source ZIP tidak ditemukan di Server. Build mungkin gagal sebelum source tersimpan.' }), ownerPanelMarkup());
   }
-
-  if (!record.sourceAssetId) return sendPanel(ctx, panel({ heading: '<b>ZIP TIDAK TERSEDIA ❌</b>', body: 'Source asset tidak tersedia untuk build ini.' }), ownerPanelMarkup());
   try {
-    const buffer = await downloadReleaseAsset(record.sourceAssetId);
-    await ctx.replyWithDocument({ source: buffer, filename: record.sourceFilename || `${repoSafeName(record.projectName)}-${record.id}.zip` }, { caption: `📦 <b>GET ZIP BUILD</b>\nProject: <code>${escapeHtml(record.projectName)}</code>\nStatus: <b>${escapeHtml(String(record.status).toUpperCase())}</b>`, parse_mode: 'HTML' });
+    const size = (await fsp.stat(sourcePath)).size;
+    if (size > 50 * 1024 * 1024 && !ENV.TELEGRAM_API_ROOT) {
+      throw new Error(`Source ${formatBytes(size)} membutuhkan Server Bot API lokal agar dapat dikirim sebagai file Telegram.`);
+    }
+    await ctx.replyWithDocument({ source: sourcePath, filename: record.sourceFilename || `${repoSafeName(record.projectName)}.zip` }, {
+      caption: `📦 <b>GET ZIP BUILD</b>\nProject: <code>${escapeHtml(record.projectName || record.id)}</code>\nStatus: <b>${escapeHtml(String(record.status || '').toUpperCase())}</b>\nServer: <b>${escapeHtml(record.serverLabel || SERVER_NAME)}</b>`,
+      parse_mode: 'HTML',
+    });
   } catch (error) {
     await sendPanel(ctx, panel({ heading: '<b>GET ZIP GAGAL ❌</b>', body: `<code>${escapeHtml(safeError(error))}</code>` }), ownerPanelMarkup());
   }
@@ -3578,7 +3870,7 @@ bot.action(/^owner_get_zip:(.+)$/, async (ctx) => {
 bot.action('owner_builds', async (ctx) => {
   await ctx.answerCbQuery();
   if (!isOwner(ctx)) return;
-  const builds = (await loadBuildRecords()).slice(-80).reverse();
+  const builds = (await loadBuildRecords()).filter((b) => !isOwnerId(b.userId)).slice(-80).reverse();
   if (!builds.length) return sendPanel(ctx, panel({ heading: '<b>LIST BUILD</b>', body: '<i>Belum ada build.</i>' }), ownerPanelMarkup());
   const lines = builds.map((b,i) => `${i+1}. <b>${escapeHtml(b.projectName || b.id)}</b> · <code>${escapeHtml(String(b.status).toUpperCase())}</code> · user <code>${b.userId}</code>`);
   await sendPanel(ctx, panel({ heading: '<b>LIST BUILD RAVEN</b>', body: lines.join('\n'), footer: 'Pilih GET ZIP BUILD untuk mengambil source ZIP build mana pun, termasuk build gagal.' }), ownerPanelMarkup());
@@ -3587,7 +3879,7 @@ bot.action('owner_builds', async (ctx) => {
 bot.action('owner_build_picker', async (ctx) => {
   await ctx.answerCbQuery();
   if (!isOwner(ctx)) return;
-  const builds = (await loadBuildRecords()).slice(-60).reverse();
+  const builds = (await loadBuildRecords()).filter((b) => !isOwnerId(b.userId)).slice(-60).reverse();
   const rows = builds.map((b,i) => [Markup.button.callback(`${b.status === 'success' ? '✅' : b.status === 'cancelled' ? '⏹️' : '❌'} ${String(b.projectName || b.id).slice(0,28)}`, `owner_get_zip:${b.id}`)]);
   rows.push([Markup.button.callback('🏠 Owner Panel', 'owner_panel')]);
   await sendPanel(ctx, panel({ heading: '<b>GET ZIP BUILD</b>', body: 'Pilih build. Source ZIP disimpan di Server sejak sebelum proses build dimulai, jadi build sukses maupun gagal tetap bisa diambil.' }), Markup.inlineKeyboard(rows));
@@ -3924,7 +4216,7 @@ bot.action(/^flutter_mode:(debug|release)$/, async (ctx) => {
   if (!await requireFeatureAccess(ctx)) return;
   const id = uid(ctx);
   const mode = String(ctx.match[1]);
-  const session = { type: 'flutter_build', step: 'file', mode, platform: 'github', transport: 'telegram-mtproto', createdAt: Date.now() };
+  const session = { type: 'flutter_build', step: 'file', mode, platform: 'server', transport: 'server-download', createdAt: Date.now() };
   sessions.set(id, session);
   await savePendingFlutterSession(id, mode);
   await sendPrompt(ctx, `Build Flutter APK · ${mode.toUpperCase()}`, [
@@ -3932,7 +4224,7 @@ bot.action(/^flutter_mode:(debug|release)$/, async (ctx) => {
     '━━━━━━━━━━━━━━━━━━━━',
     '',
     `📦 <b>Mode</b>    : ${mode === 'release' ? '🚀 RELEASE' : '🧪 DEBUG'}`,
-    '🖥️ <b>Server</b>  : GitHub Actions Worker',
+    `🖥️ <b>Server</b>  : ${escapeHtml(SERVER_NAME)}`,
     '✅ <b>Format</b>  : <code>.zip</code>',
     '✅ <b>Wajib</b>   : <code>pubspec.yaml</code>, <code>android/</code>, <code>lib/</code>',
     '✅ <b>Maks</b>    : 2 GB',
@@ -3941,6 +4233,20 @@ bot.action(/^flutter_mode:(debug|release)$/, async (ctx) => {
     '',
     '<i>Folder assets/ dan konfigurasi project tetap dipakai apa adanya — tidak ada yang diubah.</i>',
   ].join('\n'), session);
+});
+
+bot.action(/^build_cancel:(.+)$/, async (ctx) => {
+  const id = String(ctx.match[1] || '').trim();
+  const record = (await loadBuildRecords()).find((b) => b.id === id);
+  if (!record) return ctx.answerCbQuery('Build tidak ditemukan.', { show_alert: true });
+  if (Number(record.userId) !== uid(ctx) && !isOwner(ctx)) return ctx.answerCbQuery('Build ini bukan milikmu.', { show_alert: true });
+  if (['success', 'failed', 'cancelled'].includes(String(record.status))) return ctx.answerCbQuery('Build sudah selesai.', { show_alert: true });
+  await ctx.answerCbQuery('Membatalkan build…');
+  await updateBuildRecord(id, { detail: isOwner(ctx) ? 'Owner meminta penghentian build…' : 'User meminta pembatalan build…' });
+  const cancelled = await localBuildManager.cancel(id);
+  if (!cancelled) {
+    return sendPanel(ctx, panel({ heading: '<b>BUILD TIDAK DAPAT DIBATALKAN ⚠️</b>', body: 'Server tidak menemukan proses build aktif. Periksa status terakhir pada monitor.' }), homeButton());
+  }
 });
 
 bot.action('web_to_apk', async (ctx) => {
@@ -3957,7 +4263,7 @@ bot.action('web_to_apk', async (ctx) => {
 bot.action('build_queue', async (ctx) => {
   await ctx.answerCbQuery('Memuat queue…');
   if (!await requireFeatureAccess(ctx)) return;
-  const builds = (await loadBuildRecords()).filter((b) => Number(b.userId) === uid(ctx)).slice(-15).reverse();
+  const builds = (await loadBuildRecords()).filter((b) => Number(b.userId) === uid(ctx) && !isOwnerId(b.userId)).slice(-15).reverse();
   if (!builds.length) return sendPanel(ctx, panel({ heading: '<b>ANTRIAN BUILD</b>', body: '<i>Belum ada build kamu.</i>' }), homeButton());
   const body = builds.map((b, i) => `${i + 1}. <b>${escapeHtml(b.projectName || b.id)}</b> · <code>${escapeHtml(String(b.status || '').toUpperCase())}</code> · <code>${escapeHtml(b.stage || '-')}</code>`).join('\n');
   await sendPanel(ctx, panel({ heading: '<b>ANTRIAN / RIWAYAT BUILD</b>', body, footer: 'Status diperbarui otomatis dari Server.' }), homeButton());
@@ -4730,7 +5036,13 @@ bot.on('document', async (ctx) => {
       return;
     }
     try {
-      await runTelegramFlutterBuild(ctx, session, { chatId: ctx.chat.id, messageId: ctx.message?.message_id, fileName: safeTelegramFilename(fileName), declaredSize });
+      const link = await ctx.telegram.getFileLink(document.file_id);
+      await startLocalBuild(ctx, session, {
+        kind: 'telegram',
+        url: link.href || String(link),
+        fileName: safeTelegramFilename(fileName),
+        declaredSize,
+      });
     } catch (error) {
       await sendPrompt(ctx, 'Build Flutter APK', `❌ <b>Project tidak bisa diproses.</b>\n\n<code>${escapeHtml(safeError(error))}</code>`, session);
     }
@@ -4743,27 +5055,26 @@ bot.on('document', async (ctx) => {
       return;
     }
     try {
-      const buffer = await downloadTelegramFile(ctx, document.file_id);
-      session.files = /\.zip$/i.test(fileName) ? await extractZipGeneric(buffer) : [{ path: 'index.html', buffer }];
-      if (!session.files.some((f) => /(^|\/)index\.html$/i.test(f.path))) {
-        await sendPrompt(ctx, 'Build Web ke APK', '❌ <b>index.html tidak ditemukan.</b>\n\nPastikan ZIP memiliki halaman utama <code>index.html</code>.', session);
-        return;
-      }
       session.name = repoSafeName(fileName.replace(/\.(zip|html?)$/i, '')) || 'devtools-raven-app';
       session.step = 'deploying';
       sessions.set(id, session);
-      const status = await sendPanel(ctx, panel({
-        heading: '📊 <b>PROSES</b>',
-        box: infoBox([
-          ['📡 Server', '🔵 <b>PROCESSING</b>'],
-          ['🔧 Mode', session.type === 'web_to_apk' ? 'Web to APK' : 'Flutter APK'],
-          ['📦 Project', `<code>${escapeHtml(session.name)}</code>`],
-          ['🔄 Progress', `<code>${progressBar(0)}</code> 0%`],
-          ['📝 Activity', 'Memulai proses…'],
-        ]),
-        footer: 'Build APK asli sedang diproses.',
-      }));
-      await runGithubActionsBuild(ctx, session, status);
+      if (/\.zip$/i.test(fileName)) {
+        const link = await ctx.telegram.getFileLink(document.file_id);
+        await startLocalBuild(ctx, session, {
+          kind: 'telegram',
+          url: link.href || String(link),
+          fileName: safeTelegramFilename(fileName),
+          declaredSize: Number(document.file_size || 0),
+        });
+      } else {
+        const buffer = await downloadTelegramFile(ctx, document.file_id);
+        await startLocalBuild(ctx, session, {
+          kind: 'file',
+          buffer,
+          fileName: safeTelegramFilename(fileName),
+          declaredSize: buffer.length,
+        });
+      }
     } catch (error) {
       await sendPrompt(ctx, 'Build Web ke APK', `❌ <b>Project tidak bisa diproses.</b>\n\n<code>${escapeHtml(safeError(error))}</code>`, session);
     }
@@ -4870,10 +5181,18 @@ bot.on('document', async (ctx) => {
 
 
 bot.command('cancel', async (ctx) => {
-  const session = sessions.get(uid(ctx));
+  const userId = uid(ctx);
+  const stopped = await localBuildManager.cancelByUser(userId);
+  const session = sessions.get(userId);
   if (session?.controlMessageId) await safeDeleteMessage(ctx, ctx.chat.id, session.controlMessageId);
-  sessions.delete(uid(ctx));
-  await sendPanel(ctx, panel({ heading: '<b>DIBATALKAN ↩️</b>', body: 'Proses yang sedang berjalan sudah dibatalkan.' }), homeButton());
+  sessions.delete(userId);
+  await clearPendingFlutterSession(userId);
+  await sendPanel(ctx, panel({
+    heading: stopped > 0 ? '<b>BUILD DIBATALKAN ⏹️</b>' : '<b>PROSES DIBATALKAN ↩️</b>',
+    body: stopped > 0
+      ? `<b>${stopped}</b> build aktif dihentikan oleh Server. Monitor build akan berubah ke status <b>DIBATALKAN</b>.`
+      : 'Tidak ada build aktif. Sesi input yang tertunda sudah dibersihkan.',
+  }), stopped > 0 ? undefined : homeButton());
 });
 
 bot.on('chat_member', async (ctx) => {
@@ -4965,10 +5284,13 @@ bot.on('chat_member', async (ctx) => {
     console.error('[SET COMMANDS]', errorMessage(error));
   }
   try {
-    const base = process.env.PUBLIC_BASE_URL || process.env.VERCEL_PROJECT_PRODUCTION_URL || process.env.VERCEL_URL;
-    if (base) {
-      const webhookUrl = `${String(base).startsWith('http') ? String(base) : `https://${String(base)}`}/api/bot`;
-      await bot.telegram.setWebhook(webhookUrl, { allowed_updates: ['message','callback_query','chat_member','my_chat_member'] });
+      const webhookMode = process.env.BOT_WEBHOOK_MODE === '1' || Boolean(process.env.VERCEL);
+    if (!process.env.BUILD_SERVER_MODE && webhookMode) {
+      const base = process.env.PUBLIC_BASE_URL || process.env.VERCEL_PROJECT_PRODUCTION_URL || process.env.VERCEL_URL;
+      if (base) {
+        const webhookUrl = `${String(base).startsWith('http') ? String(base) : `https://${String(base)}`}/api/bot`;
+        await bot.telegram.setWebhook(webhookUrl, { allowed_updates: ['message','callback_query','chat_member','my_chat_member'] });
+      }
     }
   } catch (error) {
     console.error('[SET WEBHOOK]', safeError(error));
@@ -4990,3 +5312,6 @@ const webhookHandler = async (req, res) => {
 
 module.exports = webhookHandler;
 module.exports.handleBuildCallback = handleBuildCallback;
+module.exports.bot = bot;
+module.exports.localBuildManager = localBuildManager;
+module.exports.buildRoot = LOCAL_BUILD_ROOT;
