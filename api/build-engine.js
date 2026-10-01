@@ -83,11 +83,23 @@ async function dispatchWorkflow(repo, jobId, mode, callbackUrl, callbackSecret, 
   for (const [key, value] of Object.entries(extraInputs || {})) {
     if (value !== undefined && value !== null) inputs[key] = String(value);
   }
-  await gh('POST', `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo.name)}/actions/workflows/${encodeURIComponent(safeWorkflowFile)}/dispatches`, {
+  const response = await gh('POST', `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo.name)}/actions/workflows/${encodeURIComponent(safeWorkflowFile)}/dispatches`, {
     ref: repo.default_branch || 'main',
     inputs,
-  }, { timeout: 30000 });
-  return { dispatched: true };
+  }, { timeout: 30000, validateStatus: (status) => status >= 200 && status < 300 });
+  return { dispatched: true, status: response.status || 204 };
+}
+
+async function dispatchRepositoryEvent(repo, eventType, clientPayload = {}) {
+  const owner = repo.owner.login;
+  const repository = repo.name;
+  const response = await gh('POST', `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repository)}/dispatches`, {
+    event_type: String(eventType || 'raven_build').slice(0, 100),
+    client_payload: Object.fromEntries(
+      Object.entries(clientPayload || {}).map(([key, value]) => [String(key).slice(0, 100), String(value ?? '')])
+    ),
+  }, { timeout: 30000, validateStatus: (status) => status >= 200 && status < 300 });
+  return { dispatched: true, status: response.status || 204 };
 }
 
 async function createRelease(owner, repo, jobId, name) {
@@ -243,4 +255,4 @@ jobs:
           curl -fsS -X POST -H 'content-type: application/json' "$INPUT_CALLBACK_URL" -d "$payload" || true
 `;
 
-module.exports = { env, workflowYml, androidWorkflowYml, safeSlug, createRepo, uploadFiles, dispatchWorkflow, createRelease, uploadReleaseAsset, downloadReleaseAsset, getArtifact, cancelRun, getRun, downloadRunLogs, deleteRepo, buildId };
+module.exports = { env, workflowYml, androidWorkflowYml, safeSlug, createRepo, uploadFiles, dispatchWorkflow, dispatchRepositoryEvent, createRelease, uploadReleaseAsset, downloadReleaseAsset, getArtifact, cancelRun, getRun, downloadRunLogs, deleteRepo, buildId };
