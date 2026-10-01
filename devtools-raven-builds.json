@@ -48,11 +48,11 @@
     "buildKind": "flutter-apk",
     "deliveryMethod": "mtproto",
     "transport": "telegram-mtproto",
-    "status": "running",
-    "stage": "WORKFLOW_DISPATCHED",
-    "progress": 2,
+    "status": "failed",
+    "stage": "SUBMIT_FAILED",
+    "progress": 0,
     "createdAt": 1790846855170,
-    "updatedAt": 1790846858601,
+    "updatedAt": 1790846859918,
     "callbackSecretHash": "e334e460fd1740f0eefa1c1f4b7270415f4147d1e5c7c5d5c0c4b37e6424dbd1",
     "callbackUrl": "https://cloud-logic-raven-zy.vercel.app/api/build-callback",
     "sourceFilename": "Flutter CHIKZXATOMIC.zip.zip",
@@ -67,6 +67,7 @@
     "sourceReleaseTag": "raven-build-mupbz94y-57a6cd08",
     "targetChatId": 8696140641,
     "targetMessageId": 1907,
-    "channelMessageId": 77
+    "channelMessageId": 77,
+    "error": "Invalid request.\n\nNo more than 10 properties are allowed; 11 were supplied."
   }
 ]
