@@ -63,24 +63,24 @@ Workflow memeriksa:
 
 ## Progress build
 
-Progress dibuat monoton agar status tidak turun karena callback terlambat:
+Progress dibuat monoton dan memiliki update lifecycle sejak worker dimulai agar monitoring tidak terlihat berhenti pada 4%:
 
-`2 → 4 → 22 → 38 → 54 → 60 → 68 → 78 → 90 → 95 → 100`
+`2 → 6 → 10 → 12 → 14 → 24 → 30 → 38 → 54 → 62 → 70 → 80 → 91 → 95 → 100`
 
-Download/upload byte-progress tidak boleh menurunkan progress tahap utama.
+Download/upload byte-progress tetap mengikuti tahap utama tanpa menurunkan progress.
 
 ## Channel / chat UI
 
 Status build memakai format premium yang berisi informasi User, User ID, Project, Mode, Source, Source size, APK size, Server, Developer, Build ID, Stage, Status, Progress, Durasi, dan waktu selesai.
 
-Asset yang dipakai hanya asset existing project:
+Asset UI build memakai hanya file yang sudah ada di `assets/`:
 
 - `assets/raven-welcome.jpg`
 - `assets/raven-goodbye.jpg`
 - `assets/raven-response.jpg`
 - `assets/raven-build-success.jpg`
 
-Tidak ada gambar/icon baru yang diperlukan.
+Tidak ada gambar/icon baru yang ditambahkan.
 
 ## Persistence session Vercel
 
