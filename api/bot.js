@@ -19,16 +19,23 @@ const ENV = {
   VERCEL_HOOK: process.env.VERCEL_HOOK,
   VERCEL_TEAM_ID: process.env.VERCEL_TEAM_ID || '',
   NETLIFY_TOKEN: process.env.NETLIFY_TOKEN,
+  // Opsional: gunakan Local Bot API Server / proxy yang mendukung download file besar.
+  TELEGRAM_API_ROOT: process.env.TELEGRAM_API_ROOT || process.env.TELEGRAM_LOCAL_API_ROOT || '',
 };
 
 function requireConfig() {
   const required = ['BOT_TOKEN', 'OWNER_ID', 'GH_TOKEN', 'GH_OWNER', 'GH_REPO', 'VERCEL_TOKEN'];
   const missing = required.filter((k) => !ENV[k]);
   if (missing.length) console.error(`[CONFIG] Missing: ${missing.join(', ')}`);
+  if (ENV.TELEGRAM_API_ROOT) console.log(`[CONFIG] Custom Telegram API root enabled: ${ENV.TELEGRAM_API_ROOT}`);
 }
 requireConfig();
 
-const bot = new Telegraf(ENV.BOT_TOKEN);
+const bot = new Telegraf(ENV.BOT_TOKEN, {
+  telegram: {
+    apiRoot: ENV.TELEGRAM_API_ROOT || 'https://api.telegram.org',
+  },
+});
 const OWNER_ID = Number(ENV.OWNER_ID);
 const sessions = new Map();
 const userProfiles = new Map();
@@ -56,6 +63,17 @@ const OWNER_WHATSAPP_URL = 'https://wa.me/6288271102065';
 const OWNER_CHANNEL_URL = 'https://whatsapp.com/channel/0029Vb89MImFHWptXTOThg3G';
 const BUY_MESSAGE = 'Saya ingin membeli akses Get Repo/Cari Repo DevTools dengan harga 5k, tolong di acc';
 const BUY_ACCESS_URL = `${OWNER_TELEGRAM_URL}?text=${encodeURIComponent(BUY_MESSAGE)}`;
+
+// Telegram Bot API resmi saat ini hanya mengizinkan getFile/download sampai 20 MB.
+// Build Flutter tetap bisa menerima ZIP >20 MB melalui Local Bot API Server (opsional)
+// atau melalui URL GitHub/direct HTTPS ZIP.
+const TELEGRAM_OFFICIAL_DOWNLOAD_LIMIT = 20 * 1024 * 1024;
+const FLUTTER_REMOTE_SOURCE_LIMIT = 150 * 1024 * 1024;
+const FLUTTER_MAX_FILES = 6000;
+const FLUTTER_MAX_UNCOMPRESSED = 300 * 1024 * 1024;
+const FLUTTER_SKIP_DIRS = new Set([
+  '.git', '.dart_tool', 'build', 'node_modules', '.gradle', '.idea', '.vscode', 'coverage',
+]);
 
 const GH_API = 'https://api.github.com';
 const VERCEL_API = 'https://api.vercel.com';
@@ -1350,14 +1368,255 @@ function detectGenerateBotWebhookPath(files) {
 }
 
 
-async function downloadTelegramFile(ctx, fileId) {
+function isCustomTelegramApiConfigured() {
+  return Boolean(ENV.TELEGRAM_API_ROOT);
+}
+
+function formatBytes(bytes) {
+  const n = Number(bytes) || 0;
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  if (n < 1024 * 1024 * 1024) return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+  return `${(n / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+}
+
+function isZipBuffer(buffer) {
+  if (!Buffer.isBuffer(buffer) || buffer.length < 4) return false;
+  return buffer[0] === 0x50 && buffer[1] === 0x4b && (buffer[2] === 0x03 || buffer[2] === 0x05 || buffer[2] === 0x07);
+}
+
+function isPrivateOrLocalHostname(hostname) {
+  const host = String(hostname || '').trim().toLowerCase();
+  if (!host) return true;
+  if (['localhost', 'localhost.localdomain', 'ip6-localhost', 'ip6-loopback'].includes(host)) return true;
+  if (host.endsWith('.local') || host.endsWith('.internal') || host.endsWith('.lan')) return true;
+  const ipVersion = require('net').isIP(host);
+  if (ipVersion === 4) {
+    const parts = host.split('.').map(Number);
+    if (parts[0] === 10) return true;
+    if (parts[0] === 127) return true;
+    if (parts[0] === 169 && parts[1] === 254) return true;
+    if (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31) return true;
+    if (parts[0] === 192 && parts[1] === 168) return true;
+    if (parts[0] === 100 && parts[1] >= 64 && parts[1] <= 127) return true;
+  }
+  if (ipVersion === 6) {
+    if (host === '::1' || host === '::') return true;
+    if (host.startsWith('fc') || host.startsWith('fd') || host.startsWith('fe8') || host.startsWith('fe9') || host.startsWith('fea') || host.startsWith('feb')) return true;
+  }
+  return false;
+}
+
+async function assertSafeRemoteUrl(rawUrl) {
+  let parsed;
+  try {
+    parsed = new URL(String(rawUrl).trim());
+  } catch (_) {
+    throw new Error('URL source tidak valid.');
+  }
+  if (parsed.protocol !== 'https:') throw new Error('Source URL wajib menggunakan HTTPS.');
+  if (isPrivateOrLocalHostname(parsed.hostname)) throw new Error('Host source tidak diizinkan.');
+  return parsed;
+}
+
+async function downloadHttpsBuffer(rawUrl, label = 'source') {
+  const parsed = await assertSafeRemoteUrl(rawUrl);
+  const response = await axios.get(parsed.toString(), {
+    responseType: 'arraybuffer',
+    timeout: 180000,
+    maxContentLength: FLUTTER_REMOTE_SOURCE_LIMIT,
+    maxBodyLength: FLUTTER_REMOTE_SOURCE_LIMIT,
+    maxRedirects: 5,
+    headers: { 'User-Agent': 'Builder-By-Raven/3.0' },
+    validateStatus: (status) => status >= 200 && status < 400,
+  });
+  const buffer = Buffer.from(response.data);
+  if (!buffer.length) throw new Error(`${label} kosong.`);
+  if (buffer.length > FLUTTER_REMOTE_SOURCE_LIMIT) throw new Error(`${label} terlalu besar. Maksimal ${formatBytes(FLUTTER_REMOTE_SOURCE_LIMIT)}.`);
+  return { buffer, contentType: String(response.headers?.['content-type'] || '') };
+}
+
+function parseGitHubRepoUrl(input) {
+  let parsed;
+  try {
+    parsed = new URL(String(input).trim());
+  } catch (_) {
+    return null;
+  }
+  if (!/^https?:$/i.test(parsed.protocol)) return null;
+  if (parsed.hostname.toLowerCase() !== 'github.com') return null;
+  const parts = parsed.pathname.split('/').filter(Boolean);
+  if (parts.length < 2) return null;
+  const owner = parts[0];
+  let repo = parts[1].replace(/\.git$/i, '');
+  if (!owner || !repo) return null;
+
+  let ref = null;
+  if (parts[2] === 'tree' && parts[3]) ref = parts.slice(3).join('/');
+  if (parts[2] === 'archive' && parts.length >= 5 && parts[3] === 'refs' && parts[4] === 'heads') {
+    ref = parts.slice(5).join('/') || null;
+  }
+  return { owner, repo, ref };
+}
+
+async function downloadGitHubFlutterRepo(input) {
+  const parsed = parseGitHubRepoUrl(input);
+  if (!parsed) return null;
+  const repoResponse = await axios.get(`${GH_API}/repos/${encodeURIComponent(parsed.owner)}/${encodeURIComponent(parsed.repo)}`, {
+    headers: ghHeaders,
+    timeout: 30000,
+    validateStatus: (status) => status >= 200 && status < 500,
+  });
+  if (repoResponse.status >= 400) throw new Error(`GitHub repository tidak dapat diakses (HTTP ${repoResponse.status}).`);
+  const defaultBranch = String(repoResponse.data?.default_branch || 'main');
+  const ref = parsed.ref || defaultBranch;
+  const zipUrl = `${GH_API}/repos/${encodeURIComponent(parsed.owner)}/${encodeURIComponent(parsed.repo)}/zipball/${encodeURIComponent(ref)}`;
+  const response = await axios.get(zipUrl, {
+    headers: ghHeaders,
+    responseType: 'arraybuffer',
+    timeout: 180000,
+    maxContentLength: FLUTTER_REMOTE_SOURCE_LIMIT,
+    maxBodyLength: FLUTTER_REMOTE_SOURCE_LIMIT,
+    maxRedirects: 5,
+    validateStatus: (status) => status >= 200 && status < 400,
+  });
+  const buffer = Buffer.from(response.data);
+  if (!isZipBuffer(buffer)) throw new Error('GitHub tidak mengembalikan ZIP project.');
+  if (buffer.length > FLUTTER_REMOTE_SOURCE_LIMIT) throw new Error(`Repository ZIP terlalu besar. Maksimal ${formatBytes(FLUTTER_REMOTE_SOURCE_LIMIT)}.`);
+  return {
+    buffer,
+    label: `GitHub · ${parsed.owner}/${parsed.repo} · ${ref}`,
+    sourceType: 'github',
+    sourceName: repoSafeName(parsed.repo),
+  };
+}
+
+async function downloadFlutterSourceFromText(input) {
+  const textValue = String(input || '').trim();
+  if (!textValue) throw new Error('URL source kosong.');
+
+  // GitHub repo / tree / archive URL.
+  const githubResult = await downloadGitHubFlutterRepo(textValue);
+  if (githubResult) return githubResult;
+
+  // Direct HTTPS ZIP.
+  const { buffer, contentType } = await downloadHttpsBuffer(textValue, 'ZIP source');
+  const lowerType = contentType.toLowerCase();
+  if (!isZipBuffer(buffer) && !lowerType.includes('zip') && !/\.zip(?:\?|#|$)/i.test(textValue)) {
+    throw new Error('URL tidak menunjuk ke file ZIP. Gunakan URL HTTPS langsung ke .zip atau repository GitHub.');
+  }
+  const parsed = new URL(textValue);
+  const fallbackName = path.basename(parsed.pathname).replace(/\.zip$/i, '') || 'raven-flutter-build';
+  return {
+    buffer,
+    label: `HTTPS ZIP · ${parsed.hostname}`,
+    sourceType: 'https-zip',
+    sourceName: repoSafeName(fallbackName),
+  };
+}
+
+async function downloadTelegramFile(ctx, fileId, declaredSize = 0) {
+  const size = Number(declaredSize) || 0;
+  if (size > FLUTTER_REMOTE_SOURCE_LIMIT) {
+    throw new Error(`TELEGRAM_SOURCE_TOO_BIG: ${formatBytes(size)} melebihi batas build ${formatBytes(FLUTTER_REMOTE_SOURCE_LIMIT)}.`);
+  }
+  if (size > TELEGRAM_OFFICIAL_DOWNLOAD_LIMIT && !isCustomTelegramApiConfigured()) {
+    throw new Error(`FILE_TOO_BIG_TELEGRAM: ${formatBytes(size)} melebihi batas download Bot API resmi 20 MB. Kirim URL GitHub/HTTPS ZIP, atau pasang TELEGRAM_API_ROOT ke Local Bot API Server.`);
+  }
   const link = await ctx.telegram.getFileLink(fileId);
   const response = await axios.get(link.href || link, {
     responseType: 'arraybuffer',
-    timeout: 120000,
-    maxContentLength: 200 * 1024 * 1024,
+    timeout: 180000,
+    maxContentLength: size ? FLUTTER_REMOTE_SOURCE_LIMIT : 200 * 1024 * 1024,
+    maxBodyLength: size ? FLUTTER_REMOTE_SOURCE_LIMIT : 200 * 1024 * 1024,
   });
   return Buffer.from(response.data);
+}
+
+async function extractFlutterZip(buffer) {
+  if (!isZipBuffer(buffer)) throw new Error('Source bukan ZIP yang valid.');
+  const zip = await JSZip.loadAsync(buffer);
+  const raw = [];
+  let totalBytes = 0;
+
+  for (const [entryPath, entry] of Object.entries(zip.files)) {
+    if (entry.dir) continue;
+    const clean = normalizeZipPath(entryPath);
+    if (!clean) continue;
+    if (raw.length >= FLUTTER_MAX_FILES) throw new Error(`Project memiliki terlalu banyak file. Maksimal ${FLUTTER_MAX_FILES} file.`);
+    const fileBuffer = await entry.async('nodebuffer');
+    totalBytes += fileBuffer.length;
+    if (totalBytes > FLUTTER_MAX_UNCOMPRESSED) {
+      throw new Error(`Isi ZIP terlalu besar. Maksimal ${formatBytes(FLUTTER_MAX_UNCOMPRESSED)} setelah diekstrak.`);
+    }
+    raw.push({ path: clean, buffer: fileBuffer });
+  }
+  if (!raw.length) throw new Error('ZIP kosong.');
+
+  const hasRootPubspec = raw.some((f) => f.path.toLowerCase() === 'pubspec.yaml');
+  if (hasRootPubspec) return raw;
+
+  // Ratakan satu folder pembungkus agar pubspec.yaml berada di root build repo.
+  const topFolders = new Set(raw.map((f) => f.path.split('/')[0]));
+  if (topFolders.size === 1) {
+    const [prefix] = topFolders;
+    const flattened = raw
+      .map((f) => ({ path: f.path.slice(prefix.length + 1), buffer: f.buffer }))
+      .filter((f) => f.path);
+    if (flattened.some((f) => f.path.toLowerCase() === 'pubspec.yaml')) return flattened;
+  }
+  return raw;
+}
+
+function sanitizeFlutterBuildFiles(files) {
+  const out = [];
+  let removedCount = 0;
+  let removedBytes = 0;
+  for (const file of Array.isArray(files) ? files : []) {
+    const clean = normalizeZipPath(file?.path || '');
+    if (!clean || !Buffer.isBuffer(file?.buffer)) continue;
+    const shouldSkip = clean.split('/').some((part) => FLUTTER_SKIP_DIRS.has(String(part).toLowerCase()));
+    if (shouldSkip) {
+      removedCount += 1;
+      removedBytes += file.buffer.length;
+      continue;
+    }
+    out.push({ path: clean, buffer: file.buffer });
+  }
+  return { files: out, removedCount, removedBytes };
+}
+
+async function startFlutterBuildFromFiles(ctx, session, files, sourceMeta = {}) {
+  const id = uid(ctx);
+  const sanitized = sanitizeFlutterBuildFiles(files);
+  const buildFiles = sanitized.files;
+  const pubspec = buildFiles.find((f) => f.path.toLowerCase() === 'pubspec.yaml')
+    || buildFiles.find((f) => /(^|\/)pubspec\.yaml$/i.test(f.path));
+  if (!pubspec) throw new Error('pubspec.yaml tidak ditemukan. ZIP/URL harus berisi project Flutter.');
+  if (!buildFiles.length) throw new Error('Tidak ada file source yang bisa diproses setelah membersihkan cache/generated files.');
+
+  session.files = buildFiles;
+  session.name = repoSafeName(sourceMeta.sourceName || session.name || 'raven-flutter-build');
+  session.sourceType = sourceMeta.sourceType || session.sourceType || 'telegram';
+  session.sourceLabel = sourceMeta.label || session.sourceLabel || 'Telegram ZIP';
+  session.cleanedFiles = sanitized.removedCount;
+  session.cleanedBytes = sanitized.removedBytes;
+  session.step = 'deploying';
+  sessions.set(id, session);
+
+  const status = await sendPanel(ctx, panel({
+    heading: '💎 <b>RAVEN FLUTTER BUILD</b>',
+    box: infoBox([
+      ['⚙️ Mode', session.mode.toUpperCase()],
+      ['📦 Project', `<code>${escapeHtml(session.name)}</code>`],
+      ['📥 Source', escapeHtml(session.sourceLabel)],
+      ['🧹 Cleanup', `<b>${sanitized.removedCount}</b> file cache/generated dibuang`],
+      ['🛰️ Engine', 'GitHub Actions'],
+      ['📝 Activity', 'Source siap dikirim ke build server…'],
+    ]),
+    footer: 'Build nyata • APK akan dikirim otomatis setelah selesai.',
+  }));
+  await runGithubActionsBuild(ctx, session, status);
 }
 
 async function tryGetVercelProject(idOrName) {
@@ -1959,6 +2218,10 @@ async function runGithubActionsBuild(ctx, session, statusMessage) {
       sourceRepoOwner: baseOwner,
       sourceRepoName: baseRepo,
       sourceBranch: baseBranch,
+      sourceType: session.sourceType || 'telegram',
+      sourceLabel: session.sourceLabel || 'Telegram ZIP',
+      cleanedFileCount: Number(session.cleanedFiles || 0),
+      cleanedBytes: Number(session.cleanedBytes || 0),
     };
     await upsertBuildRecord(record);
 
@@ -1998,7 +2261,7 @@ async function runGithubActionsBuild(ctx, session, statusMessage) {
     if (buildRepo?.owner?.login && buildRepo?.name) { try { await deleteBuildRepo(buildRepo.owner.login, buildRepo.name); } catch (_) {} }
     await editPanel(ctx, statusMessage.message_id, panel({ heading: '<b>BUILD GAGAL ❌</b>', box: infoBox([
       ['⚠️ Penyebab', escapeHtml(safe)],
-      ['📦 ZIP Project', record?.sourceAssetId ? '✅ Tersimpan di Server' : '❌ Belum berhasil dibuat'],
+      ['📦 Source', record?.sourceAssetId ? '✅ Tersimpan di Server' : '❌ Belum berhasil dibuat'],
     ]), body: 'Build gagal pada tahap pengiriman/penyiapan.' }), homeButton());
     sessions.delete(id);
   }
@@ -2618,13 +2881,16 @@ async function notifyChannelBuildStart(record) {
       `🆔  User ID   : <code>${record.userId}</code>`,
       `📦  Project   : <code>${escapeHtml(record.projectName || '-')}</code>`,
       `🔑  Build ID  : <code>${escapeHtml(record.id)}</code>`,
-      `⚙️  Engine    : Server`,
+      `⚙️  Engine    : <b>GitHub Actions</b>`,
+      `📥  Source    : <b>${escapeHtml(record.sourceLabel || record.sourceType || 'Telegram ZIP')}</b>`,
       `📊  Status    : <b>⏳ QUEUED</b>`,
       `⏰  Waktu     : ${escapeHtml(formatWib())}`,
     ];
 
     const caption = [
-      premiumHeader('🚀  BUILD BARU DIMULAI  🚀'),
+      '╭━━━〔 💎 RAVEN BUILD CENTER 💎 〕━━━╮',
+      '┃ 🚀  BUILD BARU DIMULAI',
+      '╰━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╯',
       '',
       premiumBox('📋  INFORMASI BUILD', infoLines),
       '',
@@ -2675,6 +2941,7 @@ async function notifyChannelBuildStage(record, stage, status, runId, extra = '')
       `👤  User      : <b>${escapeHtml(record.userName || 'Unknown')}</b>`,
       `🆔  User ID   : <code>${record.userId}</code>`,
       `📦  Project   : <code>${escapeHtml(record.projectName || '-')}</code>`,
+      `📥  Source    : <code>${escapeHtml(record.sourceLabel || record.sourceType || '-')}</code>`,
       `🔑  Build ID  : <code>${escapeHtml(record.id)}</code>`,
       `📡  Stage     : <code>${escapeHtml(stage)}</code>`,
       `${emoji}  Status    : <b>${escapeHtml(String(status || 'unknown').toUpperCase())}</b>`,
@@ -2705,7 +2972,9 @@ async function notifyChannelBuildStage(record, stage, status, runId, extra = '')
 
     // ─── SUSUN CAPTION GAYA PANEL PREMIUM ───
     const caption = [
-      premiumHeader(headerTitle),
+      '╭━━━〔 💎 RAVEN BUILD CENTER 💎 〕━━━╮',
+      `┃ ${headerTitle.replace(/<[^>]+>/g, '').trim()}`,
+      '╰━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╯',
       '',
       premiumBox('📋  INFORMASI BUILD', infoLines),
       '',
@@ -3273,7 +3542,7 @@ bot.action(/^flutter_mode:(debug|release)$/, async (ctx) => {
   const id = uid(ctx);
   const mode = String(ctx.match[1]);
   sessions.set(id, { type: 'flutter_build', step: 'file', mode, platform: 'github', createdAt: Date.now() });
-  await sendPrompt(ctx, `Build Flutter APK — ${mode.toUpperCase()}`, 'Kirim ZIP project Flutter.\nWajib ada <code>pubspec.yaml</code>.', sessions.get(id));
+  await sendPrompt(ctx, `Build Flutter APK — ${mode.toUpperCase()}`, 'Kirim ZIP project Flutter. Wajib ada <code>pubspec.yaml</code>.\n\n<b>ZIP >20 MB:</b> kirim URL repository GitHub atau URL HTTPS langsung ke ZIP.', sessions.get(id));
 });
 
 bot.action('web_to_apk', async (ctx) => {
@@ -3489,6 +3758,38 @@ bot.on('text', async (ctx) => {
     } catch (error) {
       await editPanel(ctx, status.message_id, panel({ heading: '<b>FIX CODE GAGAL ❌</b>', body: `<code>${escapeHtml(safeError(error))}</code>` }), homeButton());
       await notifyChannelText('🧯 FIX CODE GAGAL', ctx, `<code>${escapeHtml(safeError(error))}</code>`);
+    }
+    return;
+  }
+
+  if (session.type === 'flutter_build' && session.step === 'file') {
+    if (!/^https:\/\//i.test(text)) {
+      await sendPrompt(ctx, 'Build Flutter APK', '❌ Kirim <code>URL GitHub</code> atau <code>URL HTTPS langsung ke ZIP</code>.', session);
+      return;
+    }
+    try {
+      const loading = await sendPanel(ctx, panel({
+        heading: '🔗 <b>SOURCE REMOTE FLUTTER</b>',
+        box: infoBox([
+          ['📥 Source', '<b>DOWNLOADING</b>'],
+          ['🔐 Protocol', 'HTTPS'],
+          ['📝 Activity', 'Mengambil source…'],
+        ]),
+        footer: 'Source remote akan divalidasi sebelum build.',
+      }));
+      const remote = await downloadFlutterSourceFromText(text);
+      const files = await extractFlutterZip(remote.buffer);
+      await ctx.telegram.editMessageText(ctx.chat.id, loading.message_id, undefined, panel({
+        heading: '🔗 <b>SOURCE REMOTE OK ✅</b>',
+        box: infoBox([
+          ['📥 Source', escapeHtml(remote.label)],
+          ['📦 ZIP', formatBytes(remote.buffer.length)],
+          ['📝 Activity', 'Memulai build Flutter…'],
+        ]),
+      }), REPLY_OPTS).catch(() => {});
+      await startFlutterBuildFromFiles(ctx, session, files, remote);
+    } catch (error) {
+      await sendPrompt(ctx, 'Build Flutter APK', `❌ <b>Source remote gagal diproses.</b>\n\n<code>${escapeHtml(safeError(error))}</code>`, session);
     }
     return;
   }
@@ -4015,31 +4316,27 @@ bot.on('document', async (ctx) => {
 
   if (session.type === 'flutter_build' && session.step === 'file') {
     if (!/\.zip$/i.test(fileName)) {
-      await sendPrompt(ctx, 'Build Flutter APK', '❌ Kirim file <code>.zip</code> project Flutter.', session);
+      await sendPrompt(ctx, 'Build Flutter APK', '❌ <b>Format salah.</b>\n\nKirim file <code>.zip</code> project Flutter, atau ketik URL GitHub/HTTPS ZIP.', session);
       return;
     }
     try {
-      const buffer = await downloadTelegramFile(ctx, document.file_id);
-      const files = await extractZipGeneric(buffer);
-      if (!files.some((f) => /(^|\/)pubspec\.yaml$/i.test(f.path))) {
-        await sendPrompt(ctx, 'Build Flutter APK', '❌ <b>pubspec.yaml tidak ditemukan.</b> Pastikan ZIP benar-benar berisi project Flutter.', session);
+      const declaredSize = Number(document.file_size || 0);
+      if (declaredSize > TELEGRAM_OFFICIAL_DOWNLOAD_LIMIT && !isCustomTelegramApiConfigured()) {
+        session.sourceType = 'telegram-too-large';
+        session.sourceLabel = `Telegram ZIP ${formatBytes(declaredSize)}`;
+        await sendPrompt(ctx, 'Build Flutter APK',
+          `❌ <b>ZIP ${escapeHtml(formatBytes(declaredSize))} terlalu besar untuk download Bot API standar.</b>\n\n` +
+          'Kirim <b>URL repository GitHub</b> atau <b>URL HTTPS langsung ke ZIP</b>.\n' +
+          'Alternatif: pasang <code>TELEGRAM_API_ROOT</code> ke Local Bot API Server agar upload ZIP besar bisa dipakai langsung.', session);
         return;
       }
-      session.files = files;
-      session.name = repoSafeName(fileName.replace(/\.zip$/i, '')) || 'raven-flutter-build';
-      session.step = 'deploying';
-      sessions.set(id, session);
-      const status = await sendPanel(ctx, panel({
-        heading: '📊 <b>BUILD FLUTTER APK</b>',
-        box: infoBox([
-          ['⚙️ Mode', session.mode.toUpperCase()],
-          ['📦 Project', `<code>${escapeHtml(session.name)}</code>`],
-          ['🛰️ Engine', 'Server'],
-          ['📝 Activity', 'Menyiapkan proses build…'],
-        ]),
-        footer: 'Build nyata. APK dikirim setelah Server selesai memproses.',
-      }));
-      await runGithubActionsBuild(ctx, session, status);
+      const buffer = await downloadTelegramFile(ctx, document.file_id, declaredSize);
+      const files = await extractFlutterZip(buffer);
+      await startFlutterBuildFromFiles(ctx, session, files, {
+        sourceType: 'telegram',
+        sourceLabel: `Telegram ZIP · ${formatBytes(declaredSize || buffer.length)}`,
+        sourceName: fileName.replace(/\.zip$/i, ''),
+      });
     } catch (error) {
       await sendPrompt(ctx, 'Build Flutter APK', `❌ <b>Project tidak bisa diproses.</b>\n\n<code>${escapeHtml(safeError(error))}</code>`, session);
     }
