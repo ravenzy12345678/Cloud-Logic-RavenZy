@@ -79,12 +79,13 @@ async def build_client() -> TelegramClient:
         StringSession(),
         api_id,
         api_hash,
-        connection_retries=5,
-        request_retries=3,
+        connection_retries=2,
+        request_retries=2,
+        retry_delay=2,
         auto_reconnect=True,
         sequential_updates=False,
     )
-    await client.start(bot_token=bot_token)
+    await asyncio.wait_for(client.start(bot_token=bot_token), timeout=75)
     return client
 
 
@@ -96,9 +97,11 @@ async def download_source(callback: Callback) -> Path:
     if expected_size > MAX_BYTES:
         raise RuntimeError(f"Source exceeds {MAX_BYTES} bytes.")
 
+    callback.send("running", "TELEGRAM_CONNECTING", 12, source_size=expected_size)
     client = await build_client()
     try:
-        message = await client.get_messages(chat_id, ids=message_id)
+        callback.send("running", "TELEGRAM_SESSION_READY", 13, source_size=expected_size)
+        message = await asyncio.wait_for(client.get_messages(chat_id, ids=message_id), timeout=30)
         if not message or not message.file:
             raise RuntimeError("Pesan Telegram tidak memiliki file document yang dapat diunduh.")
         media_size = int(getattr(message.file, "size", 0) or 0)
@@ -116,13 +119,21 @@ async def download_source(callback: Callback) -> Path:
                 bytes_total=int(total or media_size or expected_size),
             )
 
-        await client.download_media(message, file=str(target), progress_callback=progress)
+        media = message.media
+        written = 0
+        with target.open('wb') as handle:
+            async for chunk in client.iter_download(media, request_size=512 * 1024):
+                handle.write(chunk)
+                written += len(chunk)
+                progress(written, media_size or expected_size)
+        if media_size and written != media_size:
+            raise RuntimeError(f"Source ZIP tidak lengkap. Diterima {written} dari {media_size} bytes.")
         if not target.exists() or target.stat().st_size <= 0:
             raise RuntimeError("Source ZIP tidak berhasil diunduh.")
         actual = target.stat().st_size
         if actual > MAX_BYTES:
             raise RuntimeError("Source ZIP melebihi batas 2 GB setelah diunduh.")
-        callback.send("running", "SOURCE_DOWNLOADED", 22, source_size=actual, source_sha256=sha256(target))
+        callback.send("running", "SOURCE_DOWNLOADED", 24, source_size=actual, source_sha256=sha256(target))
         return target
     finally:
         await client.disconnect()
@@ -138,10 +149,11 @@ async def send_file(callback: Callback) -> Path:
         raise RuntimeError("Output file tidak valid atau melebihi 2 GB.")
 
     caption = os.environ.get("APK_CAPTION", "✅ APK BUILD SELESAI")[:1000]
+    callback.send("running", "TELEGRAM_CONNECTING", 93, apk_size=size, apk_filename=file_path.name)
     client = await build_client()
     started = time.time()
     try:
-        callback.send("running", "SENDING_APK", 90, apk_size=size, apk_filename=file_path.name)
+        callback.send("running", "SENDING_APK", 95, apk_size=size, apk_filename=file_path.name)
 
         def progress(current: int, total: int) -> None:
             pct = int((current * 100) / total) if total else 0
@@ -161,6 +173,7 @@ async def send_file(callback: Callback) -> Path:
             caption=caption,
             force_document=True,
             parse_mode="html",
+            part_size_kb=512,
             progress_callback=progress,
         )
         elapsed = int(time.time() - started)
