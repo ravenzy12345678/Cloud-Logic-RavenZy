@@ -123,6 +123,16 @@ jobs:
           test -n "$TARGET_CHAT_ID" || { echo "TARGET_CHAT_ID belum tersedia" >&2; exit 1; }
           echo "✅ Invocation valid: $MODE / $JOB_ID"
 
+      - name: Build worker started
+        shell: bash
+        run: |
+          python - <<'PY' || true
+          import os, json, urllib.request
+          payload={'jobId':os.environ['JOB_ID'],'secret':os.environ['CALLBACK_SECRET'],'status':'running','stage':'WORKER_STARTING','progress':6,'runId':os.environ.get('GITHUB_RUN_ID')}
+          req=urllib.request.Request(os.environ['CALLBACK_URL'],data=json.dumps(payload).encode(),headers={'Content-Type':'application/json'},method='POST')
+          with urllib.request.urlopen(req,timeout=15) as r: r.read()
+          PY
+
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
@@ -133,6 +143,16 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           python -m pip install 'Telethon>=1.40,<2'
+
+      - name: MTProto worker ready
+        shell: bash
+        run: |
+          python - <<'PY' || true
+          import os, json, urllib.request
+          payload={'jobId':os.environ['JOB_ID'],'secret':os.environ['CALLBACK_SECRET'],'status':'running','stage':'WORKER_READY','progress':10,'runId':os.environ.get('GITHUB_RUN_ID')}
+          req=urllib.request.Request(os.environ['CALLBACK_URL'],data=json.dumps(payload).encode(),headers={'Content-Type':'application/json'},method='POST')
+          with urllib.request.urlopen(req,timeout=15) as r: r.read()
+          PY
 
       - name: Telegram → runner source transfer
         shell: bash
@@ -169,8 +189,18 @@ jobs:
                       raise SystemExit(f'Path ZIP tidak aman: {info.filename}')
                   total += int(info.file_size or 0)
                   if total > max_uncompressed:
-                      raise SystemExit('Isi ZIP terkompresi terlalu besar (>8 GB).')
+                      raise SystemExit('Isi ZIP terkompresi terlalu besar (>6 GB).')
           print(f'✅ ZIP valid: compressed={size} bytes, entries={len(infos)}, uncompressed={total} bytes')
+          PY
+
+      - name: Source validated callback
+        shell: bash
+        run: |
+          python - <<'PY' || true
+          import os, json, urllib.request
+          payload={'jobId':os.environ['JOB_ID'],'secret':os.environ['CALLBACK_SECRET'],'status':'running','stage':'SOURCE_VALIDATED','progress':30,'runId':os.environ.get('GITHUB_RUN_ID'),'source_filename':os.environ.get('SOURCE_FILENAME'),'source_size':os.path.getsize(os.environ['SOURCE_PATH'])}
+          req=urllib.request.Request(os.environ['CALLBACK_URL'],data=json.dumps(payload).encode(),headers={'Content-Type':'application/json'},method='POST')
+          with urllib.request.urlopen(req,timeout=15) as r: r.read()
           PY
 
       - name: Backup source to private GitHub storage
@@ -277,8 +307,13 @@ jobs:
             "platform-tools" \
             "platforms;android-34" \
             "platforms;android-35" \
+            "platforms;android-36" \
             "build-tools;34.0.0" \
             "build-tools;35.0.0"
+          SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}"
+          if [ -n "$SDK_ROOT" ] && [ ! -d "$SDK_ROOT/ndk/27.0.12077973" ]; then
+            sdkmanager "ndk;27.0.12077973"
+          fi
 
       - name: Toolchain ready callback
         shell: bash
@@ -354,6 +389,26 @@ jobs:
           except FileNotFoundError: pass
           print(f'✅ Flutter project detected: {name}')
           PY
+
+      - name: Normalize runner-local Android paths
+        working-directory: ${{ env.PROJECT_PATH }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}"
+          test -n "$SDK_ROOT" || { echo "Android SDK path tidak tersedia di runner." >&2; exit 1; }
+          test -n "${FLUTTER_ROOT:-}" || { echo "Flutter SDK path tidak tersedia di runner." >&2; exit 1; }
+          mkdir -p android
+          if [ -f android/local.properties ]; then
+            awk '!/^(flutter\.sdk|sdk\.dir|flutter\.buildMode)=/' android/local.properties > android/local.properties.raven.tmp
+            mv android/local.properties.raven.tmp android/local.properties
+          fi
+          {
+            printf 'flutter.sdk=%s\n' "$FLUTTER_ROOT"
+            printf 'sdk.dir=%s\n' "$SDK_ROOT"
+            printf 'flutter.buildMode=%s\n' "${MODE,,}"
+          } >> android/local.properties
+          echo "✅ Runner paths normalized for this build workspace."
 
       - name: Project validated callback
         env:
