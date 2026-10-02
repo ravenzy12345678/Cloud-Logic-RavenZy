@@ -1,3 +1,12 @@
 {
-  "version": 2
+  "version": 2,
+  "ignoreCommand": "git diff --quiet HEAD^ HEAD -- api assets package.json vercel.json Bot.png",
+  "functions": {
+    "api/bot.js": {
+      "includeFiles": "assets/**"
+    },
+    "api/build-callback.js": {
+      "includeFiles": "assets/**"
+    }
+  }
 }
