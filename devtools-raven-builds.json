@@ -471,7 +471,7 @@
     "stage": "BUILD_FAILED",
     "progress": 95,
     "createdAt": 1790943103199,
-    "updatedAt": 1790943181435,
+    "updatedAt": 1790943182799,
     "callbackSecretHash": "12f16011f9a267281f814fdf8abed03b817b86fbe70d1eb98c28f93be7f588fc",
     "callbackUrl": "https://cloud-logic-raven-zy.vercel.app/api/build-callback",
     "sourceFilename": "Base-Holow-Exekution (1).zip",
@@ -504,6 +504,7 @@
     "sourceAssetId": "RA_kwDOU4t9Cs4kF8qz",
     "sourceAssetFilename": "Base-Holow-Exekution__1_.zip",
     "apkDeliveredAt": null,
-    "completedAt": 1790943181337
+    "completedAt": 1790943181337,
+    "errorLogSentAt": 1790943182608
   }
 ]
