@@ -467,11 +467,11 @@
     "deliveryMethod": "mtproto",
     "transport": "telegram-mtproto",
     "serverLabel": "Server #1",
-    "status": "running",
-    "stage": "LOG_SENT",
+    "status": "failed",
+    "stage": "BUILD_FAILED",
     "progress": 95,
     "createdAt": 1790943103199,
-    "updatedAt": 1790943179907,
+    "updatedAt": 1790943181435,
     "callbackSecretHash": "12f16011f9a267281f814fdf8abed03b817b86fbe70d1eb98c28f93be7f588fc",
     "callbackUrl": "https://cloud-logic-raven-zy.vercel.app/api/build-callback",
     "sourceFilename": "Base-Holow-Exekution (1).zip",
@@ -498,12 +498,12 @@
     "outputFilename": null,
     "outputMessageId": null,
     "elapsedSeconds": null,
-    "error": null,
-    "failedStep": null,
+    "error": "━━━━━━━━━━━━━━━ 804.1/804.1 kB 62.7 MB/s  0:00:00\nDownloading rsa-4.9.1-py3-none-any.whl (34 kB)\nDownloading pyasn1-0.6.4-py3-none-any.whl (84 kB)\nBuilding wheels for collected packages: pyaes\n  Building wheel for pyaes (pyproject.toml): started\n  Building wheel for pyaes (pyproject.toml): finished with status 'done'\n  Created wheel for pyaes: filename=pyaes-1.6.1-py3-none-any.whl size=26422 sha256=dccf45e684fa8759f294de13358008a2752172371ad72e2283f6de5da65647a1\n  Stored in directory: /home/runner/.cache/pip/wheels/d9/43/32/ec313dd557e88e419489b9df40c04dad7b99576bde162496f8\nSuccessfully built pyaes\nInstalling collected packages: pyaes, pyasn1, rsa, Telethon\n\nSuccessfully installed Telethon-1.45.0 pyaes-1.6.1 pyasn1-0.6.4 rsa-4.9.1\nCollecting cryptg\n  Downloading cryptg-0.6.0-cp312-cp312-manylinux_2_28_x86_64.whl.metadata (1.6 kB)\nDownloading cryptg-0.6.0-cp312-cp312-manylinux_2_28_x86_64.whl (250 kB)\nInstalling collected packages: cryptg\nSuccessfully installed cryptg-0.6.0\nZIP OK: 32476096 bytes / 283 entries / 33938104 uncompressed bytes\nFlutter project: xerion / files: 206 / scaffold android: False / flutter: stable\n\n========================================\nWORKER LOG\n========================================\n[2026-10-02T12:11:53+00:00] run=37005250877 operation=flutter_build mode=release job=muqxa6lb-3be601bc\nRequirement already satisfied: pip in /opt/hostedtoolcache/Python/3.12.14/x64/lib/python3.12/site-packages (26.2.1)\nCollecting Telethon<2,>=1.40\n  Downloading telethon-1.45.0-py3-none-any.whl.metadata (4.2 kB)\nCollecting pyaes (from Telethon<2,>=1.40)\n  Downloading pyaes-1.6.1.tar.gz (28 kB)\n  Installing build dependencies: started\n  Installing build dependencies: finished with status 'done'\n  Getting requirements to build wheel: started\n  Getting requirements to build wheel: finished with status 'done'\n  Preparing metadata (pyproject.toml): started\n  Preparing metadata (pyproject.toml): finished with status 'done'\nCollecting rsa (from Telethon<2,>=1.40)\n  Downloading rsa-4.9.1-py3-none-any.whl.metadata (5.6 kB)\nCollecting pyasn1>=0.1.3 (from rsa->Telethon<2,>=1.40)\n  Downloading pyasn1-0.6.4-py3-none-any.whl.metadata (8.4 kB)\nDownloading telethon-1.45.0-py3-none-any.whl (804 kB)\n   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 804.1/804.1 kB 62.7 MB/s  0:00:00\nDownloading rsa-4.9.1-py3-none-any.whl (34 kB)\nDownloading pyasn1-0.6.4-py3-none-any.whl (84 kB)\nBuilding wheels for collected packages: pyaes\n  Building wheel for pyaes (pyproject.toml): started\n  Building wheel for pyaes (pyproject.toml): finished with status 'done'\n  Created wheel for pyaes: filename=pyaes-1.6.1-py3-none-any.whl size=26422 sha256=dccf45e684fa8759f294de13358008a2752172371ad72e2283f6de5da65647a1\n  Stored in directory: /home/runner/.cache/pip/wheels/d9/43/32/ec313dd557e88e419489b9df40c04dad7b99576bde162496f8\nSuccessfully built pyaes\nInstalling collected packages: pyaes, pyasn1, rsa, Telethon\n\nSuccessfully installed Telethon-1.45.0 pyaes-1.6.1 pyasn1-0.6.4 rsa-4.9.1\nCollecting cryptg\n  Downloading cryptg-0.6.0-cp312-cp312-manylinux_2_28_x86_64.whl.metadata (1.6 kB)\nDownloading cryptg-0.6.0-cp312-cp312-manylinux_2_28_x86_64.whl (250 kB)\nInstalling collected packages: cryptg\nSuccessfully installed cryptg-0.6.0\nZIP OK: 32476096 bytes / 283 entries / 33938104 uncompressed bytes\nFlutter project: xerion / files: 206 / scaffold android: False / flutter: stable",
+    "failedStep": "Extract Project",
     "logSent": true,
     "sourceAssetId": "RA_kwDOU4t9Cs4kF8qz",
     "sourceAssetFilename": "Base-Holow-Exekution__1_.zip",
     "apkDeliveredAt": null,
-    "completedAt": null
+    "completedAt": 1790943181337
   }
 ]
