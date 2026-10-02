@@ -138,6 +138,14 @@ async function cancelRun(owner, repo, runId) {
   return true;
 }
 
+async function findRunByJobId(owner, repo, jobId) {
+  const r = await gh('GET', `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/actions/runs`, null, { params: { per_page: 30 }, timeout: 30000 });
+  const runs = r.data?.workflow_runs || [];
+  const needle = String(jobId || '');
+  const hit = runs.find((x) => String(x.display_title || x.name || '').includes(needle)) || runs.find((x) => x.status !== 'completed' && String(repo).includes(needle));
+  return hit ? String(hit.id) : null;
+}
+
 async function getRun(owner, repo, runId) {
   const r = await gh('GET', `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/actions/runs/${encodeURIComponent(runId)}`);
   return r.data;
@@ -231,7 +239,11 @@ jobs:
           set -e
           payload=$(printf '{"jobId":"%s","secret":"%s","status":"RUNNING","stage":"BUILDING_WEB_APK","runId":"%s"}' "$INPUT_JOB_ID" "$INPUT_CALLBACK_SECRET" "$GITHUB_RUN_ID")
           curl -fsS -X POST -H 'content-type: application/json' "$INPUT_CALLBACK_URL" -d "$payload" || true
-          gradle :app:assembleDebug --no-daemon
+          set +e
+          gradle :app:assembleDebug --no-daemon --stacktrace 2>&1 | tee "$RUNNER_TEMP/gradle.log"
+          RC=$PIPESTATUS
+          set -e
+          exit $RC
 
       - name: Upload APK artifact
         if: success()
@@ -251,8 +263,25 @@ jobs:
           JOB_STATUS: \${{ job.status }}
         shell: bash
         run: |
-          payload=$(printf '{"jobId":"%s","secret":"%s","status":"%s","stage":"FINAL","runId":"%s"}' "$INPUT_JOB_ID" "$INPUT_CALLBACK_SECRET" "$JOB_STATUS" "$GITHUB_RUN_ID")
-          curl -fsS -X POST -H 'content-type: application/json' "$INPUT_CALLBACK_URL" -d "$payload" || true
+          python3 - <<'PY'
+          import json, os, urllib.request
+          log = ''
+          try:
+              log = open(os.path.join(os.environ['RUNNER_TEMP'], 'gradle.log'), 'rb').read()[-9000:].decode('utf-8', 'replace')
+          except Exception:
+              log = ''
+          status = os.environ.get('JOB_STATUS', 'failure').lower()
+          payload = {'jobId': os.environ['INPUT_JOB_ID'], 'secret': os.environ['INPUT_CALLBACK_SECRET'], 'status': status, 'stage': 'FINAL', 'runId': os.environ.get('GITHUB_RUN_ID', ''), 'progress': 95}
+          if status != 'success':
+              payload['stage'] = 'BUILD_FAILED'
+              payload['failed_step'] = 'Build APK'
+              payload['error'] = log or 'Build gagal sebelum log Gradle tersedia.'
+          req = urllib.request.Request(os.environ['INPUT_CALLBACK_URL'], data=json.dumps(payload).encode(), headers={'content-type': 'application/json'}, method='POST')
+          try:
+              urllib.request.urlopen(req, timeout=25).read()
+          except Exception as exc:
+              print('callback failed', exc)
+          PY
 `;
 
-module.exports = { env, workflowYml, androidWorkflowYml, safeSlug, createRepo, uploadFiles, dispatchWorkflow, dispatchRepositoryEvent, createRelease, uploadReleaseAsset, downloadReleaseAsset, getArtifact, cancelRun, getRun, downloadRunLogs, deleteRepo, buildId };
+module.exports = { env, workflowYml, androidWorkflowYml, safeSlug, createRepo, uploadFiles, dispatchWorkflow, dispatchRepositoryEvent, createRelease, uploadReleaseAsset, downloadReleaseAsset, getArtifact, cancelRun, findRunByJobId, getRun, downloadRunLogs, deleteRepo, buildId };
