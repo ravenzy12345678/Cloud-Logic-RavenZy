@@ -96,7 +96,7 @@ async function dispatchRepositoryEvent(repo, eventType, clientPayload = {}) {
   const response = await gh('POST', `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repository)}/dispatches`, {
     event_type: String(eventType || 'raven_build').slice(0, 100),
     client_payload: Object.fromEntries(
-      Object.entries(clientPayload || {}).map(([key, value]) => [String(key).slice(0, 100), String(value ?? '')])
+      Object.entries(clientPayload || {}).map(([key, value]) => [String(key).slice(0, 100), (value && typeof value === 'object') ? value : String(value ?? '')])
     ),
   }, { timeout: 30000, validateStatus: (status) => status >= 200 && status < 300 });
   return { dispatched: true, status: response.status || 204 };
