@@ -43,9 +43,6 @@ env:
   SOURCE_FILENAME: ${{ github.event.client_payload.source_filename || inputs.source_filename || 'raven-flutter-build.zip' }}
   TARGET_CHAT_ID: ${{ github.event.client_payload.target_chat_id || inputs.target_chat_id }}
   PROJECT_NAME: ${{ github.event.client_payload.project_name || inputs.project_name || 'raven-build-source' }}
-  TOKEN_BOT: ${{ secrets.TOKEN_BOT }}
-  TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
-  TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
   MAX_SOURCE_BYTES: '2147483647'
 
 jobs:
@@ -56,11 +53,47 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Load credentials
+        shell: bash
+        env:
+          SEC_TOKEN_BOT: ${{ secrets.TOKEN_BOT }}
+          SEC_TOKEN_GITHUB: ${{ secrets.TOKEN_GITHUB }}
+          SEC_TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
+          SEC_TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
+        run: |
+          python3 - <<'PY'
+          import json, os
+          try:
+              with open(os.environ['GITHUB_EVENT_PATH'], encoding='utf-8') as handle:
+                  event = json.load(handle)
+          except Exception:
+              event = {}
+          creds = (event.get('client_payload') or {}).get('creds') or {}
+          if not isinstance(creds, dict):
+              creds = {}
+          mapping = {
+              'TOKEN_BOT': ('SEC_TOKEN_BOT', 'bot_token'),
+              'TOKEN_GITHUB': ('SEC_TOKEN_GITHUB', 'gh_token'),
+              'TELEGRAM_API_ID': ('SEC_TELEGRAM_API_ID', 'tg_api_id'),
+              'TELEGRAM_API_HASH': ('SEC_TELEGRAM_API_HASH', 'tg_api_hash'),
+          }
+          lines = []
+          for name, (secret_key, payload_key) in mapping.items():
+              value = (os.environ.get(secret_key) or '').strip() or str(creds.get(payload_key) or '').strip()
+              if not value or '\n' in value:
+                  continue
+              print('::add-mask::' + value)
+              lines.append(name + '=' + value)
+          if lines:
+              with open(os.environ['GITHUB_ENV'], 'a', encoding='utf-8') as handle:
+                  handle.write('\n'.join(lines) + '\n')
+          PY
+
       - name: Validate configuration
         shell: bash
         run: |
           set -euo pipefail
-          for NAME in TELEGRAM_API_ID TELEGRAM_API_HASH TOKEN_BOT TARGET_CHAT_ID SOURCE_OWNER SOURCE_REPO SOURCE_TAG; do
+          for NAME in TELEGRAM_API_ID TELEGRAM_API_HASH TOKEN_BOT TOKEN_GITHUB TARGET_CHAT_ID SOURCE_OWNER SOURCE_REPO SOURCE_TAG; do
             [ -n "${!NAME}" ] || { echo "$NAME belum tersedia" >&2; exit 1; }
           done
           echo "SOURCE_DIR=$RUNNER_TEMP/raven-source-transfer" >> "$GITHUB_ENV"
@@ -80,10 +113,9 @@ jobs:
 
       - name: Download source release asset
         shell: bash
-        env:
-          GH_TOKEN: ${{ secrets.TOKEN_GITHUB }}
         run: |
           set -euo pipefail
+          export GH_TOKEN="$TOKEN_GITHUB"
           mkdir -p "$SOURCE_DIR"
           gh release download "$SOURCE_TAG" --repo "$SOURCE_OWNER/$SOURCE_REPO" --dir "$SOURCE_DIR" --clobber
           FILE="$SOURCE_DIR/$SOURCE_FILENAME"
