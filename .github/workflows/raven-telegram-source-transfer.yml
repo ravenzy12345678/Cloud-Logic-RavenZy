@@ -1,5 +1,7 @@
 name: Raven Telegram Large Source Transfer
 
+run-name: source-transfer • ${{ github.event.client_payload.job_id || inputs.source_release_tag || github.run_id }}
+
 on:
   repository_dispatch:
     types: [raven_source_transfer]
@@ -44,7 +46,6 @@ env:
   TOKEN_BOT: ${{ secrets.TOKEN_BOT }}
   TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
   TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
-  SOURCE_DIR: ${{ runner.temp }}/raven-source-transfer
   MAX_SOURCE_BYTES: '2147483647'
 
 jobs:
@@ -52,20 +53,17 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 120
     steps:
-      - name: Checkout Builder
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Validate transfer configuration
+      - name: Validate configuration
         shell: bash
         run: |
           set -euo pipefail
-          test -n "$TELEGRAM_API_ID" || { echo "TELEGRAM_API_ID belum diset" >&2; exit 1; }
-          test -n "$TELEGRAM_API_HASH" || { echo "TELEGRAM_API_HASH belum diset" >&2; exit 1; }
-          test -n "$TOKEN_BOT" || { echo "TOKEN_BOT belum diset" >&2; exit 1; }
-          test -n "$TARGET_CHAT_ID" || { echo "TARGET_CHAT_ID belum tersedia" >&2; exit 1; }
-          test -n "$SOURCE_OWNER" || { echo "SOURCE_OWNER belum tersedia" >&2; exit 1; }
-          test -n "$SOURCE_REPO" || { echo "SOURCE_REPO belum tersedia" >&2; exit 1; }
-          test -n "$SOURCE_TAG" || { echo "SOURCE_TAG belum tersedia" >&2; exit 1; }
+          for NAME in TELEGRAM_API_ID TELEGRAM_API_HASH TOKEN_BOT TARGET_CHAT_ID SOURCE_OWNER SOURCE_REPO SOURCE_TAG; do
+            [ -n "${!NAME}" ] || { echo "$NAME belum tersedia" >&2; exit 1; }
+          done
+          echo "SOURCE_DIR=$RUNNER_TEMP/raven-source-transfer" >> "$GITHUB_ENV"
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -73,42 +71,46 @@ jobs:
           python-version: '3.12'
 
       - name: Install MTProto worker
-        run: |
-          python -m pip install --upgrade pip
-          python -m pip install 'Telethon>=1.40,<2'
-
-      - name: Download source release asset
-        env:
-          GH_TOKEN: ${{ secrets.TOKEN_GITHUB }}
         shell: bash
         run: |
           set -euo pipefail
+          python3 -m pip install --upgrade pip
+          python3 -m pip install 'Telethon>=1.40,<2'
+          python3 -m pip install cryptg || true
+
+      - name: Download source release asset
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.TOKEN_GITHUB }}
+        run: |
+          set -euo pipefail
           mkdir -p "$SOURCE_DIR"
-          gh release download "$SOURCE_TAG" \
-            --repo "$SOURCE_OWNER/$SOURCE_REPO" \
-            --dir "$SOURCE_DIR" \
-            --clobber
+          gh release download "$SOURCE_TAG" --repo "$SOURCE_OWNER/$SOURCE_REPO" --dir "$SOURCE_DIR" --clobber
           FILE="$SOURCE_DIR/$SOURCE_FILENAME"
           if [ ! -f "$FILE" ]; then FILE="$(find "$SOURCE_DIR" -maxdepth 1 -type f -print -quit)"; fi
-          test -n "$FILE" && test -f "$FILE"
+          [ -n "$FILE" ] && [ -f "$FILE" ]
           SIZE="$(stat -c '%s' "$FILE")"
-          test "$SIZE" -le "$MAX_SOURCE_BYTES"
-          echo "SOURCE_FILE=$FILE" >> "$GITHUB_ENV"
-          echo "SOURCE_SIZE_ACTUAL=$SIZE" >> "$GITHUB_ENV"
+          [ "$SIZE" -le "$MAX_SOURCE_BYTES" ]
+          {
+            echo "SOURCE_FILE=$FILE"
+            echo "SOURCE_SIZE_ACTUAL=$SIZE"
+            echo "SOURCE_SIZE_MB=$(python3 -c "print(round($SIZE/1048576,2))")"
+          } >> "$GITHUB_ENV"
 
-      - name: Send source to owner via Telegram
+      - name: Send source to owner
+        shell: bash
         env:
-          TARGET: ${{ env.TARGET_CHAT_ID }}
-          FILE_PATH: ${{ env.SOURCE_FILE }}
-          APK_PATH: ${{ env.SOURCE_FILE }}
-          APK_CAPTION: |
-            📦 <b>GET ZIP BUILD — RAVEN</b>
+          OUTPUT_KIND: zip
+          OUTPUT_PATH: ${{ env.SOURCE_FILE }}
+          OUTPUT_CAPTION: |
+            📦 <b>GET ZIP BUILD</b>
+            ━━━━━━━━━━━━━━━━━━━━━
 
-            📋 Project: <code>${{ env.PROJECT_NAME }}</code>
-            📁 Source: <b>${{ env.SOURCE_FILENAME }}</b>
-            📏 Size: <b>${{ env.SOURCE_SIZE_ACTUAL }} bytes</b>
-            ✅ Source ZIP siap dikirim.
+            📋 Project : <code>${{ env.PROJECT_NAME }}</code>
+            📁 Source  : <b>${{ env.SOURCE_FILENAME }}</b>
+            📏 Ukuran  : <b>${{ env.SOURCE_SIZE_MB }} MB</b>
 
-            <i>Transferred via Telegram MTProto • Builder By Raven</i>
-          TELEGRAM_TARGET: ${{ env.TARGET_CHAT_ID }}
-        run: python scripts/raven-telegram-mtproto.py send-file
+            ✅ Source ZIP siap dipakai.
+        run: |
+          set -euo pipefail
+          python3 scripts/raven-telegram-mtproto.py send-file
