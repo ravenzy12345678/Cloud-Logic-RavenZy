@@ -1,5 +1,7 @@
 name: Raven Large Flutter Worker
 
+run-name: ${{ github.event.client_payload.operation || inputs.operation || 'flutter_build' }} • ${{ github.event.client_payload.job_id || inputs.job_id || github.run_id }}
+
 on:
   repository_dispatch:
     types: [raven_flutter_build]
@@ -46,7 +48,7 @@ on:
         required: false
         type: string
       project_name:
-        description: "Project name hint. For rename_project: 'basename|||new_app_name|||new_domain'"
+        description: Project name hint
         required: false
         type: string
 
@@ -68,20 +70,14 @@ env:
   SOURCE_SIZE: ${{ github.event.client_payload.source_size || inputs.source_size || '0' }}
   SOURCE_FILENAME: ${{ github.event.client_payload.source_filename || inputs.source_filename || 'raven-source.zip' }}
   PROJECT_NAME_HINT: ${{ github.event.client_payload.project_name || inputs.project_name || '' }}
-  # TARGET_CHAT_ID and RENAME_APP_NAME/RENAME_DOMAIN are derived at runtime
-  # in the "Parse project name and derive fields" step below.
   TOKEN_BOT: ${{ secrets.TOKEN_BOT }}
   TOKEN_GITHUB: ${{ secrets.TOKEN_GITHUB }}
   TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
   TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
   STORAGE_REPO: raven-build-storage
   RELEASE_TAG: raven-build-${{ github.event.client_payload.job_id || inputs.job_id || github.run_id }}
-  SOURCE_PATH: ${{ runner.temp }}/raven-source.zip
-  PROJECT_PATH: ${{ runner.temp }}/raven-flutter-project
-  WORKER_LOG: ${{ runner.temp }}/raven-worker.log
-  BUILD_LOG: ${{ runner.temp }}/flutter-build.log
-  OUTPUT_PATH: ${{ runner.temp }}/raven-output
   MAX_SOURCE_BYTES: '2147483647'
+  CB: python3 scripts/raven-callback.py
 
 jobs:
   worker:
@@ -93,322 +89,355 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Prepare callback secret and worker log
+      - name: Prepare workspace
         shell: bash
         run: |
           set -euo pipefail
-          : > "$WORKER_LOG"
+          {
+            echo "SOURCE_PATH=$RUNNER_TEMP/raven-source.zip"
+            echo "PROJECT_PATH=$RUNNER_TEMP/raven-flutter-project"
+            echo "WORKER_LOG=$RUNNER_TEMP/raven-worker.log"
+            echo "BUILD_LOG=$RUNNER_TEMP/flutter-build.log"
+            echo "OUTPUT_BASE=$RUNNER_TEMP/raven-output"
+            echo "TARGET_CHAT_ID=$SOURCE_CHAT_ID"
+            echo "START_EPOCH=$(date +%s)"
+          } >> "$GITHUB_ENV"
+          : > "$RUNNER_TEMP/raven-worker.log"
+          : > "$RUNNER_TEMP/flutter-build.log"
           if [ -z "${CALLBACK_SECRET:-}" ]; then
-            CALLBACK_SECRET="$(python - <<'PY'
-          import hashlib, hmac, os
-          print(hmac.new(os.environ.get('TOKEN_BOT','').encode(), os.environ['JOB_ID'].encode(), hashlib.sha256).hexdigest())
-          PY
-          )"
-            echo "CALLBACK_SECRET=$CALLBACK_SECRET" >> "$GITHUB_ENV"
+            SECRET="$(python3 -c "import hashlib,hmac,os;print(hmac.new(os.environ.get('TOKEN_BOT','').encode(),os.environ['JOB_ID'].encode(),hashlib.sha256).hexdigest())")"
+            echo "CALLBACK_SECRET=$SECRET" >> "$GITHUB_ENV"
           fi
-          test -n "${CALLBACK_SECRET:-}"
-          printf '[%s] worker=%s operation=%s mode=%s job=%s\n' "$(date -Is)" "${GITHUB_RUN_ID}" "$OPERATION" "$MODE" "$JOB_ID" >> "$WORKER_LOG"
-
-      - name: Parse project name and derive fields
-        shell: bash
-        run: |
-          set -euo pipefail
-          # TARGET_CHAT_ID always equals SOURCE_CHAT_ID (same user chat).
-          echo "TARGET_CHAT_ID=${SOURCE_CHAT_ID}" >> "$GITHUB_ENV"
-          # For rename_project, PROJECT_NAME_HINT is encoded as:
-          #   "basename|||new_app_name|||new_domain"
-          # For flutter_build it is just the plain project name.
-          # Use Python to split on the literal "|||" delimiter safely.
-          python - <<'PY'
-          import os
-          raw = os.environ.get('PROJECT_NAME_HINT', '')
-          sep = '|||'
-          env_file = os.environ['GITHUB_ENV']
-          if sep in raw:
-              parts = raw.split(sep, 2)
-              base_name = parts[0] if len(parts) > 0 else ''
-              rename_app = parts[1] if len(parts) > 1 else ''
-              rename_domain = parts[2] if len(parts) > 2 else ''
-          else:
-              base_name = raw
-              rename_app = ''
-              rename_domain = ''
-          with open(env_file, 'a') as f:
-              f.write(f'PROJECT_NAME_HINT={base_name}\n')
-              f.write(f'RENAME_APP_NAME={rename_app}\n')
-              f.write(f'RENAME_DOMAIN={rename_domain}\n')
-          PY
-
-      - name: Prepare callback helper
-        shell: bash
-        run: |
-          set -euo pipefail
-          cat > "$RUNNER_TEMP/raven-callback.sh" <<'BASH'
-          #!/usr/bin/env bash
-          set +e
-          post_callback() {
-            local status="$1"
-            local stage="$2"
-            local progress="$3"
-            local extra="${4:-{}}"
-            python - "$status" "$stage" "$progress" "$extra" <<'PY'
-          import json, os, sys, urllib.request, time
-          url=os.environ.get('CALLBACK_URL','').strip()
-          if not url:
-              raise SystemExit(0)
-          try:
-              extra=json.loads(sys.argv[4]) if sys.argv[4] else {}
-              if not isinstance(extra, dict): extra={}
-          except Exception:
-              extra={}
-          payload={
-              'jobId':os.environ['JOB_ID'],
-              'secret':os.environ.get('CALLBACK_SECRET',''),
-              'status':sys.argv[1],
-              'stage':sys.argv[2],
-              'progress':int(sys.argv[3]),
-              'runId':os.environ.get('GITHUB_RUN_ID',''),
-          }
-          payload.update(extra)
-          body=json.dumps(payload,separators=(',',':'),ensure_ascii=False).encode()
-          for i in range(3):
-              try:
-                  req=urllib.request.Request(url,data=body,headers={'Content-Type':'application/json','User-Agent':'Raven-Worker'},method='POST')
-                  with urllib.request.urlopen(req,timeout=12) as r: r.read()
-                  break
-              except Exception:
-                  if i < 2: time.sleep(1.5*(i+1))
-          PY
-          }
-          BASH
-          chmod 700 "$RUNNER_TEMP/raven-callback.sh"
-
-      - name: Validate invocation
-        shell: bash
-        run: |
-          set -euo pipefail
-          source "$RUNNER_TEMP/raven-callback.sh"
-          case "${OPERATION,,}" in
-            flutter_build|rename_project) ;;
-            *) echo "Operation tidak valid: $OPERATION" | tee -a "$WORKER_LOG" >&2; exit 1 ;;
-          esac
-          if [ "${OPERATION,,}" = 'flutter_build' ]; then
-            case "${MODE,,}" in debug|release) ;; *) echo "Mode build tidak valid: $MODE" | tee -a "$WORKER_LOG" >&2; exit 1 ;; esac
-          fi
-          test -n "$TELEGRAM_API_ID" || { echo 'TELEGRAM_API_ID belum diset' | tee -a "$WORKER_LOG" >&2; exit 1; }
-          test -n "$TELEGRAM_API_HASH" || { echo 'TELEGRAM_API_HASH belum diset' | tee -a "$WORKER_LOG" >&2; exit 1; }
-          test -n "$TOKEN_BOT" || { echo 'TOKEN_BOT belum diset' | tee -a "$WORKER_LOG" >&2; exit 1; }
-          test -n "$TOKEN_GITHUB" || { echo 'TOKEN_GITHUB belum diset' | tee -a "$WORKER_LOG" >&2; exit 1; }
-          test -n "$CALLBACK_URL" || { echo 'CALLBACK_URL belum tersedia' | tee -a "$WORKER_LOG" >&2; exit 1; }
-          test -n "$CALLBACK_SECRET" || { echo 'CALLBACK_SECRET belum tersedia' | tee -a "$WORKER_LOG" >&2; exit 1; }
-          test -n "$SOURCE_CHAT_ID" || { echo 'SOURCE_CHAT_ID belum tersedia' | tee -a "$WORKER_LOG" >&2; exit 1; }
-          test -n "$SOURCE_MESSAGE_ID" || { echo 'SOURCE_MESSAGE_ID belum tersedia' | tee -a "$WORKER_LOG" >&2; exit 1; }
-          test -n "$TARGET_CHAT_ID" || { echo 'TARGET_CHAT_ID belum tersedia' | tee -a "$WORKER_LOG" >&2; exit 1; }
-          if [ "$OPERATION" = 'rename_project' ]; then
-            test -n "$RENAME_APP_NAME" || { echo 'RENAME_APP_NAME belum tersedia' | tee -a "$WORKER_LOG" >&2; exit 1; }
-          fi
-          echo "[$(date -Is)] invocation valid" | tee -a "$WORKER_LOG"
-          post_callback running WORKER_STARTING 6 '{"detail":"Server worker sedang dimulai."}'
+          printf '[%s] run=%s operation=%s mode=%s job=%s\n' "$(date -Is)" "$GITHUB_RUN_ID" "$OPERATION" "$MODE" "$JOB_ID" >> "$RUNNER_TEMP/raven-worker.log"
 
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
 
+      - name: Validate invocation
+        id: invocation
+        shell: bash
+        run: |
+          set -euo pipefail
+          fail() { echo "$1" | tee -a "$WORKER_LOG" >&2; exit 1; }
+          case "${OPERATION,,}" in
+            flutter_build|rename_project) ;;
+            *) fail "Operation tidak valid: $OPERATION" ;;
+          esac
+          if [ "${OPERATION,,}" = 'flutter_build' ]; then
+            case "${MODE,,}" in debug|release) ;; *) fail "Mode build tidak valid: $MODE" ;; esac
+          fi
+          [ -n "$TELEGRAM_API_ID" ] || fail 'Secret TELEGRAM_API_ID belum diset'
+          [ -n "$TELEGRAM_API_HASH" ] || fail 'Secret TELEGRAM_API_HASH belum diset'
+          [ -n "$TOKEN_BOT" ] || fail 'Secret TOKEN_BOT belum diset'
+          [ -n "$TOKEN_GITHUB" ] || fail 'Secret TOKEN_GITHUB belum diset'
+          [ -n "$CALLBACK_URL" ] || fail 'CALLBACK_URL belum tersedia'
+          [ -n "$SOURCE_CHAT_ID" ] || fail 'SOURCE_CHAT_ID belum tersedia'
+          [ -n "$SOURCE_MESSAGE_ID" ] || fail 'SOURCE_MESSAGE_ID belum tersedia'
+          if [ "$OPERATION" = 'rename_project' ]; then
+            case "$PROJECT_NAME_HINT" in
+              *'|||'*) REST="${PROJECT_NAME_HINT#*'|||'}"; APP="${REST%%'|||'*}" ;;
+              *) APP='' ;;
+            esac
+            [ -n "$APP" ] || fail 'Nama aplikasi baru belum tersedia'
+          fi
+          $CB running WORKER_STARTING 6 "detail=Server worker sedang dimulai."
+
+      - name: Parse project fields
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os
+          raw = os.environ.get('PROJECT_NAME_HINT', '')
+          sep = '|||'
+          if sep in raw:
+              parts = raw.split(sep, 2)
+              base = parts[0]
+              app = parts[1] if len(parts) > 1 else ''
+              domain = parts[2] if len(parts) > 2 else ''
+          else:
+              base, app, domain = raw, '', ''
+          with open(os.environ['GITHUB_ENV'], 'a') as handle:
+              handle.write('PROJECT_NAME_HINT=' + base.replace('\n', ' ') + '\n')
+              handle.write('RENAME_APP_NAME=' + app.replace('\n', ' ') + '\n')
+              handle.write('RENAME_DOMAIN=' + domain.replace('\n', ' ') + '\n')
+          PY
+
       - name: Install MTProto worker
         shell: bash
         run: |
           set -euo pipefail
-          python -m pip install --upgrade pip >> "$WORKER_LOG" 2>&1
-          python -m pip install 'Telethon>=1.40,<2' >> "$WORKER_LOG" 2>&1
-          echo "[$(date -Is)] Telethon ready" | tee -a "$WORKER_LOG"
-          source "$RUNNER_TEMP/raven-callback.sh"
-          post_callback running WORKER_READY 10 '{"detail":"Worker Server siap mengambil source."}'
+          python3 -m pip install --upgrade pip >> "$WORKER_LOG" 2>&1
+          python3 -m pip install 'Telethon>=1.40,<2' >> "$WORKER_LOG" 2>&1
+          python3 -m pip install cryptg >> "$WORKER_LOG" 2>&1 || true
+          $CB running WORKER_READY 10 "detail=Worker Server siap mengambil source."
 
       - name: Download source from Telegram
+        id: download
         shell: bash
         run: |
           set -euo pipefail
-          source "$RUNNER_TEMP/raven-callback.sh"
-          post_callback running TELEGRAM_CONNECTING 12 '{"detail":"Menghubungkan ke Telegram untuk mengambil ZIP."}'
-          if ! python scripts/raven-telegram-mtproto.py download-source 2>&1 | tee -a "$WORKER_LOG"; then
-            exit 1
-          fi
+          $CB running TELEGRAM_CONNECTING 12 "detail=Menghubungkan ke Telegram untuk mengambil ZIP."
+          python3 scripts/raven-telegram-mtproto.py download-source 2>&1 | tee -a "$WORKER_LOG"
+          test "${PIPESTATUS[0]}" -eq 0
 
       - name: Validate ZIP
+        id: validate
         shell: bash
         run: |
           set -euo pipefail
-          python - <<'PY' 2>&1 | tee -a "$WORKER_LOG"
+          python3 - <<'PY' 2>&1 | tee -a "$WORKER_LOG"
           import os, zipfile
           from pathlib import PurePosixPath
-          src=os.environ['SOURCE_PATH']
-          size=os.path.getsize(src)
-          if size <= 0: raise SystemExit('Source ZIP kosong.')
-          if size > int(os.environ['MAX_SOURCE_BYTES']): raise SystemExit('Source ZIP melebihi batas maksimum.')
-          with zipfile.ZipFile(src) as z:
-              infos=z.infolist()
-              if not infos: raise SystemExit('ZIP tidak memiliki entry.')
-              if len(infos) > 30000: raise SystemExit(f'Terlalu banyak entry ZIP: {len(infos)}')
-              total=0
+          src = os.environ['SOURCE_PATH']
+          size = os.path.getsize(src)
+          if size <= 0:
+              raise SystemExit('Source ZIP kosong.')
+          if size > int(os.environ['MAX_SOURCE_BYTES']):
+              raise SystemExit('Source ZIP melebihi batas maksimum.')
+          if not zipfile.is_zipfile(src):
+              raise SystemExit('File bukan ZIP yang valid.')
+          with zipfile.ZipFile(src) as archive:
+              infos = archive.infolist()
+              if not infos:
+                  raise SystemExit('ZIP tidak memiliki entry.')
+              if len(infos) > 60000:
+                  raise SystemExit(f'Terlalu banyak entry ZIP: {len(infos)}')
+              total = 0
               for info in infos:
-                  name=info.filename.replace('\\','/').lstrip('/')
-                  p=PurePosixPath(name)
-                  if p.is_absolute() or '..' in p.parts: raise SystemExit(f'Path ZIP tidak aman: {info.filename}')
+                  name = info.filename.replace('\\', '/').lstrip('/')
+                  parts = PurePosixPath(name).parts
+                  if '..' in parts:
+                      raise SystemExit(f'Path ZIP tidak aman: {info.filename}')
                   total += int(info.file_size or 0)
-                  if total > 6_000_000_000: raise SystemExit('Isi ZIP setelah ekstrak melebihi 6 GB.')
+                  if total > 8_000_000_000:
+                      raise SystemExit('Isi ZIP setelah ekstrak melebihi 8 GB.')
           print(f'ZIP OK: {size} bytes / {len(infos)} entries / {total} uncompressed bytes')
           PY
-          source "$RUNNER_TEMP/raven-callback.sh"
-          post_callback running SOURCE_VALIDATED 30 '{"source_filename":"'"$SOURCE_FILENAME"'"}'
+          test "${PIPESTATUS[0]}" -eq 0
+          $CB running SOURCE_VALIDATED 30 "source_filename=$SOURCE_FILENAME"
 
-      - name: Backup Flutter source
+      - name: Backup source
+        id: backup
         if: env.OPERATION == 'flutter_build'
+        continue-on-error: true
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.TOKEN_GITHUB }}
         run: |
           set -euo pipefail
-          source "$RUNNER_TEMP/raven-callback.sh"
-          post_callback running SOURCE_BACKUP_START 34 '{"detail":"Menyimpan source build sebelum kompilasi."}'
+          $CB running SOURCE_BACKUP_START 34 "detail=Menyimpan source build sebelum kompilasi."
           OWNER="$(gh api user --jq .login)"
           TARGET="$OWNER/$STORAGE_REPO"
           if ! gh api "repos/$TARGET" >/dev/null 2>&1; then
-            gh api --method POST /user/repos \
-              -H 'Accept: application/vnd.github+json' \
-              -f name="$STORAGE_REPO" \
-              -f description='Private source storage for Raven builds' \
-              -F private=true -F has_issues=false -F has_projects=false -F has_wiki=false -F auto_init=true >/dev/null
+            gh api --method POST /user/repos -f name="$STORAGE_REPO" -f description='Private source storage for Raven builds' -F private=true -F has_issues=false -F has_projects=false -F has_wiki=false -F auto_init=true >/dev/null
+            sleep 3
           fi
-          PRIVATE="$(gh api "repos/$TARGET" --jq .private)"
-          [ "$PRIVATE" = true ] || { echo "Storage harus private: $TARGET" | tee -a "$WORKER_LOG" >&2; exit 1; }
-          STORAGE_BRANCH="$(gh api "repos/$TARGET" --jq .default_branch)"
-          if ! gh api "repos/$TARGET/git/ref/heads/$STORAGE_BRANCH" >/dev/null 2>&1; then
-            CONTENT_B64="$(printf 'Raven private build storage\n' | base64 -w 0)"
-            gh api --method PUT "repos/$TARGET/contents/.raven-storage" \
-              -f message='chore: bootstrap Raven build storage' \
-              -f branch="$STORAGE_BRANCH" \
-              -f content="$CONTENT_B64" >/dev/null
+          [ "$(gh api "repos/$TARGET" --jq .private)" = true ] || { echo "Storage harus private: $TARGET" | tee -a "$WORKER_LOG" >&2; exit 1; }
+          BRANCH="$(gh api "repos/$TARGET" --jq .default_branch)"
+          if ! gh api "repos/$TARGET/git/ref/heads/$BRANCH" >/dev/null 2>&1; then
+            gh api --method PUT "repos/$TARGET/contents/.raven-storage" -f message='chore: bootstrap storage' -f branch="$BRANCH" -f content="$(printf 'Raven private build storage\n' | base64 -w 0)" >/dev/null
           fi
-          TAG="$RELEASE_TAG"
-          if gh release view "$TAG" --repo "$TARGET" >/dev/null 2>&1; then
-            gh release delete "$TAG" --repo "$TARGET" --yes >/dev/null 2>&1 || true
-          fi
-          gh release create "$TAG" --repo "$TARGET" --title "Raven Source $JOB_ID" --notes "Private source backup" --prerelease >/dev/null
-          gh release upload "$TAG" "$SOURCE_PATH" --repo "$TARGET" --clobber 2>&1 | tee -a "$WORKER_LOG"
-          SOURCE_ASSET_ID="$(gh release view "$TAG" --repo "$TARGET" --json assets | python -c 'import json,sys,os; a=json.load(sys.stdin)["assets"]; n=os.environ.get("SOURCE_FILENAME"); print(next((str(x["id"]) for x in a if x.get("name")==n), ""))')"
-          echo "SOURCE_STORAGE_OWNER=$OWNER" >> "$GITHUB_ENV"
-          echo "SOURCE_ASSET_ID=$SOURCE_ASSET_ID" >> "$GITHUB_ENV"
-          source "$RUNNER_TEMP/raven-callback.sh"
-          export TAG OWNER STORAGE_REPO SOURCE_ASSET_ID SOURCE_FILENAME SOURCE_PATH
-          EXTRA_JSON="$(python - <<'PY'
-          import json, os
-          print(json.dumps({
-              'source_release_tag': os.environ['TAG'],
-              'source_storage_owner': os.environ['OWNER'],
-              'source_storage_repo': os.environ['STORAGE_REPO'],
-              'source_asset_id': os.environ.get('SOURCE_ASSET_ID',''),
-              'source_asset_filename': os.environ['SOURCE_FILENAME'],
-              'source_size': os.path.getsize(os.environ['SOURCE_PATH']),
-          }, separators=(',', ':')))
+          SAFE_NAME="$(printf '%s' "$SOURCE_FILENAME" | tr -c 'A-Za-z0-9._-' '_')"
+          [ -n "$SAFE_NAME" ] || SAFE_NAME=source.zip
+          mkdir -p "$RUNNER_TEMP/backup"
+          cp "$SOURCE_PATH" "$RUNNER_TEMP/backup/$SAFE_NAME"
+          gh release delete "$RELEASE_TAG" --repo "$TARGET" --yes --cleanup-tag >/dev/null 2>&1 || true
+          gh release create "$RELEASE_TAG" --repo "$TARGET" --title "Raven Source $JOB_ID" --notes "Private source backup" --prerelease >/dev/null
+          gh release upload "$RELEASE_TAG" "$RUNNER_TEMP/backup/$SAFE_NAME" --repo "$TARGET" --clobber 2>&1 | tee -a "$WORKER_LOG"
+          ASSET_ID="$(gh release view "$RELEASE_TAG" --repo "$TARGET" --json assets --jq ".assets[] | select(.name==\"$SAFE_NAME\") | .id" | head -n1)"
+          SIZE="$(stat -c '%s' "$SOURCE_PATH")"
+          $CB running SOURCE_BACKUP_READY 38 "source_release_tag=$RELEASE_TAG" "source_storage_owner=$OWNER" "source_storage_repo=$STORAGE_REPO" "source_asset_id=$ASSET_ID" "source_asset_filename=$SAFE_NAME" "source_size=$SIZE"
+
+      - name: Extract Flutter project
+        id: extract
+        if: env.OPERATION == 'flutter_build'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY' 2>&1 | tee -a "$WORKER_LOG"
+          import os, re, shutil, zipfile
+          from pathlib import Path, PurePosixPath
+          src = Path(os.environ['SOURCE_PATH'])
+          dst = Path(os.environ['PROJECT_PATH'])
+          if dst.exists():
+              shutil.rmtree(dst)
+          dst.mkdir(parents=True)
+          with zipfile.ZipFile(src) as archive:
+              entries = []
+              for info in archive.infolist():
+                  name = info.filename.replace('\\', '/')
+                  while name.startswith('./'):
+                      name = name[2:]
+                  name = name.lstrip('/')
+                  if name and not name.startswith('__MACOSX/'):
+                      entries.append((info, name))
+              roots = []
+              for info, name in entries:
+                  if info.is_dir():
+                      continue
+                  parts = PurePosixPath(name).parts
+                  if parts[-1].lower() == 'pubspec.yaml':
+                      directory = parts[:-1]
+                      if any(p in ('.dart_tool', 'build', '.symlinks', 'ephemeral') for p in directory):
+                          continue
+                      roots.append(directory)
+              if not roots:
+                  raise SystemExit('pubspec.yaml tidak ditemukan di dalam ZIP.')
+              roots.sort(key=lambda p: (len(p), 1 if p and p[-1].lower() in ('example', 'examples', 'test') else 0, p))
+              root = roots[0]
+              prefix = '/'.join(root) + '/' if root else ''
+              count = 0
+              for info, name in entries:
+                  if info.is_dir() or not name.startswith(prefix):
+                      continue
+                  rel = name[len(prefix):]
+                  pure = PurePosixPath(rel)
+                  if not rel or pure.is_absolute() or '..' in pure.parts:
+                      continue
+                  out = dst.joinpath(*pure.parts)
+                  out.parent.mkdir(parents=True, exist_ok=True)
+                  with archive.open(info) as reader, out.open('wb') as writer:
+                      shutil.copyfileobj(reader, writer, 16 * 1024 * 1024)
+                  count += 1
+          for folder in ['.git', '.dart_tool', 'build', '.gradle', '.idea', '.vscode', 'coverage', 'node_modules']:
+              target = dst / folder
+              if target.exists():
+                  shutil.rmtree(target, ignore_errors=True)
+          android_build = dst / 'android' / 'build'
+          if android_build.exists():
+              shutil.rmtree(android_build, ignore_errors=True)
+          pubspec = (dst / 'pubspec.yaml').read_text(encoding='utf-8', errors='ignore')
+          match = re.search(r'^name:\s*([A-Za-z0-9_]+)', pubspec, re.M)
+          name = match.group(1) if match else 'raven_flutter_app'
+          if not (dst / 'lib' / 'main.dart').exists():
+              raise SystemExit('lib/main.dart tidak ditemukan. Project Flutter tidak lengkap.')
+          needs_android = not (dst / 'android' / 'app' / 'src' / 'main' / 'AndroidManifest.xml').exists()
+          flutter_version = ''
+          fvmrc = dst / '.fvmrc'
+          fvm_cfg = dst / '.fvm' / 'fvm_config.json'
+          try:
+              import json
+              if fvmrc.exists():
+                  flutter_version = str(json.loads(fvmrc.read_text()).get('flutter', '')).strip()
+              elif fvm_cfg.exists():
+                  flutter_version = str(json.loads(fvm_cfg.read_text()).get('flutterSdkVersion', '')).strip()
+          except Exception:
+              flutter_version = ''
+          if not re.fullmatch(r'\d+\.\d+\.\d+(\+hotfix\.\d+)?', flutter_version or ''):
+              flutter_version = ''
+          with open(os.environ['GITHUB_ENV'], 'a') as handle:
+              handle.write(f'FLUTTER_PROJECT_NAME={name}\n')
+              handle.write(f'NEEDS_ANDROID_SCAFFOLD={"1" if needs_android else "0"}\n')
+              handle.write(f'REQUESTED_FLUTTER_VERSION={flutter_version}\n')
+          print(f'Flutter project: {name} / files: {count} / scaffold android: {needs_android} / flutter: {flutter_version or "stable"}')
           PY
-          )"
-          post_callback running SOURCE_BACKUP_READY 38 "$EXTRA_JSON"
+          test "${PIPESTATUS[0]}" -eq 0
+          $CB running PROJECT_VALIDATED 46 "project_name=$FLUTTER_PROJECT_NAME"
 
       - name: Prepare rename project
+        id: rename
         if: env.OPERATION == 'rename_project'
         shell: bash
         run: |
           set -euo pipefail
-          source "$RUNNER_TEMP/raven-callback.sh"
-          post_callback running RENAME_PROCESSING 65 '{"detail":"Membaca source dan menerapkan perubahan nama/domain."}'
-          python - <<'PY' 2>&1 | tee -a "$WORKER_LOG"
+          $CB running RENAME_PROCESSING 65 "detail=Membaca source dan menerapkan perubahan nama atau domain."
+          python3 - <<'PY' 2>&1 | tee -a "$WORKER_LOG"
           import os, re, zipfile
           from pathlib import Path
+          src = Path(os.environ['SOURCE_PATH'])
+          out = Path(os.environ['OUTPUT_BASE'] + '.zip')
+          new_app = os.environ['RENAME_APP_NAME'].strip()[:120]
+          raw_domain = os.environ.get('RENAME_DOMAIN', '').strip()
+          new_domain = ''
+          if raw_domain:
+              new_domain = re.sub(r'^https?://', '', raw_domain, flags=re.I).split('/')[0].strip().strip('.')
 
-          src=Path(os.environ['SOURCE_PATH'])
-          out=Path(os.environ['OUTPUT_PATH']+'.zip')
-          new_app=os.environ['RENAME_APP_NAME'].strip()[:120]
-          raw_domain=os.environ.get('RENAME_DOMAIN','').strip()
-          new_domain=re.sub(r'^https?://','',raw_domain,flags=re.I).split('/')[0].strip().strip('.') if raw_domain else ''
-          def slug(v):
-              x=re.sub(r'[^a-z0-9_]+','_',v.lower()).strip('_')
-              if not x: x='raven_app'
-              if x[0].isdigit(): x='raven_'+x
-              return x[:60]
-          new_pkg=slug(new_app)
-          text_ext=re.compile(r'\.(dart|yaml|yml|json|xml|gradle|properties|kt|java|js|ts|html|css|md|txt|arb|plist|iml|toml|ini)$',re.I)
-          skip_hosts={'pub.dev','github.com','raw.githubusercontent.com','google.com','googleapis.com','firebase.google.com','firebaseio.com','android.com','dart.dev','flutter.dev','w3.org','schemas.android.com','fonts.googleapis.com','localhost','127.0.0.1'}
-          records=[]
-          with zipfile.ZipFile(src) as z:
-              for info in z.infolist():
-                  if info.is_dir(): continue
-                  name=info.filename.replace('\\','/').lstrip('/')
-                  if not name or '..' in name.split('/'): raise SystemExit(f'Path ZIP tidak aman: {name}')
-                  data=z.read(info)
-                  records.append((name,data))
+          def slug(value):
+              text = re.sub(r'[^a-z0-9_]+', '_', value.lower()).strip('_')
+              if not text:
+                  text = 'raven_app'
+              if text[0].isdigit():
+                  text = 'raven_' + text
+              return text[:60]
 
-          old_pkg=''
-          app_candidates=[]
-          domain_candidates=[]
-          pub_idx=next((i for i,(n,_) in enumerate(records) if n.lower()=='pubspec.yaml'),None)
-          if pub_idx is not None:
-              pub=records[pub_idx][1].decode('utf-8','ignore')
-              m=re.search(r'^name:\s*([^#\r\n]+)',pub,re.M)
-              if m: old_pkg=m.group(1).strip().strip('"\'')
-
-          for name,data in records:
-              if not text_ext.search(name): continue
-              text=data.decode('utf-8','ignore')
-              for m in re.finditer(r'<string[^>]+name=["\']app_name["\'][^>]*>([^<]+)</string>',text,re.I):
-                  v=m.group(1).strip()
-                  if v: app_candidates.append(v)
-              for m in re.finditer(r'android:label=["\']([^"\']+)["\']',text,re.I):
-                  v=m.group(1).strip()
-                  if v and not v.startswith('@'): app_candidates.append(v)
-              for key in ('CFBundleDisplayName','CFBundleName'):
-                  m=re.search(rf'<key>\s*{key}\s*</key>\s*<string>([^<]+)</string>',text,re.I)
-                  if m: app_candidates.append(m.group(1).strip())
-              for m in re.finditer(r'https?://([^\s\"\'<>`)]+)',text,re.I):
-                  host=m.group(1).split('/')[0].split(':')[0].lower().strip('.')
+          new_pkg = slug(new_app)
+          text_ext = re.compile(r'\.(dart|yaml|yml|json|xml|gradle|kts|properties|kt|java|js|ts|html|css|md|txt|arb|plist|iml|toml|ini)$', re.I)
+          skip_hosts = {'pub.dev', 'github.com', 'raw.githubusercontent.com', 'google.com', 'googleapis.com', 'firebase.google.com', 'firebaseio.com', 'android.com', 'dart.dev', 'flutter.dev', 'w3.org', 'schemas.android.com', 'fonts.googleapis.com', 'localhost', '127.0.0.1', 'apache.org', 'gradle.org', 'maven.org', 'jitpack.io'}
+          records = []
+          with zipfile.ZipFile(src) as archive:
+              for info in archive.infolist():
+                  if info.is_dir():
+                      continue
+                  name = info.filename.replace('\\', '/').lstrip('/')
+                  if not name or '..' in name.split('/'):
+                      raise SystemExit(f'Path ZIP tidak aman: {name}')
+                  records.append((name, archive.read(info)))
+          old_pkg = ''
+          app_candidates = []
+          domain_candidates = []
+          for name, data in records:
+              if name.lower().endswith('pubspec.yaml') and name.count('/') <= 1:
+                  match = re.search(r'^name:\s*([^#\r\n]+)', data.decode('utf-8', 'ignore'), re.M)
+                  if match:
+                      old_pkg = match.group(1).strip().strip('"\'')
+                      break
+          for name, data in records:
+              if not text_ext.search(name):
+                  continue
+              text = data.decode('utf-8', 'ignore')
+              for match in re.finditer(r'<string[^>]+name=["\']app_name["\'][^>]*>([^<]+)</string>', text, re.I):
+                  value = match.group(1).strip()
+                  if value:
+                      app_candidates.append(value)
+              for match in re.finditer(r'android:label=["\']([^"\']+)["\']', text, re.I):
+                  value = match.group(1).strip()
+                  if value and not value.startswith('@'):
+                      app_candidates.append(value)
+              for key in ('CFBundleDisplayName', 'CFBundleName'):
+                  match = re.search(rf'<key>\s*{key}\s*</key>\s*<string>([^<]+)</string>', text, re.I)
+                  if match:
+                      app_candidates.append(match.group(1).strip())
+              for match in re.finditer(r'https?://([^\s"\'<>`)]+)', text, re.I):
+                  host = match.group(1).split('/')[0].split(':')[0].lower().strip('.')
                   if host and host not in skip_hosts and not host.endswith('.googleusercontent.com'):
                       domain_candidates.append(host)
-
-          app_candidates=[x for i,x in enumerate(dict.fromkeys(app_candidates)) if len(x)>1]
-          domain_candidates=list(dict.fromkeys(domain_candidates))
-          changed=0
-          replacements=0
-          tmp=[]
-          for name,data in records:
-              out_data=data
+          app_candidates = [x for x in dict.fromkeys(app_candidates) if len(x) > 1]
+          domain_candidates = list(dict.fromkeys(domain_candidates))
+          changed = 0
+          result = []
+          for name, data in records:
+              payload = data
               if text_ext.search(name):
-                  text=data.decode('utf-8','ignore')
-                  original=text
+                  original = data.decode('utf-8', 'ignore')
+                  text = original
                   if old_pkg and old_pkg != new_pkg:
-                      text=text.replace(old_pkg,new_pkg)
+                      text = text.replace(old_pkg, new_pkg)
                   for old in app_candidates:
-                      if old != new_app: text=text.replace(old,new_app)
+                      if old != new_app:
+                          text = text.replace(old, new_app)
                   if new_domain:
-                      for old_host in domain_candidates:
-                          text=re.sub(r'(?i)(https?://)'+re.escape(old_host), lambda m:m.group(1)+new_domain, text)
-                          text=re.sub(r'(?<![A-Za-z0-9.-])'+re.escape(old_host)+r'(?![A-Za-z0-9.-])', new_domain, text, flags=re.I)
+                      for host in domain_candidates:
+                          text = re.sub(r'(?i)(https?://)' + re.escape(host), lambda m: m.group(1) + new_domain, text)
+                          text = re.sub(r'(?<![A-Za-z0-9.-])' + re.escape(host) + r'(?![A-Za-z0-9.-])', new_domain, text, flags=re.I)
                   if text != original:
-                      replacements += sum(1 for _ in re.finditer(r'(?s)(?!^)', original)) if False else 1
                       changed += 1
-                  out_data=text.encode('utf-8')
-              tmp.append((name,out_data))
-
-          tmp.sort(key=lambda x:x[0])
-          with zipfile.ZipFile(out,'w',compression=zipfile.ZIP_DEFLATED,compresslevel=6) as z:
-              for name,data in tmp: z.writestr(name,data)
+                      payload = text.encode('utf-8')
+              result.append((name, payload))
+          result.sort(key=lambda item: item[0])
+          with zipfile.ZipFile(out, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
+              for name, payload in result:
+                  archive.writestr(name, payload)
+          if out.stat().st_size <= 0:
+              raise SystemExit('Output rename kosong.')
           print(f'RENAME OK: app={new_app} package={new_pkg} changed_files={changed} size={out.stat().st_size}')
-          if out.stat().st_size <= 0: raise SystemExit('Output rename kosong.')
           PY
-          RENAME_OUTPUT_PATH="$OUTPUT_PATH.zip"
-          echo "RENAME_OUTPUT_PATH=$RENAME_OUTPUT_PATH" >> "$GITHUB_ENV"
-          SIZE="$(stat -c '%s' "$RENAME_OUTPUT_PATH")"
-          source "$RUNNER_TEMP/raven-callback.sh"
-          post_callback running RENAME_READY 91 "{\"output_filename\":\"$(basename "$RENAME_OUTPUT_PATH")\",\"output_size\":$SIZE}"
+          test "${PIPESTATUS[0]}" -eq 0
+          SIZE="$(stat -c '%s' "$OUTPUT_BASE.zip")"
+          echo "RENAME_OUTPUT_PATH=$OUTPUT_BASE.zip" >> "$GITHUB_ENV"
+          $CB running RENAME_READY 91 "output_filename=$(basename "$OUTPUT_BASE.zip")" "output_size=$SIZE"
 
       - name: Setup Java
         if: env.OPERATION == 'flutter_build'
@@ -416,237 +445,237 @@ jobs:
         with:
           distribution: temurin
           java-version: '17'
-          cache: gradle
 
-      - name: Setup Flutter stable
+      - name: Setup Flutter
         if: env.OPERATION == 'flutter_build'
         uses: subosito/flutter-action@v2
         with:
           channel: stable
+          flutter-version: ${{ env.REQUESTED_FLUTTER_VERSION }}
           cache: true
 
       - name: Setup Android SDK
         if: env.OPERATION == 'flutter_build'
         uses: android-actions/setup-android@v3
 
-      - name: Install Android SDK packages
+      - name: Prepare toolchain
+        id: toolchain
         if: env.OPERATION == 'flutter_build'
         shell: bash
         run: |
           set -euo pipefail
           yes | sdkmanager --licenses >/dev/null 2>&1 || true
-          sdkmanager "platform-tools" "platforms;android-34" "platforms;android-35" "build-tools;34.0.0" "build-tools;35.0.0"
-          SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}"
-          if [ -n "$SDK_ROOT" ] && [ ! -d "$SDK_ROOT/ndk/27.0.12077973" ]; then sdkmanager "ndk;27.0.12077973" || true; fi
-          echo "[$(date -Is)] Android SDK ready" | tee -a "$WORKER_LOG"
-          source "$RUNNER_TEMP/raven-callback.sh"
-          post_callback running TOOLCHAIN_READY 54 '{"detail":"Flutter, Java 17, dan Android SDK siap."}'
+          { sdkmanager "platform-tools" "platforms;android-34" "platforms;android-35" "build-tools;34.0.0" "build-tools;35.0.0" 2>&1 | tail -n 5 | tee -a "$WORKER_LOG"; } || true
+          flutter config --no-analytics >/dev/null 2>&1 || true
+          flutter --version 2>&1 | tee -a "$WORKER_LOG"
+          echo "[$(date -Is)] toolchain ready" | tee -a "$WORKER_LOG"
+          $CB running TOOLCHAIN_READY 54 "detail=Flutter, Java 17, dan Android SDK siap."
 
-      - name: Extract Flutter project
-        if: env.OPERATION == 'flutter_build'
-        shell: bash
-        run: |
-          set -euo pipefail
-          python - <<'PY' 2>&1 | tee -a "$WORKER_LOG"
-          import os, re, shutil, zipfile
-          from pathlib import Path, PurePosixPath
-          src=Path(os.environ['SOURCE_PATH'])
-          dst=Path(os.environ['PROJECT_PATH'])
-          if dst.exists(): shutil.rmtree(dst)
-          dst.mkdir(parents=True)
-          with zipfile.ZipFile(src) as z:
-              names=[]
-              for info in z.infolist():
-                  n=info.filename.replace('\\','/').lstrip('./').rstrip('/')
-                  if n: names.append(n)
-              lower={n.lower() for n in names}
-              prefixes=['']
-              tops={n.split('/')[0] for n in names if '/' in n}
-              if len(tops)==1: prefixes.append(next(iter(tops))+'/')
-              root=None
-              for prefix in prefixes:
-                  if (prefix+'pubspec.yaml').lower() in lower and any(n.lower().startswith((prefix+'android/').lower()) for n in names) and any(n.lower().startswith((prefix+'lib/').lower()) for n in names):
-                      root=prefix; break
-              if root is None: raise SystemExit('Project Flutter tidak lengkap. Wajib pubspec.yaml + android/ + lib/.')
-              for info in z.infolist():
-                  raw=info.filename.replace('\\','/').lstrip('./')
-                  if root and not raw.startswith(root): continue
-                  rel=raw[len(root):] if root else raw
-                  if not rel or rel.endswith('/'): continue
-                  p=PurePosixPath(rel)
-                  if p.is_absolute() or '..' in p.parts: raise SystemExit('Path ZIP tidak aman.')
-                  out=dst.joinpath(*p.parts); out.parent.mkdir(parents=True,exist_ok=True)
-                  with z.open(info) as r, out.open('wb') as w: shutil.copyfileobj(r,w,16*1024*1024)
-          for d in ['.git','.dart_tool','build','.gradle','.idea','.vscode','coverage','node_modules']:
-              q=dst/d
-              if q.exists(): shutil.rmtree(q,ignore_errors=True)
-          pub=(dst/'pubspec.yaml').read_text(encoding='utf-8',errors='ignore')
-          m=re.search(r'^name:\s*([A-Za-z0-9_]+)',pub,re.M)
-          name=m.group(1) if m else (os.environ.get('PROJECT_NAME_HINT') or 'raven_flutter_app')
-          Path(os.environ['RUNNER_TEMP'],'flutter-project-name').write_text(name)
-          print(f'Flutter project: {name}')
-          PY
-          source "$RUNNER_TEMP/raven-callback.sh"
-          PROJECT_NAME="$(cat "$RUNNER_TEMP/flutter-project-name")"
-          post_callback running PROJECT_VALIDATED 62 "{\"project_name\":\"$PROJECT_NAME\"}"
-
-      - name: Normalize Android runner paths
+      - name: Normalize Android project
+        id: normalize
         if: env.OPERATION == 'flutter_build'
         working-directory: ${{ env.PROJECT_PATH }}
         shell: bash
         run: |
           set -euo pipefail
           SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}"
-          test -n "$SDK_ROOT"
-          test -n "${FLUTTER_ROOT:-}"
+          [ -n "$SDK_ROOT" ] || { echo 'ANDROID_SDK_ROOT tidak ditemukan' | tee -a "$WORKER_LOG" >&2; exit 1; }
+          [ -n "${FLUTTER_ROOT:-}" ] || { echo 'FLUTTER_ROOT tidak ditemukan' | tee -a "$WORKER_LOG" >&2; exit 1; }
+          if [ "$NEEDS_ANDROID_SCAFFOLD" = "1" ]; then
+            flutter create . --platforms=android --project-name "$FLUTTER_PROJECT_NAME" --no-pub 2>&1 | tee -a "$WORKER_LOG"
+          fi
+          test -f android/app/src/main/AndroidManifest.xml
           if [ -f android/local.properties ]; then
-            awk '!/^(flutter\.sdk|sdk\.dir|flutter\.buildMode)=/' android/local.properties > android/local.properties.raven.tmp
-            mv android/local.properties.raven.tmp android/local.properties
+            awk '!/^(flutter\.sdk|sdk\.dir|flutter\.buildMode)=/' android/local.properties > android/local.properties.tmp
+            mv android/local.properties.tmp android/local.properties
           fi
           {
             printf 'flutter.sdk=%s\n' "$FLUTTER_ROOT"
             printf 'sdk.dir=%s\n' "$SDK_ROOT"
-            printf 'flutter.buildMode=%s\n' "${MODE,,}"
           } >> android/local.properties
+          touch android/gradle.properties
+          grep -q '^org.gradle.jvmargs' android/gradle.properties || printf '\norg.gradle.jvmargs=-Xmx4G -XX:MaxMetaspaceSize=1G -Dfile.encoding=UTF-8\n' >> android/gradle.properties
+          grep -q '^android.useAndroidX' android/gradle.properties || printf 'android.useAndroidX=true\n' >> android/gradle.properties
+          grep -q '^org.gradle.daemon' android/gradle.properties || printf 'org.gradle.daemon=false\n' >> android/gradle.properties
+          $CB running ANDROID_READY 58 "detail=Konfigurasi Android project siap."
 
       - name: Flutter pub get
+        id: pubget
         if: env.OPERATION == 'flutter_build'
         working-directory: ${{ env.PROJECT_PATH }}
         shell: bash
         run: |
           set -euo pipefail
-          echo "[$(date -Is)] flutter pub get" | tee -a "$WORKER_LOG"
-          flutter --version 2>&1 | tee -a "$WORKER_LOG"
-          flutter pub get 2>&1 | tee -a "$WORKER_LOG"
-          source "$RUNNER_TEMP/raven-callback.sh"
-          post_callback running DEPENDENCIES_READY 70 '{"detail":"Dependency project berhasil disiapkan."}'
+          echo "[$(date -Is)] flutter pub get" | tee -a "$BUILD_LOG" "$WORKER_LOG"
+          flutter pub get 2>&1 | tee -a "$BUILD_LOG" "$WORKER_LOG"
+          test "${PIPESTATUS[0]}" -eq 0
+          $CB running DEPENDENCIES_READY 70 "detail=Dependency project berhasil disiapkan."
 
       - name: Build Flutter APK
+        id: build
         if: env.OPERATION == 'flutter_build'
         working-directory: ${{ env.PROJECT_PATH }}
         shell: bash
         run: |
-          set -euo pipefail
-          : > "$BUILD_LOG"
-          source "$RUNNER_TEMP/raven-callback.sh"
-          post_callback running BUILDING_APK 78 '{"detail":"Flutter SDK sedang mengompilasi source ke APK."}'
-          : > "$RUNNER_TEMP/build-heartbeat-stop"
-          START_EPOCH="$(date +%s)"
-          export START_EPOCH
+          set -uo pipefail
+          $CB running BUILDING_APK 78 "detail=Flutter SDK sedang mengompilasi source ke APK."
+          HEARTBEAT="$RUNNER_TEMP/build-heartbeat"
+          : > "$HEARTBEAT"
+          START="$(date +%s)"
           (
-            while [ -f "$RUNNER_TEMP/build-heartbeat-stop" ]; do
-              sleep 20
-              [ -f "$RUNNER_TEMP/build-heartbeat-stop" ] || break
-              elapsed=$(( $(date +%s) - START_EPOCH ))
-              p=$((78 + elapsed / 60 * 2))
-              [ "$p" -lt 90 ] || p=89
-              post_callback running BUILDING_APK "$p" "{\"detail\":\"Flutter masih mengompilasi APK. Durasi ${elapsed}s.\"}" >/dev/null 2>&1 || true
+            while [ -f "$HEARTBEAT" ]; do
+              sleep 25
+              [ -f "$HEARTBEAT" ] || break
+              ELAPSED=$(( $(date +%s) - START ))
+              P=$(( 78 + ELAPSED / 30 ))
+              [ "$P" -lt 90 ] || P=89
+              $CB running BUILDING_APK "$P" "detail=Flutter masih mengompilasi APK. Durasi ${ELAPSED}s." >/dev/null 2>&1 || true
             done
           ) &
           HB=$!
-          set +e
-          flutter build apk --${MODE,,} --no-pub 2>&1 | tee -a "$BUILD_LOG" "$WORKER_LOG"
+          FLAGS="--no-pub"
+          [ "${MODE,,}" = "release" ] && FLAGS="$FLAGS --no-tree-shake-icons"
+          echo "[$(date -Is)] flutter build apk --${MODE,,} $FLAGS" | tee -a "$BUILD_LOG" "$WORKER_LOG"
+          flutter build apk --${MODE,,} $FLAGS 2>&1 | tee -a "$BUILD_LOG" "$WORKER_LOG"
           RC=${PIPESTATUS[0]}
-          set -e
-          rm -f "$RUNNER_TEMP/build-heartbeat-stop"
+          rm -f "$HEARTBEAT"
           kill "$HB" >/dev/null 2>&1 || true
           wait "$HB" >/dev/null 2>&1 || true
-          if [ "$RC" -ne 0 ]; then exit "$RC"; fi
+          exit "$RC"
 
       - name: Locate APK
-        if: env.OPERATION == 'flutter_build'
         id: apk
+        if: env.OPERATION == 'flutter_build'
         shell: bash
         run: |
           set -euo pipefail
-          APK="$(find "$PROJECT_PATH/build/app/outputs/flutter-apk" -maxdepth 1 -type f -name '*.apk' -printf '%T@ %p\n' 2>/dev/null | sort -n | tail -1 | cut -d' ' -f2-)"
-          if [ -z "$APK" ]; then
-            APK="$(find "$PROJECT_PATH/build" -type f -name '*.apk' -printf '%T@ %p\n' 2>/dev/null | sort -n | tail -1 | cut -d' ' -f2-)"
-          fi
-          test -n "$APK"
+          APK="$(find "$PROJECT_PATH/build/app/outputs" -type f -name '*.apk' -printf '%T@ %p\n' 2>/dev/null | sort -n | tail -n1 | cut -d' ' -f2-)"
+          [ -n "$APK" ] || { echo 'APK tidak ditemukan setelah build.' | tee -a "$WORKER_LOG" >&2; exit 1; }
           SIZE="$(stat -c '%s' "$APK")"
-          test "$SIZE" -gt 0
-          cp "$APK" "$OUTPUT_PATH.apk"
-          echo "path=$OUTPUT_PATH.apk" >> "$GITHUB_OUTPUT"
-          echo "name=$(basename "$APK")" >> "$GITHUB_OUTPUT"
-          echo "size=$SIZE" >> "$GITHUB_OUTPUT"
-          echo "[$(date -Is)] APK ready: $(basename "$APK") / $SIZE bytes" | tee -a "$WORKER_LOG"
-
-      - name: APK ready callback
-        if: env.OPERATION == 'flutter_build'
-        env:
-          APK_NAME_OUT: ${{ steps.apk.outputs.name }}
-          APK_SIZE_OUT: ${{ steps.apk.outputs.size }}
-        shell: bash
-        run: |
-          source "$RUNNER_TEMP/raven-callback.sh"
-          PROJECT_NAME="$(cat "$RUNNER_TEMP/flutter-project-name")"
-          post_callback running APK_READY 91 "{\"apk_filename\":\"$APK_NAME_OUT\",\"apk_size\":$APK_SIZE_OUT,\"project_name\":\"$PROJECT_NAME\"}"
+          [ "$SIZE" -gt 0 ] || { echo 'APK kosong.' | tee -a "$WORKER_LOG" >&2; exit 1; }
+          SAFE="$(printf '%s' "$FLUTTER_PROJECT_NAME" | tr -c 'A-Za-z0-9._-' '_')"
+          DEST="$RUNNER_TEMP/${SAFE}-${MODE,,}.apk"
+          cp "$APK" "$DEST"
+          {
+            echo "path=$DEST"
+            echo "name=$(basename "$DEST")"
+            echo "size=$SIZE"
+          } >> "$GITHUB_OUTPUT"
+          echo "[$(date -Is)] APK ready: $(basename "$DEST") / $SIZE bytes" | tee -a "$WORKER_LOG"
+          $CB running APK_READY 91 "apk_filename=$(basename "$DEST")" "apk_size=$SIZE" "project_name=$FLUTTER_PROJECT_NAME"
 
       - name: Send Flutter APK
+        id: sendapk
         if: env.OPERATION == 'flutter_build'
         env:
+          OUTPUT_KIND: apk
           APK_PATH: ${{ steps.apk.outputs.path }}
           APK_CAPTION: |
-            ✅ <b>APK BUILD SELESAI</b>
+            🎉 <b>APK BUILD SELESAI!</b>
+            ━━━━━━━━━━━━━━━━━━━━━
 
-            📦 Project: <code>${{ steps.apk.outputs.name }}</code>
-            🚀 Mode: <b>${{ env.MODE }}</b>
-            🖥️ Server: <b>Build Server</b>
+            📦 Project  : <code>${{ env.FLUTTER_PROJECT_NAME }}</code>
+            🔧 Mode     : <b>${{ env.MODE }}</b>
+            🖥️ Server  : Build Server
 
-            <i>Build berhasil dikirim ke Chat User.</i>
+            ✅ APK siap install!
+        shell: bash
         run: |
           set -euo pipefail
-          python scripts/raven-telegram-mtproto.py send-file 2>&1 | tee -a "$WORKER_LOG"
+          python3 scripts/raven-telegram-mtproto.py send-file 2>&1 | tee -a "$WORKER_LOG"
+          test "${PIPESTATUS[0]}" -eq 0
 
       - name: Send renamed ZIP
+        id: sendzip
         if: env.OPERATION == 'rename_project'
         env:
           OUTPUT_KIND: zip
           OUTPUT_PATH: ${{ env.RENAME_OUTPUT_PATH }}
           OUTPUT_CAPTION: |
             ✅ <b>RENAME PROJECT SELESAI</b>
+            ━━━━━━━━━━━━━━━━━━━━━
 
-            📦 File: <code>${{ env.RENAME_OUTPUT_PATH }}</code>
-            ✏️ Nama baru: <b>${{ env.RENAME_APP_NAME }}</b>
-            🖥️ Server: <b>Build Server</b>
+            ✏️ Nama baru : <b>${{ env.RENAME_APP_NAME }}</b>
+            🖥️ Server   : Build Server
 
-            <i>ZIP hasil rename berhasil dikirim ke Chat User.</i>
-        run: |
-          set -euo pipefail
-          python scripts/raven-telegram-mtproto.py send-file 2>&1 | tee -a "$WORKER_LOG"
-
-      - name: Failure callback with real log
-        if: failure()
+            ZIP hasil rename siap dipakai.
         shell: bash
         run: |
+          set -euo pipefail
+          python3 scripts/raven-telegram-mtproto.py send-file 2>&1 | tee -a "$WORKER_LOG"
+          test "${PIPESTATUS[0]}" -eq 0
+
+      - name: Report failure
+        if: failure()
+        shell: bash
+        env:
+          OUT_INVOCATION: ${{ steps.invocation.outcome }}
+          OUT_DOWNLOAD: ${{ steps.download.outcome }}
+          OUT_VALIDATE: ${{ steps.validate.outcome }}
+          OUT_EXTRACT: ${{ steps.extract.outcome }}
+          OUT_RENAME: ${{ steps.rename.outcome }}
+          OUT_TOOLCHAIN: ${{ steps.toolchain.outcome }}
+          OUT_NORMALIZE: ${{ steps.normalize.outcome }}
+          OUT_PUBGET: ${{ steps.pubget.outcome }}
+          OUT_BUILD: ${{ steps.build.outcome }}
+          OUT_APK: ${{ steps.apk.outcome }}
+          OUT_SENDAPK: ${{ steps.sendapk.outcome }}
+          OUT_SENDZIP: ${{ steps.sendzip.outcome }}
+        run: |
           set +e
-          source "$RUNNER_TEMP/raven-callback.sh"
-          LOG="${BUILD_LOG}"
-          [ -s "$LOG" ] || LOG="$WORKER_LOG"
-          [ -s "$LOG" ] || true
-          python - "$LOG" <<'PY' | tee -a "$WORKER_LOG" || true
-          import os, sys, json, urllib.request
-          path=sys.argv[1]
-          try:
-              data=open(path,'rb').read()[-10000:].decode('utf-8','replace')
-          except Exception:
-              data='Worker gagal sebelum log tahap tersedia.'
-          data=data.replace(os.environ.get('TOKEN_BOT',''),'[REDACTED]').replace(os.environ.get('TOKEN_GITHUB',''),'[REDACTED]')
-          url=os.environ.get('CALLBACK_URL','').strip()
-          if url:
-              payload={
-                  'jobId':os.environ['JOB_ID'], 'secret':os.environ.get('CALLBACK_SECRET',''),
-                  'status':'failure','stage':'BUILD_FAILED','progress':95,
-                  'runId':os.environ.get('GITHUB_RUN_ID',''),
-                  'error':data[-9000:], 'operation':os.environ.get('OPERATION','flutter_build')
-              }
-              req=urllib.request.Request(url,data=json.dumps(payload).encode(),headers={'Content-Type':'application/json'},method='POST')
-              try:
-                  with urllib.request.urlopen(req,timeout=12) as r: r.read()
-              except Exception as e:
-                  print(f'callback failed: {e}')
+          STEP="$(python3 - <<'PY'
+          import os
+          order = [
+              ('OUT_INVOCATION', 'Validasi Konfigurasi'),
+              ('OUT_DOWNLOAD', 'Download Source'),
+              ('OUT_VALIDATE', 'Validasi ZIP'),
+              ('OUT_EXTRACT', 'Extract Project'),
+              ('OUT_RENAME', 'Rename Project'),
+              ('OUT_TOOLCHAIN', 'Setup Toolchain'),
+              ('OUT_NORMALIZE', 'Konfigurasi Android'),
+              ('OUT_PUBGET', 'Pub Get'),
+              ('OUT_BUILD', 'Build APK'),
+              ('OUT_APK', 'Cari APK'),
+              ('OUT_SENDAPK', 'Kirim APK'),
+              ('OUT_SENDZIP', 'Kirim ZIP'),
+          ]
+          step = 'Setup Worker'
+          for key, label in order:
+              if os.environ.get(key, '') == 'failure':
+                  step = label
+                  break
+          print(step)
           PY
+          )"
+          LOG_FILE="$RUNNER_TEMP/raven-error-${JOB_ID}.txt"
+          {
+            echo "RAVEN BUILD ERROR LOG"
+            echo "Step gagal : $STEP"
+            echo "Job ID     : $JOB_ID"
+            echo "Operation  : $OPERATION"
+            echo "Mode       : $MODE"
+            echo "Source     : $SOURCE_FILENAME"
+            echo "Waktu      : $(date -Is)"
+            echo "========================================"
+            if [ -s "$BUILD_LOG" ]; then cat "$BUILD_LOG"; else cat "$WORKER_LOG" 2>/dev/null; fi
+            echo
+            echo "========================================"
+            echo "WORKER LOG"
+            echo "========================================"
+            cat "$WORKER_LOG" 2>/dev/null
+          } > "$LOG_FILE" 2>/dev/null
+          if [ -n "$TOKEN_BOT" ]; then sed -i "s/$TOKEN_BOT/[REDACTED]/g" "$LOG_FILE" 2>/dev/null; fi
+          if [ -n "$TOKEN_GITHUB" ]; then sed -i "s/$TOKEN_GITHUB/[REDACTED]/g" "$LOG_FILE" 2>/dev/null; fi
+          [ "$(stat -c '%s' "$LOG_FILE" 2>/dev/null || echo 0)" -gt 50000000 ] && tail -c 40000000 "$LOG_FILE" > "$LOG_FILE.tail" && mv "$LOG_FILE.tail" "$LOG_FILE"
+          LOG_SENT=false
+          if [ -n "$SOURCE_CHAT_ID" ] && [ -n "$TELEGRAM_API_ID" ] && [ -n "$TOKEN_BOT" ]; then
+            if OUTPUT_KIND=log OUTPUT_PATH="$LOG_FILE" OUTPUT_CAPTION="$(printf '📄 <b>Full Build Error Log</b>\n\nStep gagal: <b>%s</b>\n\nGunakan file ini untuk menemukan baris kode yang error secara detail.' "$STEP")" python3 scripts/raven-telegram-mtproto.py send-file; then
+              LOG_SENT=true
+            fi
+          fi
+          TAIL="$(tail -c 3500 "$LOG_FILE" 2>/dev/null)"
+          $CB failure BUILD_FAILED 95 "failed_step=$STEP" "log_sent=$LOG_SENT" "operation=$OPERATION" "error=$TAIL"
+          exit 0
 
       - name: Upload worker logs
         if: always()
