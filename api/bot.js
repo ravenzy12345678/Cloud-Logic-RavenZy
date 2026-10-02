@@ -174,8 +174,15 @@ function isUserBanned(id) {
 }
 
 async function refreshControlStateIfStale() {
-  if (Date.now() - controlStateLoadedAt < 15_000) return;
-  await loadControlState();
+  if (Date.now() - controlStateLoadedAt < 45_000) return;
+  if (!controlLoading) controlLoading = loadControlState().catch((error) => console.error('[CONTROL LOAD]', errorMessage(error))).finally(() => { controlLoading = null; });
+  await controlLoading;
+}
+
+async function ensureUsersLoaded() {
+  if (Date.now() - usersLoadedAt < 60_000) return;
+  usersLoadedAt = Date.now();
+  await loadUsers();
 }
 
 function featureIsExemptFromMaintenance(ctx) {
@@ -187,8 +194,10 @@ function featureIsExemptFromMaintenance(ctx) {
 function userDisplayName(from) {
   const first = String(from?.first_name || '').trim();
   const last = String(from?.last_name || '').trim();
-  const full = `${first} ${last}`.trim();
-  return full || (from?.username ? `@${from.username}` : `User ${from?.id || '-'}`);
+  const raw = `${first} ${last}`.trim();
+  const cleaned = raw ? cleanName(raw, 40) : '';
+  if (cleaned && cleaned !== 'User') return cleaned;
+  return from?.username ? `@${from.username}` : `User ${from?.id || '-'}`;
 }
 
 function getNextMemberNumber() {
@@ -289,15 +298,17 @@ function ownerContactMarkup() {
 }
 
 async function sendJoinGate(ctx, forcePhoto = true) {
-  const name = escapeHtml(ctx.from?.username || userDisplayName(ctx.from));
+  const name = escapeHtml(cleanName(ctx.from?.username || userDisplayName(ctx.from)));
   const caption = [
-    `🔒 <b>JOIN CHANNEL WAJIB</b>`,
-    BAR,
+    '🔒 <b>JOIN CHANNEL WAJIB</b>',
+    RULE,
     `Halo, <b>${name}</b>.`,
-    `Untuk memakai Builder By Raven, kamu wajib join <code>${escapeHtml(MANDATORY_CHANNEL)}</code>.`,
-    `\n1. Tekan <b>JOIN CHANNEL</b>.`,
-    `2. Setelah selesai, tekan <b>/start</b> lagi.`,
-    `3. Bot akan otomatis memeriksa status membership.`,
+    bq([
+      `📢 <b>Channel</b> : <code>${escapeHtml(MANDATORY_CHANNEL)}</code>`,
+      '1️⃣ Tekan <b>JOIN CHANNEL</b>',
+      '2️⃣ Setelah selesai, tekan <b>/start</b> lagi',
+      '3️⃣ Bot otomatis memeriksa membership',
+    ]),
   ].join('\n');
   const photo = path.join(__dirname, '..', 'assets', 'raven-welcome.jpg');
   if (forcePhoto && fs.existsSync(photo)) {
@@ -429,7 +440,7 @@ function mainMenuMarkup(ctx) {
 
 function ownerPanelMarkup() {
   return Markup.inlineKeyboard([
-    [Markup.button.callback('📦 List Build', 'owner_builds'), Markup.button.callback('📥 Get ZIP Build', 'owner_build_picker')],
+    [Markup.button.callback('📦 List & Get ZIP Build', 'owner_builds')],
     [Markup.button.callback('⏹️ Kill Build', 'owner_kill_builds'), Markup.button.callback('🛠️ Maintenance', 'owner_maintenance')],
     [Markup.button.callback('👥 Users', 'users'), Markup.button.callback('🚫 Ban User', 'ban_user')],
     [Markup.button.callback('✅ Unban User', 'unban_user')],
@@ -494,20 +505,16 @@ async function startGenerateBotEnvCollection(ctx, session, prefixText) {
 }
 
 function infoBox(rows) {
-  const lines = rows.map(([label, value], idx) => {
-    const prefix = idx === rows.length - 1 ? '└' : '├';
-    return `${prefix} ${label} : ${value}`;
-  });
-  return `┌─────────────────────────\n${lines.join('\n')}`;
+  return bq(rows.map(([label, value]) => `${label} : ${value}`));
 }
 
 function panel({ heading, box, body, footer } = {}) {
-  const sections = [];
-  if (heading) sections.push(heading);
-  if (box) sections.push(box);
-  if (body) sections.push(body);
-  if (footer) sections.push(footer);
-  return sections.filter(Boolean).join('\n\n').trim();
+  const parts = [];
+  if (heading) parts.push(`${heading}\n${RULE}${box ? `\n${box}` : ''}`);
+  else if (box) parts.push(box);
+  if (body) parts.push(body);
+  if (footer) parts.push(footer);
+  return parts.join('\n\n').trim();
 }
 
 function progressBar(percent) {
@@ -537,6 +544,65 @@ function resolveLocalAsset(filename) {
   return null;
 }
 
+const RULE = '━━━━━━━━━━━━━━━━━━━━';
+
+function cleanName(value, max = 28) {
+  const text = String(value || '').normalize('NFKC').replace(/[\p{M}\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, '').replace(/\s+/g, ' ').trim();
+  if (!text) return 'User';
+  return text.length > max ? `${text.slice(0, max - 1)}…` : text;
+}
+
+function bq(lines) {
+  const body = lines.filter((line) => line !== null && line !== undefined && line !== false && line !== '').join('\n');
+  return `<blockquote>${body}</blockquote>`;
+}
+
+function colorBar(percent, failed = false) {
+  const safe = Math.max(0, Math.min(100, Math.round(Number(percent) || 0)));
+  const filled = Math.round(safe / 10);
+  return (failed ? '🟥' : '🟩').repeat(filled) + '⬜'.repeat(10 - filled);
+}
+
+let uiThrottle = new Map();
+let usersLoadedAt = 0;
+let controlLoading = null;
+
+function workerCredentials() {
+  const creds = {
+    tg_api_id: String(process.env.TELEGRAM_API_ID || process.env.API_ID || '').trim(),
+    tg_api_hash: String(process.env.TELEGRAM_API_HASH || process.env.API_HASH || '').trim(),
+    bot_token: String(ENV.BOT_TOKEN || '').trim(),
+    gh_token: String(ENV.GH_TOKEN || '').trim(),
+  };
+  const labels = { tg_api_id: 'TELEGRAM_API_ID', tg_api_hash: 'TELEGRAM_API_HASH', bot_token: 'TOKEN_BOT', gh_token: 'TOKEN_GITHUB' };
+  const missing = Object.keys(labels).filter((key) => !creds[key]).map((key) => labels[key]);
+  if (missing.length) throw new Error(`Environment Vercel belum lengkap: ${missing.join(', ')}`);
+  return creds;
+}
+
+async function checkWorkflowActive(owner, repo, branch, file) {
+  const response = await axios.get(
+    `${GH_API}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/actions/workflows/${encodeURIComponent(file)}`,
+    { headers: ghHeaders, params: { ref: branch }, timeout: 20000, validateStatus: () => true }
+  );
+  if (response.status < 200 || response.status >= 300) throw new Error(`Workflow ${file} tidak tersedia di repo build.`);
+  const state = String(response.data?.state || '').toLowerCase();
+  if (state && state !== 'active') throw new Error(`Workflow build sedang ${state}.`);
+}
+
+function cancelButton() {
+  return Markup.inlineKeyboard([[Markup.button.callback('❌ Batalkan', 'session_cancel')]]);
+}
+
+async function sendSessionPrompt(ctx, session, text) {
+  const old = sessions.get(uid(ctx));
+  if (old?.controlMessageId) await safeDeleteMessage(ctx, ctx.chat.id, old.controlMessageId);
+  const message = await ctx.reply(text, { ...REPLY_OPTS, ...cancelButton() });
+  session.controlMessageId = message.message_id;
+  sessions.set(uid(ctx), session);
+  return message;
+}
+
 function bar12(percent) {
   const safe = Math.max(0, Math.min(100, Math.round(Number(percent) || 0)));
   const filled = Math.round((safe / 100) * 12);
@@ -548,10 +614,6 @@ function modeLabel(mode, long = false) {
   if (m === 'release') return long ? '🚀 Release Build' : '🚀 RELEASE';
   if (m === 'debug') return long ? '🐞 Debug Build' : '🐞 DEBUG';
   return String(mode || '-').toUpperCase();
-}
-
-function priorityLabel(record) {
-  return String(record?.priority || 'USER').toUpperCase() === 'OWNER' ? '👑 OWNER (Lv.10)' : '👤 USER (Lv.3)';
 }
 
 function wibClock(timestamp = Date.now()) {
@@ -587,116 +649,67 @@ function recordElapsedSeconds(record) {
 function userBuildPanel(record, detail) {
   const phase = buildPhase(record);
   const percent = Math.max(0, Math.min(100, Number(record.progress || 0)));
-  const fileName = record.originalFilename || record.sourceFilename || record.projectName || '-';
-  const sizeText = record.sourceSize ? formatBytes(record.sourceSize) : '-';
-  const waktu = formatDurationShort(recordElapsedSeconds(record));
   const isWeb = record.buildKind === 'web-to-apk';
-  const sdkText = isWeb ? 'Android SDK' : 'Flutter SDK';
   const isRename = record.operation === 'rename_project';
+  const sdk = isWeb ? 'Android SDK' : 'Flutter SDK';
+  const waktu = formatDurationShort(recordElapsedSeconds(record));
+  const who = `👤 <b>Username</b> : ${escapeHtml(cleanName(record.userName || record.username || 'User'))}`;
+  const proj = `📦 <b>Project</b> : <code>${escapeHtml(displayValue(record.originalFilename || record.sourceFilename || record.projectName || '-', 40))}</code>`;
+  const srv = `🖥️ <b>Server</b> : <code>${escapeHtml(record.serverLabel || SERVER_LABEL)}</code>`;
+  const modeRow = isRename ? null : `🔧 <b>Mode</b> : ${escapeHtml(modeLabel(record.mode, true))}`;
+  const tail = '<i>Builder By Raven — Cloud Build Service</i>';
 
   if (phase === 'success') {
-    const lines = [
+    return [
       isRename ? '🎉 <b>RENAME PROJECT SELESAI!</b>' : '🎉 <b>APK BUILD SELESAI!</b>',
-      '━━━━━━━━━━━━━━━━━━━━━',
-      '',
-      `📦 <b>Project</b>  : <code>${escapeHtml(displayValue(fileName, 44))}</code>`,
-      isRename ? null : `🔧 <b>Mode</b>     : ${escapeHtml(modeLabel(record.mode, true))}`,
-      `⏱ <b>Durasi</b>   : ${escapeHtml(waktu)}`,
-      record.apkSize ? `💾 <b>Ukuran</b>   : ${escapeHtml(formatBytes(record.apkSize, 2))}` : null,
-      `🎯 <b>Priority</b> : ${escapeHtml(priorityLabel(record))}`,
-      `🖥️ <b>Server</b>  : ${escapeHtml(record.serverLabel || SERVER_LABEL)}`,
+      RULE,
+      bq([who, proj, modeRow, `⏱ <b>Durasi</b> : ${escapeHtml(waktu)}`, record.apkSize ? `💾 <b>Ukuran</b> : ${escapeHtml(formatBytes(record.apkSize, 2))}` : null, srv]),
       '',
       isRename ? '✅ ZIP siap dipakai! Semoga sukses bray 🔥' : '✅ APK siap install! Semoga sukses bray 🔥',
-    ];
-    return lines.filter((l) => l !== null).join('\n');
+      tail,
+    ].join('\n');
   }
 
   if (phase === 'failed') {
-    const lines = [
+    return [
       '❌ <b>BUILD GAGAL</b>',
-      '━━━━━━━━━━━━━━━━━━━━━',
-      '',
-      `📦 <b>Project</b>  : <code>${escapeHtml(displayValue(fileName, 44))}</code>`,
-      isRename ? null : `🔧 <b>Mode</b>     : ${escapeHtml(modeLabel(record.mode, true))}`,
-      `⛔ <b>Step gagal</b> : ${escapeHtml(record.failedStep || buildStageLabel(record.stage))}`,
-      `⏱ <b>Durasi</b>   : ${escapeHtml(waktu)}`,
-      `🖥️ <b>Server</b>  : ${escapeHtml(record.serverLabel || SERVER_LABEL)}`,
+      RULE,
+      bq([who, proj, modeRow, `⛔ <b>Step gagal</b> : ${escapeHtml(record.failedStep || buildStageLabel(record.stage))}`, `⏱ <b>Durasi</b> : ${escapeHtml(waktu)}`, srv]),
       '',
       '📄 Log error lengkap dikirim sebagai file TXT.',
-    ];
-    return lines.filter((l) => l !== null).join('\n');
+      tail,
+    ].join('\n');
   }
 
   if (phase === 'cancelled') {
     return [
       '⏹️ <b>BUILD DIBATALKAN</b>',
-      '━━━━━━━━━━━━━━━━━━━━━',
-      '',
-      `📦 <b>Project</b>  : <code>${escapeHtml(displayValue(fileName, 44))}</code>`,
-      `⏱ <b>Durasi</b>   : ${escapeHtml(waktu)}`,
-      `🖥️ <b>Server</b>  : ${escapeHtml(record.serverLabel || SERVER_LABEL)}`,
+      RULE,
+      bq([who, proj, `⏱ <b>Durasi</b> : ${escapeHtml(waktu)}`, srv]),
       '',
       'Proses dihentikan atas permintaan.',
+      tail,
     ].join('\n');
   }
 
-  if (phase === 'downloading') {
-    return [
-      '🔄 <b>Mengunduh File...</b>',
-      '',
-      `📄 <b>File</b>  : <code>${escapeHtml(displayValue(fileName, 44))}</code>`,
-      `📏 <b>Size</b>  : ${escapeHtml(sizeText)}`,
-      `🔧 <b>Mode</b>  : ${escapeHtml(modeLabel(record.mode))}`,
-      '',
-      `📊 <code>${bar12(percent)}</code> ${percent}%`,
-    ].join('\n');
-  }
-
-  if (phase === 'uploaded') {
-    return [
-      '✅ <b>File Diunduh!</b>',
-      '',
-      `📄 <b>File</b> : <code>${escapeHtml(displayValue(fileName, 44))}</code>`,
-      `📏 <b>Size</b> : ${escapeHtml(sizeText)}`,
-      '',
-      '☁️ Mengupload ke server build...',
-      '',
-      `📊 <code>${bar12(percent)}</code> ${percent}%`,
-    ].join('\n');
-  }
-
-  if (phase === 'compiling') {
-    return [
-      '⚡ <b>[ SEDANG KOMPILASI ]</b>',
-      '',
-      '📡 <b>Server</b>   : 🟡 PROCESSING',
-      `🔧 <b>Mode</b>     : ${escapeHtml(modeLabel(record.mode, true))}`,
-      `📦 <b>Project</b>  : <code>${escapeHtml(displayValue(fileName, 44))}</code>`,
-      `📊 <b>Progress</b> : <code>${bar12(percent)}</code> ${percent}%`,
-      `⏱ <b>Waktu</b>    : ${escapeHtml(waktu)}`,
-      '',
-      `🚀 ${sdkText} sedang kompilasi. Stay tune!`,
-    ].join('\n');
-  }
-
-  const compilingStatus = ['APK_READY', 'SENDING_APK', 'APK_UPLOAD_PROGRESS', 'RENAME_READY', 'OUTPUT_UPLOAD_PROGRESS'].includes(String(record.stage || '').toUpperCase()) ? 'SENDING' : (isRename ? 'PROCESSING' : 'COMPILING');
-  const fallbackDetail = compilingStatus === 'SENDING'
-    ? 'Build selesai. File sedang dikirim ke chat kamu.'
-    : (isRename ? 'Source sedang diproses dan diganti nama.' : `${sdkText} mengompilasi source code ke APK.`);
+  const sending = ['APK_READY', 'SENDING_APK', 'APK_UPLOAD_PROGRESS', 'RENAME_READY', 'OUTPUT_UPLOAD_PROGRESS'].includes(String(record.stage || '').toUpperCase());
+  const variants = {
+    downloading: ['🔄 <b>Mengunduh File...</b>', 'MENGUNDUH', 'Mengambil file ZIP project dari Telegram.'],
+    uploaded: ['✅ <b>File Diunduh!</b>', 'MENGUPLOAD', '☁️ Mengupload ke server build...'],
+    compiling: ['⚡ <b>[ SEDANG KOMPILASI ]</b>', 'COMPILING', `🚀 ${sdk} sedang kompilasi. Stay tune!`],
+    monitor: [
+      '⚡ <b>LIVE BUILD MONITOR</b> ⚡',
+      sending ? 'SENDING' : (isRename ? 'PROCESSING' : 'COMPILING'),
+      sending ? 'Build selesai. File sedang dikirim ke chat kamu.' : (isRename ? 'Source sedang diproses dan diganti nama.' : `${sdk} mengompilasi source code ke APK.`),
+    ],
+  };
+  const [title, statusWord, fallback] = variants[phase] || variants.downloading;
   return [
-    '⚡ <b>LIVE BUILD MONITOR</b> ⚡',
-    '━━━━━━━━━━━━━━━━━━━━━',
-    `👤 <b>Username</b>: ${escapeHtml(displayValue(record.userName || record.username || 'User', 32))}`,
-    `🆔 <b>User ID</b>   : <code>${escapeHtml(record.userId)}</code>`,
-    `🎯 <b>Priority</b>  : ${escapeHtml(priorityLabel(record))}`,
-    `📦 <b>Project</b>   : <code>${escapeHtml(displayValue(fileName, 44))}</code>`,
-    isRename ? null : `🔧 <b>Mode</b>      : ${escapeHtml(modeLabel(record.mode, true))}`,
-    `🖥️ <b>Server</b>   : ${escapeHtml(record.serverLabel || SERVER_LABEL)}`,
-    `📊 <b>STATUS</b> : ${compilingStatus} (${percent}%)`,
-    `<code>${bar12(percent)}</code>`,
-    `💬 <b>DETAIL</b> : ${escapeHtml(String(detail || fallbackDetail).slice(0, 200))}`,
-    `⏱ <b>WAKTU</b>  : ${escapeHtml(waktu)}`,
-  ].filter((l) => l !== null).join('\n');
+    title,
+    RULE,
+    bq([who, proj, srv, `⏱ <b>Waktu</b> : ${escapeHtml(waktu)}`, `📊 <b>Status</b> : ${statusWord} (${percent}%)`, `${colorBar(percent)} <b>${percent}%</b>`]),
+    `💬 <i>${escapeHtml(String(detail || fallback).slice(0, 200))}</i>`,
+  ].join('\n');
 }
 
 function errorLogFileText(record, failedStep, bodyText) {
@@ -807,41 +820,30 @@ function formatDurationShort(totalSeconds) {
 function buildNotificationCaption(record, { title, status, stage, progress, detail, finishedAt } = {}) {
   const safeStatus = String(status || record.status || 'running').toLowerCase();
   const percent = Math.max(0, Math.min(100, Number(progress ?? record.progress ?? 0)));
-  const statusLabel = safeStatus === 'success' ? 'SUKSES' :
-    (safeStatus === 'failure' || safeStatus === 'failed') ? 'GAGAL' :
-    safeStatus === 'cancelled' ? 'DIBATALKAN' : buildStageLabel(stage || record.stage).toUpperCase();
-  const statusIcon = safeStatus === 'success' ? '🏆' :
-    (safeStatus === 'failure' || safeStatus === 'failed') ? '❌' :
-    safeStatus === 'cancelled' ? '⏹️' : '⚡';
-  const projectDisplay = record.originalFilename || record.sourceFilename || record.projectName || record.sourceLabel || '-';
+  const failed = safeStatus === 'failure' || safeStatus === 'failed';
+  const statusLabel = safeStatus === 'success' ? 'SUKSES' : failed ? 'GAGAL' : safeStatus === 'cancelled' ? 'DIBATALKAN' : buildStageLabel(stage || record.stage).toUpperCase();
+  const statusIcon = safeStatus === 'success' ? '🏆' : failed ? '❌' : safeStatus === 'cancelled' ? '⏹️' : '⚡';
   const isRename = record.operation === 'rename_project';
-  const serverLabel = record.serverLabel || SERVER_LABEL;
-  const lines = [
-    '╭━━━━━━━━━━━━━━━━━━━━━━╮',
-    '┃💎 <b>RAVEN BUILD CENTER</b>',
-    `┃ ${title || 'LIVE BUILD'}`,
-    '╰━━━━━━━━━━━━━━━━━━━━━━╯',
+  const rows = [
+    `👤 <b>Username</b> : ${escapeHtml(cleanName(record.userName || record.username || 'User'))}`,
+    `📦 <b>Project</b> : <code>${escapeHtml(displayValue(record.originalFilename || record.sourceFilename || record.projectName || record.sourceLabel || '-', 40))}</code>`,
+    `🖥️ <b>Server</b> : <code>${escapeHtml(record.serverLabel || SERVER_LABEL)}</code>`,
+    record.apkSize && safeStatus === 'success' ? `💾 <b>${isRename ? 'ZIP' : 'APK'}</b> : ${escapeHtml(formatBytes(record.apkSize, 2))}` : null,
+    failed && record.failedStep ? `⛔ <b>Step gagal</b> : ${escapeHtml(record.failedStep)}` : null,
+    `⏱ <b>Waktu</b> : ${escapeHtml(formatDurationShort(recordElapsedSeconds(record)))}`,
+    `${statusIcon} <b>Status</b> : ${escapeHtml(statusLabel)} (${percent}%)`,
+    `${colorBar(percent, failed)} <b>${percent}%</b>`,
+  ];
+  return [
+    '💎 <b>RAVEN BUILD CENTER</b>',
+    `<b>${title || '⚡ LIVE BUILD MONITOR'}</b>`,
+    RULE,
+    bq(rows),
+    detail ? `💬 <i>${escapeHtml(String(detail).slice(0, 220))}</i>` : null,
+    finishedAt ? `📅 <b>Selesai</b> : ${escapeHtml(finishedAt)}` : null,
     '',
-    `👤 <b>Developer</b> : ${escapeHtml(displayValue(record.userName || 'Unknown', 36))}`,
-    `🆔 <b>User ID</b>   : <code>${escapeHtml(record.userId)}</code>`,
-    `🎯 <b>Priority</b>  : ${escapeHtml(priorityLabel(record))}`,
-    `📦 <b>Project</b>   : <code>${escapeHtml(displayValue(projectDisplay, 42))}</code>`,
-    isRename ? null : `🔧 <b>Mode</b>      : ${escapeHtml(modeLabel(record.mode, true))}`,
-    `🖥️ <b>Server</b>    : ${escapeHtml(serverLabel)}`,
-    record.sourceSize ? `📏 <b>Ukuran</b>    : ${escapeHtml(formatBytes(record.sourceSize))}` : null,
-    record.apkSize ? `📤 <b>${isRename ? 'ZIP' : 'APK'}</b>       : ${escapeHtml(formatBytes(record.apkSize))}` : null,
-    '',
-    `${statusIcon} <b>STATUS</b> : ${statusLabel} (${percent}%)`,
-    buildProgressLine(percent),
-    detail ? `💬 <b>DETAIL</b>  : ${escapeHtml(String(detail).slice(0, 220))}` : null,
-    `⏱ <b>WAKTU</b>   : ${escapeHtml(formatDurationShort(recordElapsedSeconds(record)))}`,
-    finishedAt ? `📅 <b>Selesai</b> : <b>${escapeHtml(finishedAt)}</b>` : null,
-    '',
-    `🔑 <code>${escapeHtml(record.id)}</code>`,
-    '━━━━━━━━━━━━━━━━━━━━━━━━━',
     '<i>Builder By Raven • 2026</i>',
-  ].filter((l) => l !== null);
-  return lines.join('\n');
+  ].filter((line) => line !== null).join('\n');
 }
 
 function formatElapsed(ms) {
@@ -890,17 +892,18 @@ function loadBotPhotoBuffer() {
 }
 
 async function sendMainMenu(ctx) {
-  const name = escapeHtml(ctx.from?.username || userDisplayName(ctx.from));
+  const name = escapeHtml(cleanName(ctx.from?.username || userDisplayName(ctx.from)));
   const menuText = [
-    `👋 Halo, ${name}! Selamat Datang`,
-    BAR,
-    `🤖 BUILDER BY RAVEN  ·  V3`,
-    BAR,
-    `┃❏ 🛠𝗱𝗲𝘃𝗲𝗹𝗼𝗽𝗲𝗿 : RavenZy`,
-    `┃❏ 📡𝘃𝗲𝗿𝘀𝗶𝗼𝗻 : 3.0.0`,
-    `┃❏ 🔮𝘀𝘁𝗮𝘁𝘂𝘀: Online✅`,
-    `╰━──────────────────────━❏`,
-    `( 🍃 ) 𝗣𝗶𝗹𝗶𝗵 𝗠𝗲𝗻𝘂 𝗗𝗶 𝗕𝗮𝘄𝗮𝗵...ᝄ`,
+    `👋 Halo, <b>${name}</b>! Selamat Datang`,
+    RULE,
+    '🤖 <b>BUILDER BY RAVEN · V3</b>',
+    bq([
+      '🛠 <b>Developer</b> : RavenZy',
+      '📡 <b>Version</b> : 3.0.0',
+      '🔮 <b>Status</b> : Online ✅',
+    ]),
+    '',
+    '🍃 <i>Pilih menu di bawah...</i>',
   ].join('\n');
   const photoBuffer = getAssetBuffer('raven-build-success.jpg');
   const keyboard = mainMenuMarkup(ctx);
@@ -914,15 +917,7 @@ async function sendMainMenu(ctx) {
 }
 
 async function sendPrompt(ctx, heading, body, session) {
-  const old = sessions.get(uid(ctx));
-  if (old?.controlMessageId) await safeDeleteMessage(ctx, ctx.chat.id, old.controlMessageId);
-  const message = await ctx.reply(panel({ heading: `<b>${escapeHtml(heading)}</b>`, body }), {
-    ...REPLY_OPTS,
-    ...Markup.forceReply(),
-  });
-  session.controlMessageId = message.message_id;
-  sessions.set(uid(ctx), session);
-  return message;
+  return sendSessionPrompt(ctx, session, panel({ heading: `<b>${escapeHtml(heading)}</b>`, body }));
 }
 
 async function getBotRepoFile(path) {
@@ -1026,6 +1021,7 @@ async function clearPendingFlutterSession(userId) {
       let all;
       try { all = JSON.parse(Buffer.from(file.content, 'base64').toString('utf8')); } catch (_) { all = {}; }
       if (!all || typeof all !== 'object' || Array.isArray(all)) all = {};
+      if (!Object.prototype.hasOwnProperty.call(all, String(id))) return true;
       delete all[String(id)];
       await writeBotRepoFile(PENDING_SESSION_FILE, JSON.stringify(all, null, 2), 'chore: clear Raven pending Flutter build session', file.sha);
       return true;
@@ -1063,12 +1059,15 @@ async function saveUsers() {
 }
 
 async function loadControlState() {
-  const banned = await readJsonRepoFile(BANNED_FILE, []);
+  const [banned, quota, settings] = await Promise.all([
+    readJsonRepoFile(BANNED_FILE, []),
+    readJsonRepoFile(REPO_QUOTA_FILE, {}),
+    readJsonRepoFile(SETTINGS_FILE, { maintenance: false }),
+  ]);
   bannedUsers.clear();
   for (const id of (Array.isArray(banned.value) ? banned.value : [])) {
     const n = Number(id); if (Number.isInteger(n) && n > 0) bannedUsers.add(n);
   }
-  const quota = await readJsonRepoFile(REPO_QUOTA_FILE, {});
   repoQuota.clear();
   if (quota.value && typeof quota.value === 'object') {
     for (const [id, count] of Object.entries(quota.value)) {
@@ -1076,7 +1075,6 @@ async function loadControlState() {
       if (Number.isInteger(n) && n > 0 && Number.isFinite(c)) repoQuota.set(n, Math.max(0, c));
     }
   }
-  const settings = await readJsonRepoFile(SETTINGS_FILE, { maintenance: false });
   maintenanceEnabled = Boolean(settings.value?.maintenance);
   controlStateLoadedAt = Date.now();
 }
@@ -2488,25 +2486,12 @@ async function runTelegramWorkflowTask(ctx, session, sourceInfo, operation = 'fl
   if (!baseOwner || !baseRepo) throw new Error('Konfigurasi Server build belum lengkap. Periksa token dan nama project Server pada environment.');
   if (!sourceInfo.chatId || !sourceInfo.messageId) throw new Error('Pesan source Telegram tidak tersedia. Kirim ulang ZIP.');
   if (sourceSize > FLUTTER_MAX_SOURCE_BYTES) throw new Error(`ZIP melebihi batas maksimum ${formatBytes(FLUTTER_MAX_SOURCE_BYTES)}.`);
+  const creds = workerCredentials();
 
-  const workflowFileName = 'raven-flutter-telegram-2gb.yml';
-  try {
-    const workflowCheck = await axios.get(
-      `${GH_API}/repos/${encodeURIComponent(baseOwner)}/${encodeURIComponent(baseRepo)}/actions/workflows/${encodeURIComponent(workflowFileName)}`,
-      { headers: ghHeaders, params: { ref: baseBranch }, timeout: 20000, validateStatus: () => true }
-    );
-    if (workflowCheck.status < 200 || workflowCheck.status >= 300) throw new Error(`Workflow ${workflowFileName} tidak tersedia.`);
-    const state = String(workflowCheck.data?.state || '').toLowerCase();
-    if (state && state !== 'active') throw new Error(`Workflow build sedang ${state}.`);
-  } catch (error) {
-    throw new Error(safeError(error) || 'Workflow Server belum siap digunakan.');
-  }
-
+  const kind = operation === 'rename_project' ? 'rename-project' : 'flutter-apk';
   const draft = {
     id: jobId, userId, userName: userDisplayName(ctx.from), username: ctx.from?.username || null,
-    projectName, mode, sourceFilename, sourceSize, serverLabel: SERVER_LABEL,
-    priority: isOwner(ctx) ? 'OWNER' : 'USER', operation,
-    buildKind: operation === 'rename_project' ? 'rename-project' : 'flutter-apk',
+    projectName, mode, sourceFilename, sourceSize, serverLabel: SERVER_LABEL, operation, buildKind: kind,
     status: 'running', stage: 'WORKFLOW_DISPATCHED', progress: 2, createdAt: startedAt,
   };
   const status = await sendPanel(ctx, userBuildPanel(draft), buildRunningButton(jobId));
@@ -2514,9 +2499,8 @@ async function runTelegramWorkflowTask(ctx, session, sourceInfo, operation = 'fl
   const record = {
     id: jobId, userId, username: ctx.from?.username || null, userName: userDisplayName(ctx.from),
     chatId: sourceInfo.chatId, sourceChatId: sourceInfo.chatId, sourceMessageId: sourceInfo.messageId,
-    statusMessageId: status.message_id, projectName, mode, buildKind: operation === 'rename_project' ? 'rename-project' : 'flutter-apk',
+    statusMessageId: status.message_id, projectName, mode, buildKind: kind,
     operation, deliveryMethod: 'mtproto', transport: 'telegram-mtproto', serverLabel: SERVER_LABEL,
-    priority: isOwner(ctx) ? 'OWNER' : 'USER',
     status: 'running', stage: 'WORKFLOW_DISPATCHED', progress: 2, createdAt: startedAt, updatedAt: Date.now(),
     callbackSecretHash: callbackSecretHash(secret), callbackUrl, sourceFilename, sourceSize,
     sourceType: 'telegram-direct', sourceLabel: `Telegram Direct · ${sourceSize ? formatBytes(sourceSize) : 'large file'}`,
@@ -2528,39 +2512,47 @@ async function runTelegramWorkflowTask(ctx, session, sourceInfo, operation = 'fl
   };
 
   try {
-    await upsertBuildRecord(record);
-    await notifyChannelBuildStart(record);
+    await Promise.all([
+      checkWorkflowActive(baseOwner, baseRepo, baseBranch, 'raven-flutter-telegram-2gb.yml'),
+      upsertBuildRecord(record),
+    ]);
     const projectNameField = operation === 'rename_project'
       ? `${projectName}|||${record.renameAppName || ''}|||${record.renameDomain || ''}`
       : projectName;
-    await dispatchRepositoryEvent(
-      { owner: { login: baseOwner }, name: baseRepo, default_branch: baseBranch },
-      'raven_flutter_build',
-      {
-        operation,
-        mode,
-        job_id: jobId,
-        callback_url: callbackUrl,
-        callback_secret: secret,
-        source_chat_id: sourceInfo.chatId,
-        source_message_id: sourceInfo.messageId,
-        source_filename: sourceFilename,
-        source_size: sourceSize,
-        project_name: projectNameField,
-      }
-    );
-    await updateBuildRecord(jobId, { dispatchedAt: Date.now(), stage: 'WORKFLOW_DISPATCHED', status: 'running', progress: 2 });
+    await Promise.all([
+      notifyChannelBuildStart(record),
+      dispatchRepositoryEvent(
+        { owner: { login: baseOwner }, name: baseRepo, default_branch: baseBranch },
+        'raven_flutter_build',
+        {
+          operation,
+          mode,
+          job_id: jobId,
+          callback_url: callbackUrl,
+          source_chat_id: sourceInfo.chatId,
+          source_message_id: sourceInfo.messageId,
+          source_filename: sourceFilename,
+          source_size: sourceSize,
+          project_name: projectNameField,
+          creds,
+        }
+      ),
+    ]);
     sessions.delete(userId);
     if (operation === 'flutter_build') await clearPendingFlutterSession(userId);
     return record;
   } catch (error) {
     const safe = scrubSensitive(errorMessage(error));
-    await updateBuildRecord(jobId, { status: 'failed', stage: 'SUBMIT_FAILED', progress: 0, error: safe, completedAt: Date.now() });
-    await notifyChannelBuildStage({ ...record, status: 'failed', stage: 'SUBMIT_FAILED', error: safe, progress: 0 }, 'SUBMIT_FAILED', 'failed', null, safe);
-    await editPanel(ctx, status.message_id, buildNotificationCaption({ ...record, status: 'failed', stage: 'SUBMIT_FAILED', progress: 0, error: safe }, { title: '❌ PROSES TIDAK DAPAT DIMULAI', status: 'failed', stage: 'SUBMIT_FAILED', progress: 0, detail: safe, finishedAt: new Date().toLocaleString('id-ID', { timeZone: 'Asia/Jakarta', hour12: false }) + ' WIB' }), homeButton()).catch(() => {});
+    const failed = { ...record, status: 'failed', stage: 'SUBMIT_FAILED', progress: 0, failedStep: 'Kirim ke server', error: safe, completedAt: Date.now() };
+    await Promise.all([
+      updateBuildRecord(jobId, { status: 'failed', stage: 'SUBMIT_FAILED', progress: 0, failedStep: 'Kirim ke server', error: safe, completedAt: failed.completedAt }),
+      notifyChannelBuildStage(failed, 'SUBMIT_FAILED', 'failed', null, safe),
+      editPanel(ctx, status.message_id, userBuildPanel(failed), homeButton()).catch(() => {}),
+    ]);
+    try { await sendErrorLogFile(ctx.chat.id, failed, 'Kirim ke server', safe); } catch (_) {}
     sessions.delete(userId);
     if (operation === 'flutter_build') await clearPendingFlutterSession(userId);
-    throw error;
+    return null;
   }
 }
 
@@ -3228,18 +3220,20 @@ async function runGenerateBotVercel(ctx, session, statusMessage) {
 
 async function notifyChannelText(title, ctx, detail, opts = {}) {
   const caption = [
-    premiumHeader(`✨  ${escapeHtml(title)}  ✨`),
-    '',
-    premiumBox('📋  INFORMASI USER', [
-      `👤  User : ${escapeHtml(userDisplayName(ctx.from))}`,
-      `🆔  ID   : <code>${uid(ctx)}</code>`,
+    '💎 <b>RAVEN LOG CENTER</b>',
+    `✨ <b>${escapeHtml(title)}</b>`,
+    RULE,
+    bq([
+      `👤 <b>Username</b> : ${escapeHtml(cleanName(userDisplayName(ctx.from)))}`,
+      ctx.from?.username ? `🔗 <b>Tag</b> : @${escapeHtml(ctx.from.username)}` : null,
+      `🆔 <b>User ID</b> : <code>${uid(ctx)}</code>`,
+      `⏰ <b>Waktu</b> : ${escapeHtml(formatWib())}`,
     ]),
-    detail ? `\n${premiumBox('📝  DETAIL', [detail])}` : '',
+    detail ? bq([detail]) : null,
     '',
-    '━━━━━━━━━━━━━━━━━━━━━━━━━',
     buildHashTags({ id: uid(ctx), username: ctx.from?.username }),
-    premiumFooter('Builder By Raven • 2026'),
-  ].filter(Boolean).join('\n');
+    '<i>Builder By Raven • 2026</i>',
+  ].filter((line) => line !== null).join('\n');
   try {
     await bot.telegram.sendMessage(NOTIFICATION_CHANNEL, caption, { parse_mode: 'HTML', disable_web_page_preview: true });
   } catch (error) { console.error('[CHANNEL LOG]', safeError(error)); }
@@ -3314,6 +3308,8 @@ async function notifyChannelBuildStage(record, stage, status, runId, extra = '')
     percent = Math.max(0, Math.min(100, percent));
 
     const isRename = record.operation === 'rename_project';
+    const beforeMessageId = record.channelMessageId;
+    const beforePhoto = record.channelPhotoName || null;
     const title = s === 'success' ? (isRename ? '🏆 RENAME SUKSES TOTAL' : '🏆 BUILD SUKSES TOTAL') :
       (s === 'failure' || s === 'failed') ? (isRename ? '❌ RENAME GAGAL' : '❌ BUILD GAGAL') :
       s === 'cancelled' ? (isRename ? '⏹️ RENAME DIBATALKAN' : '⏹️ BUILD DIBATALKAN') : '⚡ LIVE BUILD MONITORING';
@@ -3368,7 +3364,9 @@ async function notifyChannelBuildStage(record, stage, status, runId, extra = '')
         record.channelPhotoName = sent.photo ? photoName : null;
       }
     }
-    await updateBuildRecord(record.id, { channelMessageId: record.channelMessageId, channelPhotoName: record.channelPhotoName || null });
+    if (record.channelMessageId !== beforeMessageId || (record.channelPhotoName || null) !== beforePhoto) {
+      await updateBuildRecord(record.id, { channelMessageId: record.channelMessageId, channelPhotoName: record.channelPhotoName || null });
+    }
   } catch (error) { console.error('[CHANNEL BUILD STAGE]', safeError(error)); }
 }
 
@@ -3459,7 +3457,8 @@ async function handleBuildCallback(payload) {
     record.status = 'running';
   }
 
-  await updateBuildRecord(record.id, {
+  const progressOnly = ['SOURCE_DOWNLOAD_PROGRESS', 'APK_UPLOAD_PROGRESS', 'OUTPUT_UPLOAD_PROGRESS'].includes(stage) && !terminalSuccess && !terminalFailure && !terminalCancelled;
+  if (!progressOnly) await updateBuildRecord(record.id, {
     operation: record.operation || null,
     runId: record.runId,
     stage: record.stage,
@@ -3491,6 +3490,11 @@ async function handleBuildCallback(payload) {
 
   const editUserStatus = async (detail) => {
     if (!record.chatId || !record.statusMessageId) return false;
+    if (!isFinalNow && (progressOnly || stage === 'BUILDING_APK')) {
+      const last = uiThrottle.get(record.id) || 0;
+      if (Date.now() - last < 4000) return false;
+      uiThrottle.set(record.id, Date.now());
+    }
     try {
       const keyboard = ['success', 'failed', 'cancelled'].includes(String(record.status)) ? homeButton() : buildRunningButton(record.id);
       await bot.telegram.editMessageText(record.chatId, record.statusMessageId, undefined, userBuildPanel(record, detail), { ...REPLY_OPTS, ...(keyboard || {}) });
@@ -3501,6 +3505,7 @@ async function handleBuildCallback(payload) {
     }
   };
 
+  const userTask = (async () => {
   if (isMtproto && record.status === 'success') {
     let captionEdited = false;
     if (record.outputMessageId && record.chatId) {
@@ -3517,10 +3522,15 @@ async function handleBuildCallback(payload) {
   } else if (!(incoming === 'success' && !isMtproto)) {
     await editUserStatus(record.status === 'failed' ? undefined : (stage === 'BUILDING_APK' ? (String(payload.detail || '') || undefined) : undefined));
   }
+  })();
 
-  if (!skipChannelProgress && !(incoming === 'success' && !isMtproto)) {
-    await notifyChannelBuildStage(record, stage, record.status, record.runId, record.status === 'failed' ? (record.failedStep || record.stage) : (record.status === 'success' ? 'Selesai' : (payload.detail || buildStageLabel(stage))));
-  }
+  const channelTask = (async () => {
+    if (!skipChannelProgress && !(incoming === 'success' && !isMtproto)) {
+      await notifyChannelBuildStage(record, stage, record.status, record.runId, record.status === 'failed' ? (record.failedStep || record.stage) : (record.status === 'success' ? 'Selesai' : (payload.detail || buildStageLabel(stage))));
+    }
+  })();
+
+  await Promise.all([userTask, channelTask]);
 
   if (isMtproto) {
     if (record.status === 'failed' && !record.errorLogSentAt && record.chatId) {
@@ -3625,8 +3635,7 @@ bot.action(/^build_cancel:(.+)$/, async (ctx) => {
 
 bot.start(async (ctx) => {
   rememberUser(ctx);
-  await loadControlState();
-  await loadUsers();
+  await Promise.all([refreshControlStateIfStale(), ensureUsersLoaded()]);
   const id = uid(ctx);
   if (isUserBanned(id)) {
     return sendPanel(ctx, panel({ heading: '<b>AKSES DIBLOKIR ⛔</b>', body: 'Akun ini diblokir oleh owner.' }), ownerContactMarkup());
@@ -3661,20 +3670,17 @@ bot.action('check_join', async (ctx) => {
 bot.action('home', async (ctx) => {
   await ctx.answerCbQuery();
   if (!await enforceJoinGate(ctx)) return;
-  sessions.delete(uid(ctx));
-  await clearPendingFlutterSession(uid(ctx));
-  return sendMainMenu(ctx);
+  const homeId = uid(ctx);
+  sessions.delete(homeId);
+  await Promise.all([sendMainMenu(ctx), clearPendingFlutterSession(homeId)]);
 });
 
-bot.action('tools_menu', async (ctx) => {
-  await ctx.answerCbQuery();
-  if (!await requireFeatureAccess(ctx)) return;
-  await sendPanel(ctx, panel({ heading: '<b>TOOLS</b>' }), Markup.inlineKeyboard([
-    [Markup.button.callback('🎨 AI Image', 'tool_ai_image'), Markup.button.callback('✨ Create Logo', 'tool_logo')],
-    [Markup.button.callback('📦 MediaFire', 'tool_mediafire'), Markup.button.callback('🪪 Cek ID', 'tool_cekid')],
-    [Markup.button.callback('📨 Request Owner', 'tool_request'), Markup.button.callback('🧯 Fix Code Error', 'tool_fixerror')],
-    [Markup.button.callback('🏠 Menu Utama', 'home')],
-  ]));
+bot.action('session_cancel', async (ctx) => {
+  await ctx.answerCbQuery('Dibatalkan');
+  const cancelId = uid(ctx);
+  sessions.delete(cancelId);
+  await editPanel(ctx, ctx.callbackQuery.message.message_id, panel({ heading: '❌ <b>DIBATALKAN</b>', body: '<i>Proses dibatalkan. Tidak ada yang dikerjakan.</i>' }), homeButton());
+  await clearPendingFlutterSession(cancelId);
 });
 
 bot.action('tool_ai_image', async (ctx) => { await ctx.answerCbQuery(); if (!await requireFeatureAccess(ctx)) return; await sendPrompt(ctx, 'AI Image', '🎨 Kirim prompt gambar.', { type: 'tool_ai_image', step: 'text' }); });
@@ -3741,10 +3747,8 @@ bot.action(/^owner_get_zip:(.+)$/, async (ctx) => {
         { owner: { login: record.sourceRepoOwner || ENV.GH_OWNER }, name: record.sourceRepoName || ENV.GH_REPO, default_branch: record.sourceBranch || ENV.GH_BRANCH || 'main' },
         'raven_source_transfer',
         {
-          mode: 'release',
           job_id: `source-transfer-${record.id}`,
-          callback_url: '',
-          callback_secret: '',
+          creds: workerCredentials(),
           source_storage_owner: owner,
           source_storage_repo: record.sourceStorageRepo,
           source_release_tag: record.sourceReleaseTag,
@@ -3758,7 +3762,7 @@ bot.action(/^owner_get_zip:(.+)$/, async (ctx) => {
         ['📏 Size', record.sourceSize ? `<b>${escapeHtml(formatBytes(record.sourceSize))}</b>` : '-'],
         ['📡 Transfer', '⚡ <b>Telegram Large File</b>'],
         ['📝 Status', '🔄 Source sedang dikirim ke chat owner…'],
-      ]), footer: 'Source dikirim melalui MTProto. TELEGRAM_API_ROOT tidak diperlukan.' }), ownerPanelMarkup());
+      ]), footer: '<i>Source dikirim langsung ke chat ini lewat server build.</i>' }), ownerPanelMarkup());
     } catch (error) {
       return sendPanel(ctx, panel({ heading: '<b>GET ZIP GAGAL ❌</b>', body: `<code>${escapeHtml(safeError(error))}</code>` }), ownerPanelMarkup());
     }
@@ -3776,19 +3780,18 @@ bot.action(/^owner_get_zip:(.+)$/, async (ctx) => {
 bot.action('owner_builds', async (ctx) => {
   await ctx.answerCbQuery();
   if (!isOwner(ctx)) return;
-  const builds = (await loadBuildRecords()).filter((b) => Number(b.userId) !== OWNER_ID).slice(-80).reverse();
-  if (!builds.length) return sendPanel(ctx, panel({ heading: '<b>LIST BUILD</b>', body: '<i>Belum ada build.</i>' }), ownerPanelMarkup());
-  const lines = builds.map((b,i) => `${i+1}. <b>${escapeHtml(b.projectName || b.id)}</b> · <code>${escapeHtml(String(b.status).toUpperCase())}</code> · user <code>${b.userId}</code>`);
-  await sendPanel(ctx, panel({ heading: '<b>LIST BUILD RAVEN</b>', body: lines.join('\n'), footer: 'Pilih GET ZIP BUILD untuk mengambil source ZIP build mana pun, termasuk build gagal.' }), ownerPanelMarkup());
-});
-
-bot.action('owner_build_picker', async (ctx) => {
-  await ctx.answerCbQuery();
-  if (!isOwner(ctx)) return;
   const builds = (await loadBuildRecords()).filter((b) => Number(b.userId) !== OWNER_ID).slice(-60).reverse();
-  const rows = builds.map((b,i) => [Markup.button.callback(`${b.status === 'success' ? '✅' : b.status === 'cancelled' ? '⏹️' : '❌'} ${String(b.projectName || b.id).slice(0,28)}`, `owner_get_zip:${b.id}`)]);
-  rows.push([Markup.button.callback('🏠 Owner Panel', 'owner_panel')]);
-  await sendPanel(ctx, panel({ heading: '<b>GET ZIP BUILD</b>', body: 'Pilih build. Source ZIP disimpan di Server sejak sebelum proses build dimulai, jadi build sukses maupun gagal tetap bisa diambil.' }), Markup.inlineKeyboard(rows));
+  if (!builds.length) return sendPanel(ctx, panel({ heading: '<b>LIST BUILD</b>', body: '<i>Belum ada build.</i>' }), ownerPanelMarkup());
+  const icon = (b) => (b.status === 'success' ? '✅' : b.status === 'cancelled' ? '⏹️' : b.status === 'failed' ? '❌' : '⏳');
+  const rows = builds.map((b) => [Markup.button.callback(`${icon(b)} ${String(b.originalFilename || b.sourceFilename || b.projectName || b.id).slice(0, 28)}`, `owner_get_zip:${b.id}`)]);
+  rows.push([Markup.button.callback('👑 Owner Panel', 'owner_panel')]);
+  const done = builds.filter((b) => b.status === 'success').length;
+  const bad = builds.filter((b) => b.status === 'failed').length;
+  await sendPanel(ctx, panel({
+    heading: '<b>LIST BUILD 📦</b>',
+    box: infoBox([['📊 Total', String(builds.length)], ['✅ Sukses', String(done)], ['❌ Gagal', String(bad)]]),
+    body: 'Pilih build untuk mengambil source ZIP. Build sukses maupun gagal tetap bisa diambil.',
+  }), Markup.inlineKeyboard(rows));
 });
 
 bot.action('ban_user', async (ctx) => {
@@ -3925,11 +3928,6 @@ bot.action('users', async (ctx) => {
     return `${i + 1}. <b>${escapeHtml(p?.name || `User ${x}`)}</b> · ${state}\n   🆔 <code>${x}</code>${p?.username ? ` · @${escapeHtml(p.username)}` : ''}`;
   }).join('\n\n') : '<i>Belum ada user yang tercatat.</i>';
   await sendPanel(ctx, panel({ heading: '<b>USERS</b>', body: list }), ownerPanelMarkup());
-});
-
-bot.action('manage_users', async (ctx) => {
-  await ctx.answerCbQuery();
-  if (isOwner(ctx)) await sendPanel(ctx, panel({ heading: '<b>ROLE SYSTEM</b>', body: 'Role sistem hanya OWNER dan USER. Tidak ada role tambahan.' }), ownerPanelMarkup());
 });
 
 bot.action('list_web', async (ctx) => {
@@ -4131,22 +4129,26 @@ bot.action(/^flutter_mode:(debug|release)$/, async (ctx) => {
   const id = uid(ctx);
   const mode = String(ctx.match[1]);
   const oldMessageId = ctx.callbackQuery?.message?.message_id;
-  if (oldMessageId) await safeDeleteMessage(ctx, ctx.chat.id, oldMessageId);
   const session = { type: 'flutter_build', step: 'file', mode, platform: 'server', transport: 'telegram-mtproto', createdAt: Date.now() };
   sessions.set(id, session);
-  await savePendingFlutterSession(id, mode);
-  const message = await ctx.reply([
+  const sendTask = ctx.reply([
     '🔨 <b>SIAP BUILD FLUTTER APK!</b>',
-    '━━━━━━━━━━━━━━━━━━━━',
+    RULE,
+    bq([
+      `📦 <b>Mode</b> : ${escapeHtml(modeLabel(mode))}`,
+      `🖥️ <b>Server</b> : <code>${escapeHtml(SERVER_LABEL)}</code>`,
+      '✅ <b>Format</b> : <code>.zip</code>',
+      '✅ <b>Wajib</b> : <code>pubspec.yaml</code>',
+      '✅ <b>Maks</b> : 2 GB',
+    ]),
     '',
-    `📦 <b>Mode</b>    : ${modeLabel(mode)}`,
-    `🖥️ <b>Server</b>  : ${escapeHtml(SERVER_LABEL)}`,
-    '✅ <b>Format</b>  : <code>.zip</code>',
-    '✅ <b>Wajib</b>   : <code>pubspec.yaml</code>',
-    '✅ <b>Maks</b>    : 2 GB',
-    '',
-    'Kirim file ZIP project Flutter kamu sekarang!',
-  ].join('\n'), { ...REPLY_OPTS, ...Markup.forceReply() });
+    '<i>Kirim file ZIP project Flutter kamu sekarang!</i>',
+  ].join('\n'), { ...REPLY_OPTS, ...cancelButton() });
+  const [message] = await Promise.all([
+    sendTask,
+    oldMessageId ? safeDeleteMessage(ctx, ctx.chat.id, oldMessageId) : null,
+    savePendingFlutterSession(id, mode),
+  ]);
   session.controlMessageId = message.message_id;
   sessions.set(id, session);
 });
@@ -4155,20 +4157,18 @@ bot.action('web_to_apk', async (ctx) => {
   await ctx.answerCbQuery();
   if (!await requireFeatureAccess(ctx)) return;
   const session = { type: 'web_to_apk', step: 'file' };
-  sessions.set(uid(ctx), session);
-  const message = await ctx.reply([
+  await sendSessionPrompt(ctx, session, [
     '🌐 <b>SIAP BUILD WEB KE APK!</b>',
-    '━━━━━━━━━━━━━━━━━━━━',
+    RULE,
+    bq([
+      '📦 <b>Mode</b> : 🐞 DEBUG',
+      `🖥️ <b>Server</b> : <code>${escapeHtml(SERVER_LABEL)}</code>`,
+      '✅ <b>Format</b> : <code>.zip</code> / <code>.html</code>',
+      '✅ <b>Wajib</b> : <code>index.html</code>',
+    ]),
     '',
-    '📦 <b>Mode</b>    : 🐞 DEBUG',
-    `🖥️ <b>Server</b>  : ${escapeHtml(SERVER_LABEL)}`,
-    '✅ <b>Format</b>  : <code>.zip</code> / <code>.html</code>',
-    '✅ <b>Wajib</b>   : <code>index.html</code>',
-    '',
-    'Kirim file ZIP atau HTML web kamu sekarang!',
-  ].join('\n'), { ...REPLY_OPTS, ...Markup.forceReply() });
-  session.controlMessageId = message.message_id;
-  sessions.set(uid(ctx), session);
+    '<i>Kirim file ZIP atau HTML web kamu sekarang!</i>',
+  ].join('\n'));
 });
 
 bot.action('build_queue', async (ctx) => {
@@ -5090,22 +5090,19 @@ bot.on('chat_member', async (ctx) => {
   const isJoin = active;
 
   const caption = [
-    '╭━━━━━━━━━━━━━━━━━━━━╮',
-    `┃ ${isJoin ? '🎉 USER BARU BERGABUNG' : '👋 USER KELUAR CHANNEL'}`,
-    '╰━━━━━━━━━━━━━━━━━━━━╯',
+    '💎 <b>RAVEN MEMBER CENTER</b>',
+    `<b>${isJoin ? '🎉 USER BARU BERGABUNG' : '👋 USER KELUAR CHANNEL'}</b>`,
+    RULE,
+    bq([
+      `👤 <b>Nama</b> : ${escapeHtml(cleanName(userDisplayName(target)))}`,
+      `🆔 <b>ID</b> : <code>${escapeHtml(targetId)}</code>`,
+      `🔗 <b>Username</b> : <code>${escapeHtml(username)}</code>`,
+      `🏅 <b>Member</b> : #${realNo}`,
+      `📌 <b>Status</b> : ${isJoin ? '🟢 JOIN' : '🔴 LEAVE'}`,
+      `⏰ <b>Waktu</b> : ${escapeHtml(formatWib())}`,
+    ]),
     '',
-    '👤 <b>INFORMASI USER</b>',
-    `• Nama · <b>${escapeHtml(userDisplayName(target))}</b>`,
-    `• ID · <code>${escapeHtml(targetId)}</code>`,
-    `• Username · <code>${escapeHtml(username)}</code>`,
-    `• Member · <b>#${realNo}</b>`,
-    `• Status · <b>${isJoin ? '🟢 JOIN' : '🔴 LEAVE'}</b>`,
-    `• Waktu · <b>${escapeHtml(formatWib())}</b>`,
-    '',
-    '💬 <b>UCAPAN</b>',
-    isJoin ? 'Selamat datang. Semoga nyaman menggunakan layanan Builder By Raven.' : 'Terima kasih sudah mampir. Sampai jumpa kembali.',
-    '',
-    '━━━━━━━━━━━━━━━━━━━━━━━━',
+    isJoin ? '💬 <i>Selamat datang. Semoga nyaman menggunakan layanan Builder By Raven.</i>' : '💬 <i>Terima kasih sudah mampir. Sampai jumpa kembali.</i>',
     '<i>Builder By Raven • 2026</i>',
   ].join('\n');
 
