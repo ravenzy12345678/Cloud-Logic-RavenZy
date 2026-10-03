@@ -8,6 +8,24 @@ NUMERIC = {"apk_size", "output_size", "source_size", "elapsed_seconds"}
 BOOLEAN = {"log_sent"}
 
 
+def self_cancel():
+    token = os.environ.get("TOKEN_GITHUB", "").strip()
+    repo = os.environ.get("GITHUB_REPOSITORY", "").strip()
+    run_id = os.environ.get("GITHUB_RUN_ID", "").strip()
+    if not (token and repo and run_id):
+        return
+    try:
+        request = urllib.request.Request(
+            f"https://api.github.com/repos/{repo}/actions/runs/{run_id}/cancel",
+            data=b"",
+            headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json", "User-Agent": "Raven-Worker"},
+            method="POST",
+        )
+        urllib.request.urlopen(request, timeout=20).read()
+    except Exception:
+        pass
+
+
 def main():
     url = os.environ.get("CALLBACK_URL", "").strip()
     if not url or len(sys.argv) < 4:
@@ -46,7 +64,12 @@ def main():
                 method="POST",
             )
             with urllib.request.urlopen(request, timeout=25) as response:
-                response.read()
+                raw = response.read()
+            try:
+                if json.loads(raw.decode("utf-8", "ignore")).get("status") == "cancelled":
+                    self_cancel()
+            except Exception:
+                pass
             return 0
         except Exception:
             time.sleep(1.5 * (attempt + 1))
