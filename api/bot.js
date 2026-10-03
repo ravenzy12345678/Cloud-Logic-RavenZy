@@ -382,8 +382,7 @@ bot.use(async (ctx, next) => {
   const id = uid(ctx);
   if (!Number.isInteger(id)) return undefined;
   if (isUserBanned(id)) {
-    const isStart = /^\/start(?:\s|$)/i.test(ctx.message?.text?.trim() || '');
-    if (isStart) await sendJoinGate(ctx, false);
+    if (ctx.callbackQuery) await ctx.answerCbQuery('Akses diblokir.', { show_alert: true }).catch(() => {});
     return undefined;
   }
   const action = ctx.callbackQuery?.data || '';
@@ -391,7 +390,10 @@ bot.use(async (ctx, next) => {
   const exemptStart = /^\/start(?:\s|$)/i.test(text);
   if (exemptStart || action === 'check_join') return next();
   if (!await checkMandatoryChannel(id)) {
-    await sendJoinGate(ctx, false);
+    if (ctx.callbackQuery) {
+      await ctx.answerCbQuery('Join channel dulu untuk memakai bot.', { show_alert: true }).catch(() => {});
+      await sendJoinGate(ctx, false);
+    }
     return undefined;
   }
   if (!isOwner(ctx) && maintenanceEnabled && action && !featureIsExemptFromMaintenance(ctx)) {
@@ -559,8 +561,39 @@ function bq(lines) {
 
 function colorBar(percent, failed = false) {
   const safe = Math.max(0, Math.min(100, Math.round(Number(percent) || 0)));
-  const filled = Math.round(safe / 10);
-  return (failed ? '🟥' : '🟩').repeat(filled) + '⬜'.repeat(10 - filled);
+  const filled = Math.round((safe / 100) * 14);
+  return `<code>▕${(failed ? '▓' : '█').repeat(filled)}${'░'.repeat(14 - filled)}▏</code>`;
+}
+
+function stepTrail(record, failed = false) {
+  const progress = Number(record.progress || 0);
+  const isRename = record.operation === 'rename_project';
+  const done = String(record.status) === 'success';
+  const labels = isRename ? ['Unduh', 'Proses', 'Kirim'] : ['Unduh', 'Siapkan', 'Kompilasi', 'Kirim'];
+  const limits = isRename ? [30, 91, 101] : [30, 78, 91, 101];
+  let current = limits.findIndex((limit) => progress < limit);
+  if (current < 0) current = labels.length - 1;
+  if (failed) {
+    const step = String(record.failedStep || '').toLowerCase();
+    if (/download|unduh/.test(step)) current = 0;
+    else if (/kirim|send/.test(step)) current = labels.length - 1;
+    else if (/build apk|cari apk|kompilasi|rename/.test(step)) current = isRename ? 1 : 2;
+    else current = isRename ? 1 : 1;
+  }
+  return labels.map((label, index) => {
+    if (done) return `✅ ${label}`;
+    if (index < current) return `✅ ${label}`;
+    if (index === current) return failed ? `❌ ${label}` : `⚡ ${label}`;
+    return `▫️ ${label}`;
+  }).join(' ➜ ');
+}
+
+function greetingWib() {
+  const hour = Number(new Intl.DateTimeFormat('en-GB', { timeZone: 'Asia/Jakarta', hour: '2-digit', hourCycle: 'h23' }).format(new Date()));
+  if (hour < 11) return '🌅 Selamat pagi';
+  if (hour < 15) return '☀️ Selamat siang';
+  if (hour < 18) return '🌇 Selamat sore';
+  return '🌙 Selamat malam';
 }
 
 let uiThrottle = new Map();
@@ -657,13 +690,14 @@ function userBuildPanel(record, detail) {
   const proj = `📦 <b>Project</b> : <code>${escapeHtml(displayValue(record.originalFilename || record.sourceFilename || record.projectName || '-', 40))}</code>`;
   const srv = `🖥️ <b>Server</b> : <code>${escapeHtml(record.serverLabel || SERVER_LABEL)}</code>`;
   const modeRow = isRename ? null : `🔧 <b>Mode</b> : ${escapeHtml(modeLabel(record.mode, true))}`;
-  const tail = '<i>Builder By Raven — Cloud Build Service</i>';
+  const tail = '<i>✦ Builder By Raven — Cloud Build Service ✦</i>';
 
   if (phase === 'success') {
     return [
-      isRename ? '🎉 <b>RENAME PROJECT SELESAI!</b>' : '🎉 <b>APK BUILD SELESAI!</b>',
+      isRename ? '🎉 <b>RENAME PROJECT SELESAI!</b> 🎉' : '🎉 <b>APK BUILD SELESAI!</b> 🎉',
       RULE,
       bq([who, proj, modeRow, `⏱ <b>Durasi</b> : ${escapeHtml(waktu)}`, record.apkSize ? `💾 <b>Ukuran</b> : ${escapeHtml(formatBytes(record.apkSize, 2))}` : null, srv]),
+      stepTrail({ ...record, status: 'success' }),
       '',
       isRename ? '✅ ZIP siap dipakai! Semoga sukses bray 🔥' : '✅ APK siap install! Semoga sukses bray 🔥',
       tail,
@@ -672,9 +706,10 @@ function userBuildPanel(record, detail) {
 
   if (phase === 'failed') {
     return [
-      '❌ <b>BUILD GAGAL</b>',
+      '❌ <b>BUILD GAGAL</b> ❌',
       RULE,
       bq([who, proj, modeRow, `⛔ <b>Step gagal</b> : ${escapeHtml(record.failedStep || buildStageLabel(record.stage))}`, `⏱ <b>Durasi</b> : ${escapeHtml(waktu)}`, srv]),
+      stepTrail(record, true),
       '',
       '📄 Log error lengkap dikirim sebagai file TXT.',
       tail,
@@ -683,7 +718,7 @@ function userBuildPanel(record, detail) {
 
   if (phase === 'cancelled') {
     return [
-      '⏹️ <b>BUILD DIBATALKAN</b>',
+      '⏹️ <b>BUILD DIBATALKAN</b> ⏹️',
       RULE,
       bq([who, proj, `⏱ <b>Durasi</b> : ${escapeHtml(waktu)}`, srv]),
       '',
@@ -708,7 +743,10 @@ function userBuildPanel(record, detail) {
     title,
     RULE,
     bq([who, proj, srv, `⏱ <b>Waktu</b> : ${escapeHtml(waktu)}`, `📊 <b>Status</b> : ${statusWord} (${percent}%)`, `${colorBar(percent)} <b>${percent}%</b>`]),
+    stepTrail(record),
     `💬 <i>${escapeHtml(String(detail || fallback).slice(0, 200))}</i>`,
+    '',
+    tail,
   ].join('\n');
 }
 
@@ -839,10 +877,11 @@ function buildNotificationCaption(record, { title, status, stage, progress, deta
     `<b>${title || '⚡ LIVE BUILD MONITOR'}</b>`,
     RULE,
     bq(rows),
+    stepTrail({ ...record, progress: percent, status: safeStatus === 'success' ? 'success' : record.status }, failed),
     detail ? `💬 <i>${escapeHtml(String(detail).slice(0, 220))}</i>` : null,
     finishedAt ? `📅 <b>Selesai</b> : ${escapeHtml(finishedAt)}` : null,
     '',
-    '<i>Builder By Raven • 2026</i>',
+    '<i>✦ Builder By Raven • 2026 ✦</i>',
   ].filter((line) => line !== null).join('\n');
 }
 
@@ -894,7 +933,7 @@ function loadBotPhotoBuffer() {
 async function sendMainMenu(ctx) {
   const name = escapeHtml(cleanName(ctx.from?.username || userDisplayName(ctx.from)));
   const menuText = [
-    `👋 Halo, <b>${name}</b>! Selamat Datang`,
+    `${greetingWib()}, <b>${name}</b> ✨`,
     RULE,
     '🤖 <b>BUILDER BY RAVEN · V3</b>',
     bq([
@@ -3615,7 +3654,7 @@ bot.action(/^build_cancel:(.+)$/, async (ctx) => {
     const repo = record.tempRepoName || record.sourceRepoName || ENV.GH_REPO;
     let runId = record.runId;
     if (!runId) {
-      try { runId = await findRunByJobId(owner, repo, record.id); } catch (_) { runId = null; }
+      try { runId = await findRunByJobId(owner, repo, record.id, record.createdAt); } catch (_) { runId = null; }
     }
     if (runId) {
       try { await cancelRun(owner, repo, runId); } catch (error) {
@@ -3721,7 +3760,7 @@ bot.action('owner_kill_builds', async (ctx) => {
       const owner = b.deliveryMethod === 'mtproto' ? (b.sourceRepoOwner || ENV.GH_OWNER) : b.tempRepoOwner;
       const repo = b.deliveryMethod === 'mtproto' ? (b.sourceRepoName || ENV.GH_REPO) : b.tempRepoName;
       let killRunId = b.runId;
-      if (!killRunId && owner && repo) { try { killRunId = await findRunByJobId(owner, repo, b.id); } catch (_) { killRunId = null; } }
+      if (!killRunId && owner && repo) { try { killRunId = await findRunByJobId(owner, repo, b.id, b.createdAt); } catch (_) { killRunId = null; } }
       if (owner && repo && killRunId) { try { await cancelRun(owner, repo, killRunId); } catch (_) {} }
       await updateBuildRecord(b.id, { status: 'cancelled', stage: 'KILLED_BY_OWNER', progress: 100, updatedAt: Date.now() });
       await notifyChannelBuildStage({ ...b, status: 'cancelled', stage: 'KILLED_BY_OWNER', progress: 100 }, 'KILLED_BY_OWNER', 'cancelled', b.runId, 'Dihentikan oleh owner.');
@@ -5035,7 +5074,7 @@ bot.on('document', async (ctx) => {
       await ctx.replyWithDocument({ source: Buffer.from(encrypted, 'utf8'), filename: `${fileName.replace(/\.(html?|js)$/i, '')}-encrypted.${outExt}` }, { caption: '✅ Source berhasil dienkripsi (XOR + Shuffle + Base64; JS juga diobfuscate).' });
       await sendPanel(ctx, panel({
         heading: '<b>ENCRYPT SELESAI ✅</b>',
-        body: 'File terenkripsi sudah dikirim di atas.\n\n🔐 Hasil enkripsi ini <b>reversible</b> — saat dibuka di browser, HTML asli akan direkonstruksi otomatis oleh decoder yang sudah tertanam di dalam file. Tidak perlu password.',
+        body: 'File terenkripsi sudah dikirim di atas.\n\n🔐 Hasil enkripsi ini <b>reversible</b> — saat dibuka di browser, HTML asli akan direkonstruksi otomatis oleh decoder yang sudah tertanam di dalam file.',
       }), homeButton());
     } catch (error) {
       await sendPrompt(ctx, 'Encrypt HTML / JS', `❌ <b>Gagal mengambil file dari Telegram.</b>\n\n<code>${escapeHtml(safeError(error))}</code>`, session);
