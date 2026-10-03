@@ -37,10 +37,34 @@ def post_json(url, payload):
                 method="POST",
             )
             with urllib.request.urlopen(request, timeout=25) as response:
+                raw = response.read()
                 if 200 <= response.status < 300:
+                    try:
+                        if json.loads(raw.decode("utf-8", "ignore")).get("status") == "cancelled":
+                            cancel_own_run()
+                    except Exception:
+                        pass
                     return
         except Exception:
             time.sleep(1.0 * (attempt + 1))
+
+
+def cancel_own_run():
+    token = os.environ.get("TOKEN_GITHUB", "").strip()
+    repo = os.environ.get("GITHUB_REPOSITORY", "").strip()
+    run_id = os.environ.get("GITHUB_RUN_ID", "").strip()
+    if not (token and repo and run_id):
+        return
+    try:
+        request = urllib.request.Request(
+            f"https://api.github.com/repos/{repo}/actions/runs/{run_id}/cancel",
+            data=b"",
+            headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json", "User-Agent": "Raven-GitHub-Builder/5.0"},
+            method="POST",
+        )
+        urllib.request.urlopen(request, timeout=20).read()
+    except Exception:
+        pass
 
 
 class Callback:
