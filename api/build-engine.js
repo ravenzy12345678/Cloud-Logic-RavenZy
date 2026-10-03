@@ -138,12 +138,17 @@ async function cancelRun(owner, repo, runId) {
   return true;
 }
 
-async function findRunByJobId(owner, repo, jobId) {
-  const r = await gh('GET', `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/actions/runs`, null, { params: { per_page: 30 }, timeout: 30000 });
+async function findRunByJobId(owner, repo, jobId, since = 0) {
+  const r = await gh('GET', `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/actions/runs`, null, { params: { per_page: 40 }, timeout: 30000 });
   const runs = r.data?.workflow_runs || [];
   const needle = String(jobId || '');
-  const hit = runs.find((x) => String(x.display_title || x.name || '').includes(needle)) || runs.find((x) => x.status !== 'completed' && String(repo).includes(needle));
-  return hit ? String(hit.id) : null;
+  const byTitle = runs.find((x) => String(x.display_title || x.name || '').includes(needle));
+  if (byTitle) return String(byTitle.id);
+  const floor = Number(since || 0) - 120000;
+  const recent = runs
+    .filter((x) => x.status !== 'completed' && (x.event === 'repository_dispatch' || x.event === 'workflow_dispatch') && Date.parse(x.created_at) >= floor)
+    .sort((a, b) => Date.parse(a.created_at) - Date.parse(b.created_at));
+  return recent.length ? String(recent[0].id) : null;
 }
 
 async function getRun(owner, repo, runId) {
