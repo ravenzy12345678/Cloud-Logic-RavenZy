@@ -64,7 +64,6 @@ env:
   MODE: ${{ github.event.client_payload.mode || inputs.mode || 'release' }}
   JOB_ID: ${{ github.event.client_payload.job_id || inputs.job_id || github.run_id }}
   CALLBACK_URL: ${{ github.event.client_payload.callback_url || inputs.callback_url || '' }}
-  CALLBACK_SECRET: ${{ github.event.client_payload.callback_secret || inputs.callback_secret || '' }}
   SOURCE_CHAT_ID: ${{ github.event.client_payload.source_chat_id || inputs.source_chat_id || '' }}
   SOURCE_MESSAGE_ID: ${{ github.event.client_payload.source_message_id || inputs.source_message_id || '' }}
   SOURCE_SIZE: ${{ github.event.client_payload.source_size || inputs.source_size || '0' }}
@@ -73,7 +72,7 @@ env:
   STORAGE_REPO: raven-build-storage
   RELEASE_TAG: raven-build-${{ github.event.client_payload.job_id || inputs.job_id || github.run_id }}
   MAX_SOURCE_BYTES: '2147483647'
-  CB: python3 scripts/raven-callback.py
+  CB: python3 ${{ github.workspace }}/scripts/raven-callback.py
 
 jobs:
   worker:
@@ -123,6 +122,8 @@ jobs:
 
       - name: Prepare workspace
         shell: bash
+        env:
+          IN_CALLBACK_SECRET: ${{ github.event.client_payload.callback_secret || inputs.callback_secret || '' }}
         run: |
           set -euo pipefail
           {
@@ -136,10 +137,12 @@ jobs:
           } >> "$GITHUB_ENV"
           : > "$RUNNER_TEMP/raven-worker.log"
           : > "$RUNNER_TEMP/flutter-build.log"
-          if [ -z "${CALLBACK_SECRET:-}" ]; then
+          if [ -n "${IN_CALLBACK_SECRET:-}" ]; then
+            SECRET="$IN_CALLBACK_SECRET"
+          else
             SECRET="$(python3 -c "import hashlib,hmac,os;print(hmac.new(os.environ.get('TOKEN_BOT','').encode(),os.environ['JOB_ID'].encode(),hashlib.sha256).hexdigest())")"
-            echo "CALLBACK_SECRET=$SECRET" >> "$GITHUB_ENV"
           fi
+          echo "CALLBACK_SECRET=$SECRET" >> "$GITHUB_ENV"
           printf '[%s] run=%s operation=%s mode=%s job=%s\n' "$(date -Is)" "$GITHUB_RUN_ID" "$OPERATION" "$MODE" "$JOB_ID" >> "$RUNNER_TEMP/raven-worker.log"
 
       - name: Setup Python
@@ -192,7 +195,6 @@ jobs:
           else:
               base, app, domain = raw, '', ''
           with open(os.environ['GITHUB_ENV'], 'a') as handle:
-              handle.write('PROJECT_NAME_HINT=' + base.replace('\n', ' ') + '\n')
               handle.write('RENAME_APP_NAME=' + app.replace('\n', ' ') + '\n')
               handle.write('RENAME_DOMAIN=' + domain.replace('\n', ' ') + '\n')
           PY
@@ -359,14 +361,32 @@ jobs:
               flutter_version = ''
           if not re.fullmatch(r'\d+\.\d+\.\d+(\+hotfix\.\d+)?', flutter_version or ''):
               flutter_version = ''
+          if not flutter_version:
+              sdk_match = re.search(r'^\s*sdk:\s*["\']?([^\r\n"\'#]+)', pubspec, re.M)
+              constraint = sdk_match.group(1) if sdk_match else ''
+              upper = re.search(r'<\s*(\d+)\.', constraint)
+              lower = re.search(r'>=?\s*(\d+)\.(\d+)', constraint)
+              if lower and int(lower.group(1)) <= 2 and (not upper or int(upper.group(1)) <= 3):
+                  flutter_version = '3.7.12'
+          java_version = '17'
+          wrapper = dst / 'android' / 'gradle' / 'wrapper' / 'gradle-wrapper.properties'
+          try:
+              if wrapper.exists():
+                  gradle = re.search(r'gradle-(\d+)\.(\d+)', wrapper.read_text(errors='ignore'))
+                  if gradle and (int(gradle.group(1)) < 7 or (int(gradle.group(1)) == 7 and int(gradle.group(2)) < 3)):
+                      java_version = '11'
+          except Exception:
+              java_version = '17'
           with open(os.environ['GITHUB_ENV'], 'a') as handle:
               handle.write(f'FLUTTER_PROJECT_NAME={name}\n')
               handle.write(f'NEEDS_ANDROID_SCAFFOLD={"1" if needs_android else "0"}\n')
               handle.write(f'REQUESTED_FLUTTER_VERSION={flutter_version}\n')
+              handle.write(f'JAVA_VERSION={java_version}\n')
           print(f'Flutter project: {name} / files: {count} / scaffold android: {needs_android} / flutter: {flutter_version or "stable"}')
           PY
           test "${PIPESTATUS[0]}" -eq 0
-          $CB running PROJECT_VALIDATED 46 "project_name=$FLUTTER_PROJECT_NAME"
+          PROJECT_FOUND="$(grep -E '^FLUTTER_PROJECT_NAME=' "$GITHUB_ENV" | tail -n1 | cut -d= -f2-)"
+          $CB running PROJECT_VALIDATED 46 "project_name=${PROJECT_FOUND:-flutter_app}"
 
       - name: Prepare rename project
         id: rename
@@ -475,7 +495,7 @@ jobs:
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: '17'
+          java-version: ${{ env.JAVA_VERSION || '17' }}
 
       - name: Setup Flutter
         if: env.OPERATION == 'flutter_build'
@@ -566,9 +586,18 @@ jobs:
           HB=$!
           FLAGS="--no-pub"
           [ "${MODE,,}" = "release" ] && FLAGS="$FLAGS --no-tree-shake-icons"
-          echo "[$(date -Is)] flutter build apk --${MODE,,} $FLAGS" | tee -a "$BUILD_LOG" "$WORKER_LOG"
-          flutter build apk --${MODE,,} $FLAGS 2>&1 | tee -a "$BUILD_LOG" "$WORKER_LOG"
-          RC=${PIPESTATUS[0]}
+          BUILD_HELP="$(flutter build apk -h 2>&1 || true)"
+          case "$BUILD_HELP" in
+            *android-skip-build-dependency-validation*) FLAGS="$FLAGS --android-skip-build-dependency-validation" ;;
+          esac
+          RC=1
+          for ATTEMPT in 1 2; do
+            echo "[$(date -Is)] flutter build apk --${MODE,,} $FLAGS (percobaan $ATTEMPT)" | tee -a "$BUILD_LOG" "$WORKER_LOG"
+            flutter build apk --${MODE,,} $FLAGS 2>&1 | tee -a "$BUILD_LOG" "$WORKER_LOG"
+            RC=${PIPESTATUS[0]}
+            [ "$RC" -eq 0 ] && break
+            [ "$ATTEMPT" -eq 1 ] && $CB running BUILDING_APK 80 "detail=Percobaan pertama gagal, mengulang kompilasi." >/dev/null 2>&1 || true
+          done
           rm -f "$HEARTBEAT"
           kill "$HB" >/dev/null 2>&1 || true
           wait "$HB" >/dev/null 2>&1 || true
