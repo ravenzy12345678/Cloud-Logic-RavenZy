@@ -581,7 +581,7 @@
     "stage": "WORKFLOW_DISPATCHED",
     "progress": 30,
     "createdAt": 1791566228992,
-    "updatedAt": 1791566241034,
+    "updatedAt": 1791566242771,
     "callbackSecret": "961a4403f5083189cb3b3d81e41d95c757d6cd4537811126746527a94199a5b7",
     "callbackUrl": "https://cloud-logic-raven-zy.vercel.app/api/build-callback",
     "sourceReleaseId": 408156534,
@@ -596,6 +596,8 @@
     "cleanedBytes": 0,
     "tempRepoOwner": "ravenzy12345678",
     "tempRepoName": "raven-build-mv189xj4-8200c90a",
-    "dispatchedAt": 1791566240916
+    "dispatchedAt": 1791566240916,
+    "channelMessageId": 272,
+    "channelPhotoName": "raven-response.jpg"
   }
 ]
