@@ -581,7 +581,7 @@
     "stage": "BUILD_FAILED",
     "progress": 95,
     "createdAt": 1791566228992,
-    "updatedAt": 1791566265791,
+    "updatedAt": 1791566267663,
     "callbackSecret": "961a4403f5083189cb3b3d81e41d95c757d6cd4537811126746527a94199a5b7",
     "callbackUrl": "https://cloud-logic-raven-zy.vercel.app/api/build-callback",
     "sourceReleaseId": 408156534,
@@ -614,6 +614,7 @@
     "sourceStorageRepo": null,
     "sourceAssetFilename": null,
     "apkDeliveredAt": null,
-    "completedAt": 1791566263200
+    "completedAt": 1791566263200,
+    "errorLogSentAt": 1791566267527
   }
 ]
